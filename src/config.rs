@@ -8,11 +8,9 @@ pub struct GrantedPath {
     pub path: String,
     pub note: String,
     pub read_write: bool,
-    /// Whether subfolders are included. A bind mount is inherently
-    /// recursive, so `false` is handled specially in `sandbox.rs` by
-    /// binding only the top-level files instead of the whole directory.
-    /// Defaults to `true` for configs written before this field existed,
-    /// matching their actual (always-recursive) behavior at the time.
+    /// Binds are inherently recursive, so `false` is handled in `sandbox.rs`
+    /// by binding top-level files individually. Defaults true to match
+    /// configs written before this field existed.
     #[serde(default = "default_recursive")]
     pub recursive: bool,
 }
@@ -33,57 +31,54 @@ pub struct AppConfig {
     pub granted_paths: Vec<GrantedPath>,
     #[serde(default)]
     pub auto_approve: Vec<String>,
-    /// How many propose-command -> run -> respond cycles the assistant can
-    /// chain automatically (without the user sending another message)
-    /// before it stops and waits. 0 means no limit. Kept fairly generous by
-    /// default since intermediate steps are hidden behind a collapsed
-    /// "Thinking" section in the UI, not shown inline.
+    /// Propose -> run -> respond cycles chained without the user. 0 = no
+    /// limit. Generous by default since the UI collapses intermediate steps.
     #[serde(default = "default_max_auto_steps")]
     pub max_auto_steps: u32,
-    /// When true, `rules.md`/`command-rules.md` (the editable, "additional"
-    /// advisory rules) are not sent at all -- only the hardcoded protocol
-    /// prompt (command format, one-command-per-reply, sudo handling, see
-    /// `rules::PROTOCOL_PROMPT`) plus the user's own system prompt. Lets
-    /// someone who wants full control over behavior discard the app's
-    /// baked-in advice without it competing with their own instructions.
-    /// Defaults to false (existing behavior: both files are sent).
+    /// Sends only `rules::PROTOCOL_PROMPT` plus the user's system prompt, so
+    /// someone wanting full control isn't competing with baked-in advice.
     #[serde(default)]
     pub disable_builtin_rules: bool,
-    /// Rough token budget for everything sent in one turn (system block plus
-    /// the whole conversation). Older turns get dropped once it's exceeded,
-    /// see `context.rs`. 0 disables trimming entirely -- which is the old
-    /// behavior, and fine until a session gets long enough to overflow the
-    /// model's real context limit. The default leaves headroom because the
-    /// estimate is a cheap chars/4 approximation, not a real tokenizer.
+    /// Budget for one whole turn, system block included (see `context.rs`).
+    /// 0 disables trimming. Default leaves headroom because the estimate is
+    /// chars/4, not a real tokenizer.
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: u32,
-    /// Opt-in last resort before old turns are dropped outright: ask the
-    /// model to summarize them first (see `context::fit_to_budget`).
-    /// **Defaults to off, on purpose.** A small local model writing the
-    /// permanent record of what happened is genuinely risky -- this app has
-    /// already caught one fabricating a completed reorganization -- so
-    /// dropping a turn, which at least leaves an honest gap marker, is the
-    /// safer default. Worth turning on for long sessions where losing the
-    /// early context outright is the bigger problem; the summary is shown in
-    /// the chat and can be edited there precisely so a bad one is catchable.
+    /// Opt-in last resort before dropping (see `context::fit_to_budget`).
+    /// **Off by default**: a small local model writing the permanent record
+    /// is risky -- one has already been caught fabricating a completed
+    /// reorganization -- and a dropped turn at least leaves an honest gap.
     #[serde(default)]
     pub summarize_before_dropping: bool,
-    /// After this many approvals of the same program in one session, the app
-    /// stops asking about that program for the rest of the session. 0 turns
-    /// it off and every command keeps prompting.
-    ///
-    /// Distinct from `auto_approve` in the two ways that matter: it expires
-    /// when the app closes (or the folder changes), and the user never had to
-    /// decide anything up front -- it's inferred from what they already said
-    /// yes to. Confirmation fatigue is a real safety problem, not just an
-    /// annoyance: a dialog that always appears and is always approved stops
-    /// being read, which is worse than one that appears rarely.
+    /// Approvals of one program before this session stops asking about it.
+    /// 0 = always ask. Unlike `auto_approve` it expires with the session and
+    /// is inferred rather than chosen. Confirmation fatigue is a safety
+    /// problem: a dialog always approved stops being read.
     #[serde(default = "default_confirm_fade_after")]
     pub confirm_fade_after: u32,
+    /// The per-session record (`memory.rs`) in the system block. On by
+    /// default -- app-written from observed facts, so unlike
+    /// `summarize_before_dropping` nothing in it can be wrong. Turn off for
+    /// a small context window.
+    #[serde(default = "default_memory_enabled")]
+    pub memory_enabled: bool,
+    /// Load-bearing: the block sits in the system message, which `context.rs`
+    /// never trims, so nothing else can cut it down. ~1/10 of
+    /// `max_context_tokens` is sane. 0 = no cap.
+    #[serde(default = "default_memory_max_tokens")]
+    pub memory_max_tokens: u32,
 }
 
 fn default_confirm_fade_after() -> u32 {
     3
+}
+
+fn default_memory_enabled() -> bool {
+    true
+}
+
+fn default_memory_max_tokens() -> u32 {
+    800
 }
 
 fn default_max_context_tokens() -> u32 {
@@ -94,10 +89,8 @@ fn default_max_auto_steps() -> u32 {
     12
 }
 
-/// Deliberately short -- this is the part meant to be customized per-user
-/// (persona, focus, tone). The mechanical/protocol rules (command format,
-/// quoting, confirmation behavior, etc.) live separately in `rules.rs` /
-/// `rules.md`, read first, so editing this can't accidentally break them.
+/// Short on purpose: the user-customizable part. Mechanical rules live in
+/// `rules.rs`/`rules.md` so editing this can't break them.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a local file assistant. The user has opened a \
 single folder for you to work in; you cannot see or change anything outside it unless they've \
 explicitly granted you another path. Follow the working rules provided separately from this prompt.";
@@ -117,6 +110,8 @@ impl Default for AppConfig {
             max_context_tokens: default_max_context_tokens(),
             summarize_before_dropping: false,
             confirm_fade_after: default_confirm_fade_after(),
+            memory_enabled: default_memory_enabled(),
+            memory_max_tokens: default_memory_max_tokens(),
         }
     }
 }
@@ -125,9 +120,7 @@ fn config_path() -> PathBuf {
     app_config_dir().join("config.toml")
 }
 
-/// Config is global (one file under `~/.config/llm-assistant/`), not scoped
-/// to the currently selected folder -- it needs to exist before any folder
-/// has been picked, and it's the same assistant settings across projects.
+/// Global, not per-folder: it must exist before any folder is picked.
 pub fn load_or_init() -> anyhow::Result<AppConfig> {
     let path = config_path();
     match fs::read_to_string(&path) {
@@ -149,12 +142,8 @@ pub fn save(cfg: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Per-turn note appended after the rules/system prompt telling the model
-/// whether a folder is open and, if so, what it can propose commands
-/// against and what else it's been granted read (or read-write) access to
-/// -- and why, so it can actually use a granted path proactively instead of
-/// only when the user spells out the absolute path themselves. Shared by
-/// the GUI's `send_message` and headless mode so both stay consistent.
+/// What's open and what's granted, with each grant's "why" so the model can
+/// use it proactively rather than only when given an absolute path.
 pub fn build_root_note(root: Option<&Path>, granted_paths: &[GrantedPath]) -> String {
     let Some(root) = root else {
         return "No folder is open right now, so don't propose shell commands -- just chat \

@@ -5,6 +5,7 @@ mod config;
 mod context;
 mod headless;
 mod llm;
+mod memory;
 mod paths;
 mod rules;
 mod sandbox;
@@ -23,10 +24,8 @@ use tauri_plugin_dialog::DialogExt;
 
 struct AppState {
     root: Mutex<Option<PathBuf>>,
-    /// Handle to whatever `send_chat` task is currently in flight, if any,
-    /// so `stop_generation` can actually cancel it (not just stop the UI
-    /// from proposing further steps) -- this is what makes the Stop button
-    /// a real emergency stop for a model stuck repeating itself.
+    /// So `stop_generation` can actually cancel the request, not just stop
+    /// the UI proposing further steps.
     current_send: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
@@ -46,15 +45,12 @@ fn shim_dir(app: &AppHandle) -> PathBuf {
         .join("shims")
 }
 
-/// Shared setup for a newly-selected root, whether it came from the folder
-/// picker or a CLI argument: make sure `.temp-trash` exists up front.
+/// Shared by the picker, CLI arg, and headless: `.temp-trash` must exist.
 fn activate_root(root: &std::path::Path) -> Result<(), String> {
     fs::create_dir_all(root.join(".temp-trash")).map_err(|e| e.to_string())
 }
 
-/// Reads an optional folder path from argv (`llm-assistant /some/folder`) so
-/// the app can start with a working directory already open -- handy for
-/// testing without clicking through the picker each time.
+/// `llm-assistant /some/folder` starts with that folder already open.
 fn resolve_cli_root() -> Option<PathBuf> {
     let arg = std::env::args().nth(1)?;
     let path = PathBuf::from(&arg);
@@ -74,8 +70,7 @@ fn init_logging() {
         .append(true)
         .open(log_dir.join("app.log"));
 
-    // Stderr, not Mixed: headless mode prints its actual result to stdout,
-    // which needs to stay clean of log noise.
+    // Stderr, not Mixed: headless prints its result to stdout.
     let term = TermLogger::new(
         LevelFilter::Info,
         LogConfig::default(),
@@ -96,10 +91,8 @@ fn init_logging() {
     }
 }
 
-/// Opens the native folder picker and waits for the result via a channel.
-/// Deliberately uses the non-blocking `pick_folder` callback API rather than
-/// `blocking_pick_folder()` -- calling the blocking variant from inside a
-/// Tauri command is a known way to deadlock the picker on some platforms.
+/// Uses the non-blocking `pick_folder` callback API on purpose:
+/// `blocking_pick_folder()` inside a Tauri command deadlocks the picker.
 async fn pick_folder_path(app: &AppHandle) -> Result<Option<PathBuf>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog().file().pick_folder(move |folder| {
@@ -139,8 +132,7 @@ async fn pick_and_set_root(
     Ok(serde_json::json!({ "root": root.display().to_string(), "config": cfg }))
 }
 
-/// Opens the same native folder picker, but just returns the chosen path for
-/// the "grant a readable path" flow in Settings -- doesn't touch app state.
+/// Picker for the "grant a readable path" flow; doesn't touch app state.
 #[tauri::command]
 async fn pick_granted_path(app: AppHandle) -> Result<Option<String>, String> {
     log::info!("pick_granted_path: opening folder picker");
@@ -149,8 +141,7 @@ async fn pick_granted_path(app: AppHandle) -> Result<Option<String>, String> {
         .map(|p| p.display().to_string()))
 }
 
-/// Lets the frontend check on load whether a root is already active (e.g.
-/// preloaded from a CLI argument) without having to go through the picker.
+/// So the frontend can pick up a CLI-preloaded root without the picker.
 #[tauri::command]
 fn get_current_root(state: State<AppState>) -> Option<String> {
     state
@@ -161,11 +152,8 @@ fn get_current_root(state: State<AppState>) -> Option<String> {
         .map(|p| p.display().to_string())
 }
 
-/// Drops the selected folder so the app goes back to being a plain chat
-/// client with no file access -- the sandbox has nothing to bind to `None`,
-/// so `run_command` simply refuses with "No folder selected" until a new one
-/// is picked. Returns the path that was unmounted, if any, for the UI to
-/// report back to the user.
+/// Back to plain chat with no file access; `run_command` then refuses until
+/// a new folder is picked. Returns what was unmounted, for the UI.
 #[tauri::command]
 fn unmount_root(state: State<AppState>) -> Option<String> {
     let old = state.root.lock().unwrap().take();
@@ -186,12 +174,9 @@ fn save_config(cfg: AppConfig) -> Result<(), String> {
     config::save(&cfg).map_err(|e| e.to_string())
 }
 
-/// Checks the endpoint/model/key the user has typed *in the dialog*, not what
-/// is on disk -- the point is to find out whether it works before saving it.
-/// Sends a real (tiny) completion rather than pinging `/models`, because the
-/// failures worth catching here are the ones a bare reachability check
-/// misses: a wrong model name, a missing or rejected API key, an endpoint URL
-/// pointing at the right server but the wrong path.
+/// Tests what's typed in the dialog, not what's saved. A real completion
+/// rather than a `/models` ping, since the failures worth catching are the
+/// ones reachability misses: wrong model name, rejected key, wrong URL path.
 #[tauri::command]
 async fn test_connection(
     endpoint: String,
@@ -207,8 +192,7 @@ async fn test_connection(
         Ok(reply) => {
             let reply = reply.trim();
             log::info!("test_connection: ok, model replied {reply:?}");
-            // The content doesn't matter -- a reply of any kind means the
-            // whole path (URL, auth, model name, response shape) works.
+            // Any reply means URL, auth, model name and response shape work.
             Ok(if reply.is_empty() {
                 "Connected, but the model returned an empty reply.".into()
             } else {
@@ -222,8 +206,7 @@ async fn test_connection(
     }
 }
 
-/// Keeps a chatty model's test reply to one line in the dialog; the full
-/// thing is in `app.log` if it matters.
+/// One line for the dialog; the full reply is in `app.log`.
 fn first_line(text: &str) -> String {
     let line = text.lines().next().unwrap_or("").trim();
     if line.chars().count() > 80 {
@@ -275,24 +258,16 @@ fn default_command_rules() -> &'static str {
     rules::DEFAULT_COMMAND_RULES
 }
 
-/// Appends one entry to this session's `<app-config-dir>/logs/chat-*.log`,
-/// mirroring exactly what the GUI shows (including collapsed "thinking"
-/// steps, since a flat log file has no collapse concept) -- for debugging
-/// without driving the window. A fresh timestamped file is started at the
-/// beginning of every GUI launch (up to 5 kept, oldest deleted first), see
-/// `chat_log::init` and `main()`.
+/// Mirrors what the GUI shows, thinking steps included, into this session's
+/// `logs/chat-*.log`.
 #[tauri::command]
 fn append_chat_log(text: String) -> Result<(), String> {
     chat_log::append(&text).map_err(|e| e.to_string())
 }
 
-/// `session_approved` is the frontend's fade-out list (see
-/// `confirm_fade_after`): programs the user has already approved enough times
-/// in this session that it stopped asking. It's evaluated here, through the
-/// same `is_auto_approved`, rather than being checked in JS -- that function
-/// also refuses anything containing a shell metacharacter, and a second copy
-/// of that rule living in `main.js` is exactly the kind of thing that would
-/// quietly stop matching the real one.
+/// `session_approved` is the frontend's fade-out list (`confirm_fade_after`).
+/// Evaluated here through the same `is_auto_approved` rather than in JS: a
+/// second copy of its metacharacter rule would quietly stop matching.
 #[tauri::command]
 fn classify_command(
     cmd: String,
@@ -320,6 +295,9 @@ fn run_command(
     sandbox::ensure_shims(&shims).map_err(|e| e.to_string())?;
     let outcome = sandbox::run_sandboxed(&root, &shims, &cfg.granted_paths, &cmd)
         .map_err(|e| e.to_string())?;
+    // Here, not the frontend: the only place with both the command and its
+    // real exit code.
+    memory::record_command(&cmd, outcome.exit_code);
     log::debug!(
         "run_command: exit={} stdout={} bytes stderr={} bytes",
         outcome.exit_code,
@@ -381,36 +359,24 @@ fn remove_auto_approve(binary: String) -> Result<AppConfig, String> {
     Ok(cfg)
 }
 
-/// What `send_message` hands back. More than just the reply text so the UI
-/// can tell the user when older turns had to be condensed or dropped to fit
-/// the context budget -- trimming that happens silently is exactly the
-/// failure mode `context.rs` exists to avoid.
+/// More than the reply, so the UI can report trimming rather than let it
+/// happen silently.
 #[derive(serde::Serialize)]
 struct SendMessageResult {
     reply: String,
-    /// Messages dropped from the front of the history this turn (0 normally).
     dropped: usize,
-    /// Finished chain steps reduced to command + output this turn (0
-    /// normally). Reported separately from `dropped` because it's a much
-    /// milder thing to have happened -- nothing factual was lost.
+    /// Reported separately from `dropped`: nothing factual was lost.
     condensed: usize,
-    /// How many messages were folded into `summary` (0 unless the opt-in
-    /// summarizer ran).
     summarized: usize,
-    /// The summary text itself, so the UI can show it and let the user fix
-    /// it. Handing it back rather than swallowing it is the whole guardrail:
-    /// a model-written record nobody ever sees is the risk this feature
-    /// carries.
+    /// Handed back so the UI can show and edit it -- a model-written record
+    /// nobody sees is the risk this feature carries.
     summary: Option<String>,
-    /// The conversation with the summary spliced in, for the frontend to
-    /// adopt as its new history. `None` whenever nothing was summarized.
+    /// For the frontend to adopt as its new history.
     rewritten_history: Option<Vec<ChatMessage>>,
     estimated_tokens: usize,
 }
 
-/// Chat works with no folder open too (a plain assistant) -- the system
-/// prompt gets a note appended about whether a folder is currently open, so
-/// the model knows whether proposing shell commands makes sense right now.
+/// Works with no folder open; the system prompt says which it is.
 #[tauri::command]
 async fn send_message(
     state: State<'_, AppState>,
@@ -428,19 +394,11 @@ async fn send_message(
         history.len()
     );
 
-    let root_note = config::build_root_note(root.as_deref(), &cfg.granted_paths);
+    let system_content =
+        rules::build_system_content(&cfg, &general_rules, &command_rules, root.as_deref());
 
-    // Hardcoded protocol, then the advisory general/command rules (unless
-    // disabled), then the user's own customizable system prompt, then the
-    // per-turn folder-state note.
-    let rules_block =
-        rules::build_system_rules(&general_rules, &command_rules, cfg.disable_builtin_rules);
-    let system_content = format!("{}\n\n{}\n\n{}", rules_block, cfg.system_prompt, root_note);
-
-    // Condense finished chain steps, optionally summarize what would
-    // otherwise be lost, and drop the oldest turns if it still doesn't fit,
-    // rather than letting this overflow the context window. The system block
-    // is never touched -- it's the contract the app's own parsing depends on.
+    // The system block is never trimmed -- it's the contract the app's own
+    // parsing depends on.
     let summarizer = cfg.summarize_before_dropping.then(|| context::Summarizer {
         endpoint: &cfg.endpoint,
         model: &cfg.model,
@@ -460,9 +418,7 @@ async fn send_message(
         );
     }
     if let Some(summary) = &trimmed.summary {
-        // Logged in full: the summary becomes the record the model works
-        // from, so it needs to be checkable after the fact, not just at the
-        // moment it scrolls past in the chat.
+        // In full: it becomes the record, so it must be checkable later.
         log::warn!(
             "send_message: summarized {} old message(s) into:\n{summary}",
             trimmed.summarized
@@ -494,9 +450,7 @@ async fn send_message(
     }];
     messages.extend(trimmed.messages);
 
-    // Spawned (rather than just awaited) so `stop_generation` has something
-    // to abort -- an emergency stop needs to actually cancel the in-flight
-    // request, not just stop the UI from proposing another one afterward.
+    // Spawned, not awaited, so `stop_generation` has something to abort.
     let handle = tokio::spawn(async move {
         llm::send_chat(
             &cfg.endpoint,
@@ -537,6 +491,19 @@ async fn send_message(
             Err(join_err.to_string())
         }
     }
+}
+
+/// A new top-level user message is this app's task boundary.
+#[tauri::command]
+fn start_memory_task(state: State<AppState>, message: String) {
+    let root = state.root.lock().unwrap().clone();
+    memory::start_task(root.as_deref(), &message);
+}
+
+/// Separate from `run_command` because these have no exit code or output.
+#[tauri::command]
+fn record_blocked_command(cmd: String, why: String) {
+    memory::record_blocked(&cmd, &why);
 }
 
 #[tauri::command]
@@ -605,16 +572,17 @@ fn main() {
         "LLM Assistant starting, config dir = {}",
         paths::app_config_dir().display()
     );
-    // Logged once at startup (not on every send_message load) so app.log
-    // shows exactly what's in effect for this session -- useful for
-    // confirming a Reset-to-default actually took, or that an edit wasn't
-    // silently reverted.
+    // Once at startup, so app.log shows what's in effect without spamming.
     let startup_cfg = config::load_or_init().unwrap_or_default();
     rules::log_loaded_rules(startup_cfg.disable_builtin_rules);
 
-    // `llm-assistant <folder> <message...>` runs headless: one turn (plus
-    // any commands it leads to) printed to stdout, no GUI. `llm-assistant
-    // <folder>` alone (no message) is the existing GUI-preload behavior.
+    // Before the headless dispatch: a headless run is a session too.
+    match memory::init() {
+        Ok(path) => log::info!("session memory: {}", path.display()),
+        Err(e) => log::warn!("failed to start session memory: {e}"),
+    }
+
+    // `<folder> <message...>` runs headless; `<folder>` alone preloads the GUI.
     if args.len() >= 3 {
         let root = PathBuf::from(&args[1]);
         if root.is_dir() {
@@ -672,6 +640,8 @@ fn main() {
             remove_auto_approve,
             send_message,
             stop_generation,
+            start_memory_task,
+            record_blocked_command,
             append_chat_log,
         ])
         .run(tauri::generate_context!())

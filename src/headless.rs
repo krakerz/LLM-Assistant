@@ -1,22 +1,16 @@
-//! `llm-assistant <folder> <message>` runs one conversation turn (and any
-//! commands it leads to) without launching the GUI, printing the result to
-//! stdout and exiting -- for scripting and for testing the propose/classify/
-//! execute loop directly. Mirrors `ui/main.js`'s orchestration logic, but
-//! anything that would need a confirmation dialog (not auto-approved) just
-//! gets reported and stops the loop, since there's no one here to click
-//! "Run it" -- headless mode never runs a command unattended that the GUI
-//! wouldn't have run automatically either.
+//! `llm-assistant <folder> <message>` runs one turn (and any commands it
+//! leads to) without the GUI. Mirrors `ui/main.js`'s orchestration, but
+//! anything needing confirmation is reported and stops the loop -- it never
+//! runs unattended what the GUI wouldn't have run automatically.
 
 use crate::llm::{self, ChatMessage};
 use crate::sandbox::Classification;
-use crate::{activate_root, config, context, rules, sandbox};
+use crate::{activate_root, config, context, memory, rules, sandbox};
 use std::path::PathBuf;
 
 const PRIVILEGE_ESCALATION_BINARIES: &[&str] = &["sudo", "su", "doas", "pkexec"];
 
-/// Checks every word, not just the first -- a compound command like
-/// `cd /x && sudo pacman -Syu` has `sudo` as its second word, and missing
-/// that would let it fall through to the (doomed) normal confirm flow.
+/// Every word, not just the first: `cd /x && sudo ...` has it second.
 fn is_privilege_escalation(cmd: &str) -> bool {
     cmd.split_whitespace().any(|word| {
         let bin = word.rsplit('/').next().unwrap_or(word);
@@ -64,10 +58,8 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
         }
     };
 
-    let root_note = config::build_root_note(Some(root.as_path()), &cfg.granted_paths);
-    let rules_block =
-        rules::build_system_rules(&general_rules, &command_rules, cfg.disable_builtin_rules);
-    let system_content = format!("{}\n\n{}\n\n{}", rules_block, cfg.system_prompt, root_note);
+    // One invocation is one task.
+    memory::start_task(Some(root.as_path()), &message);
 
     let mut history = vec![ChatMessage {
         role: "user".into(),
@@ -80,14 +72,14 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
         cfg.max_auto_steps
     };
 
-    // Mirrors main.js's isImmediateRepeat guard: if the model proposes the
-    // exact same command again right after it ran, with nothing else having
-    // run in between, stop instead of letting it spin -- seen in practice as
-    // an ls -F / "organization is complete" loop that ran until max_steps
-    // (which is unbounded when configured to 0).
+    // Mirrors main.js's isImmediateRepeat guard: seen looping ls -F /
+    // "organization is complete" until max_steps.
     let mut last_executed: Option<String> = None;
 
     for step in 0..=max_steps {
+        // Rebuilt each step: the session record it carries grows as commands run.
+        let system_content =
+            rules::build_system_content(&cfg, &general_rules, &command_rules, Some(root.as_path()));
         let summarizer = cfg.summarize_before_dropping.then(|| context::Summarizer {
             endpoint: &cfg.endpoint,
             model: &cfg.model,
@@ -108,15 +100,14 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
             );
         }
         if let Some(summary) = &trimmed.summary {
-            // Printed in full, same as the GUI shows it: a model-written
-            // record nobody gets to look at is the whole hazard here.
+            // In full, as the GUI shows it: an unseen model-written record is
+            // the hazard.
             eprintln!(
                 "[summarized {} old message(s) to fit the ~{} token context budget]\n{summary}",
                 trimmed.summarized, cfg.max_context_tokens
             );
         }
-        // Adopted as the real history so the summary is written once rather
-        // than re-generated (differently) on every following step.
+        // Adopted so the summary is written once, not regenerated per step.
         if let Some(rewritten) = trimmed.rewritten_history {
             history = rewritten;
         }
@@ -164,10 +155,8 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
                 "\n[skipped a repeat of that command -- it was just run with nothing in between; \
                  wrapping up instead]"
             );
-            // Mirrors main.js: this fires when the work is already done and
-            // the model is only re-running a listing to show output it
-            // already has, usually mid-sentence ("here is the structure:").
-            // One final no-command turn so the run ends on a real answer.
+            // Fires when the work is done and it's re-running a listing to
+            // show output it has. One no-command turn so it ends on an answer.
             history.push(ChatMessage {
                 role: "user".into(),
                 content: rules::REPEATED_COMMAND_NOTE.into(),
@@ -176,10 +165,8 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
                 role: "user".into(),
                 content: rules::FINAL_ANSWER_PROMPT.into(),
             });
-            // Through the same budget as every other turn. This used to send
-            // the whole untrimmed history, which meant the one turn most
-            // likely to overflow the model's real context was the only one
-            // not protected from doing so.
+            // Same budget as every other turn: this used to send the whole
+            // untrimmed history.
             let trimmed = context::fit_to_budget(
                 context::estimate_tokens(&system_content),
                 history.clone(),
@@ -207,8 +194,11 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
             break;
         }
 
+        // The GUI records these via Tauri commands; headless runs the sandbox
+        // directly, so it records them here.
         if is_privilege_escalation(&cmd) {
             println!("\n[needs sudo/root -- this sandbox can never grant that; run it yourself]");
+            memory::record_blocked(&cmd, "needs sudo/root, which this sandbox can never grant");
             break;
         }
 
@@ -216,12 +206,14 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
             || sandbox::is_auto_approved(&cmd, &cfg.auto_approve);
         if !auto_ok {
             println!("\n[needs confirmation -- not run automatically in headless mode]: {cmd}");
+            memory::record_blocked(&cmd, "needs confirmation, which headless mode cannot give");
             break;
         }
 
         match sandbox::run_sandboxed(&root, &shims, &cfg.granted_paths, &cmd) {
             Ok(outcome) => {
                 last_executed = Some(cmd.clone());
+                memory::record_command(&cmd, outcome.exit_code);
                 println!("\n$ {cmd}  (exit {})", outcome.exit_code);
                 if !outcome.stdout.is_empty() {
                     print!("{}", outcome.stdout);
@@ -230,18 +222,16 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
                     eprint!("{}", outcome.stderr);
                 }
                 let combined = format!("{}{}", outcome.stdout, outcome.stderr);
-                // Built from the shared prefix rather than spelled out, since
-                // `context.rs` recognizes a finished step by exactly this
-                // shape when condensing (as does `ui/main.js`).
+                // From the shared prefix: `context.rs` recognizes a finished
+                // step by exactly this shape.
                 let mut feedback = format!(
                     "{}{}]\n{}",
                     context::COMMAND_OUTPUT_PREFIX,
                     outcome.exit_code,
                     combined.trim()
                 );
-                // See main.js's identical hint -- reinforcing the
-                // absolute-path rule right at the point of failure works
-                // better than a rule stated once at the top of the prompt.
+                // Same hint as main.js: the rule lands better at the point of
+                // failure than once at the top of the prompt.
                 let lower = combined.to_lowercase();
                 if outcome.exit_code != 0
                     && (lower.contains("no such file or directory")

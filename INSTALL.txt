@@ -1,0 +1,60 @@
+LLM Assistant - install notes
+=============================
+
+Linux only. The sandbox is built on bubblewrap; there is no Windows or macOS
+build.
+
+
+1. INSTALL
+
+   .deb (recommended - pulls in bubblewrap for you):
+
+       sudo apt install ./llm-assistant_*_amd64.deb
+
+   AppImage:
+
+       chmod +x LLM_Assistant_*.AppImage
+       ./LLM_Assistant_*.AppImage
+
+   The AppImage does NOT bring its own bubblewrap. Install it first, or every
+   command the assistant proposes will fail:
+
+       sudo apt install bubblewrap        # Debian/Ubuntu
+       sudo pacman -S bubblewrap          # Arch
+
+
+2. CONFIG
+
+   No config file ships with this build and none is required. On first launch
+   the app writes defaults to:
+
+       ~/.config/llm-assistant/config.toml
+
+   Alongside it, also created on first run:
+
+       rules.md            behaviour rules sent to the model
+       command-rules.md    shell mechanics rules
+       logs/               app.log and per-session chat logs
+       memory/             per-session working record
+
+
+3. BEFORE FIRST USE
+
+   The defaults point at Ollama on http://localhost:11434. If you use LM Studio
+   or a different port, open Settings (gear icon) and set:
+
+       Endpoint    e.g. http://localhost:1234/v1/chat/completions
+       Model       the model name your server reports
+       API key     only if your server requires one
+
+   Press "Test connection" to confirm before saving. Editing config.toml by
+   hand works too - it is re-read on the next message, no restart needed.
+
+   Then pick a folder. The assistant can only see and change that folder;
+   everything else on the machine is invisible to it. Deletions go to
+   .temp-trash inside that folder rather than being removed.
+
+
+4. FULL DOCUMENTATION
+
+   https://github.com/krakerz/LLM-Assistant

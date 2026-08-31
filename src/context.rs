@@ -1,59 +1,25 @@
-//! Keeps what gets sent to the model inside a token budget.
+//! Fits a turn into a token budget by, in order: condensing finished chain
+//! steps to command + output, optionally summarizing, then dropping oldest
+//! first. Every loss is reported, never silent.
 //!
-//! Every turn sends the system block plus the whole conversation so far, and
-//! nothing trimmed it before this -- a long enough session just eventually
-//! blew past the model's context limit, showing up as an endpoint error or
-//! (worse) the model quietly losing the earliest turns with no indication.
-//! This trims from the oldest end instead, and says so out loud rather than
-//! dropping things silently.
-//!
-//! Three mechanisms, tried in that order because each loses more than the
-//! last:
-//!
-//! 1. **Condensing** -- an auto-continue chain's finished steps collapse to
-//!    the command that ran and what it printed. The model's running
-//!    commentary is what bulks those up, and it's the part with no facts in
-//!    it.
-//! 2. **Summarizing** -- opt-in (`AppConfig.summarize_before_dropping`), and
-//!    only once the mechanical pass has already given up and something was
-//!    about to be lost outright.
-//! 3. **Dropping** -- oldest first, with an explicit gap marker left behind.
-//!
-//! Note the ordering of 2 and 3: summarizing is *not* the safe fallback, it
-//! is the risky one. The local models this app talks to have been caught
-//! fabricating a whole completed directory reorganization that never
-//! happened, and a summary is worse than a dropped turn in exactly that
-//! case, because it becomes the authoritative record with no transcript left
-//! to check it against -- whereas a gap marker at least says "something was
-//! here, go and look". So it's off by default, prompted at temperature 0 to
-//! report only what command output actually shows, and handed back to the UI
-//! to be displayed and edited rather than quietly applied. Steps 1 and 3
-//! stay purely mechanical and cannot invent anything.
+//! Summarizing sits second because it's the *risky* rung, not the safe one:
+//! a model-written summary becomes the record with no transcript left to
+//! check it against, whereas a dropped turn leaves a marker saying to go
+//! look. Hence opt-in, temperature 0, and shown to the user.
 
 use crate::llm::ChatMessage;
 use crate::rules;
 
-/// Left in place of what was dropped, so the model sees an explicit gap
-/// rather than an unexplained jump in the conversation.
 const TRIM_MARKER: &str = "[...older turns of this conversation were dropped to stay within the \
 context window. Don't assume anything about what was removed -- if an earlier detail matters, ask \
 the user or re-check it with a command.]";
 
-/// Prefix on every command result fed back to the model. Written in exactly
-/// this shape by `formatCommandFeedback` in `ui/main.js` and by
-/// `headless.rs`; condensing keys off it to recognize a step that already
-/// ran, so all three have to agree -- change one, change all three.
+/// Must match `formatCommandFeedback` in `ui/main.js` and `headless.rs`
+/// exactly -- condensing recognizes a finished step by this prefix.
 pub const COMMAND_OUTPUT_PREFIX: &str = "[command output, exit ";
 
-/// Stands in front of a condensed step so the model can see that what it's
-/// reading is an abridged record rather than the full exchange -- same
-/// honesty rule as `TRIM_MARKER`, kept short because there's one per step.
 const CONDENSED_MARKER: &str = "[earlier step, condensed to its command and result]";
 
-/// How much of a condensed step's command and output survive. The point is
-/// to shed the model's prose, not the facts, so short output is kept whole
-/// -- but a huge `find` dump is usually the very thing that blew the budget,
-/// and cutting it with an explicit note beats dropping the step entirely.
 const CONDENSED_COMMAND_CHARS: usize = 300;
 const CONDENSED_OUTPUT_CHARS: usize = 400;
 
@@ -69,29 +35,21 @@ fn truncate_with_note(text: &str, max: usize, what: &str) -> String {
     )
 }
 
-/// Rough token estimate. Deliberately not a real tokenizer: every endpoint
-/// this app talks to uses a different one, and for a safety margin being
-/// *cheap* matters far more than being exact. ~4 chars/token is the usual
-/// English approximation; symbol-heavy shell output tokenizes worse than
-/// prose, so this runs a little optimistic, which is why the default budget
-/// leaves headroom.
+/// Cheap chars/4 estimate, not a real tokenizer -- every endpoint tokenizes
+/// differently. Runs optimistic on shell output, so budgets need headroom.
 pub fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
 }
 
 pub struct TrimOutcome {
     pub messages: Vec<ChatMessage>,
-    /// How many messages were dropped (0 when everything fit).
     pub dropped: usize,
-    /// How many finished chain steps were condensed to command + output
-    /// before any dropping was needed (0 when everything fit).
     pub condensed: usize,
-    /// Estimated tokens actually being sent, system block included.
+    /// Including the system block.
     pub estimated_tokens: usize,
 }
 
-/// A finished step of an auto-continue chain: an assistant message that
-/// proposed a command, immediately followed by the result of running it.
+/// An assistant message proposing a command, followed by that command's result.
 fn is_finished_step(messages: &[ChatMessage], i: usize) -> bool {
     let Some(proposal) = messages.get(i) else {
         return false;
@@ -105,25 +63,15 @@ fn is_finished_step(messages: &[ChatMessage], i: usize) -> bool {
         && rules::extract_command(&proposal.content).is_some()
 }
 
-/// Oldest step that may still be condensed. The *last* pair is deliberately
-/// off limits: its output is the thing the model is being asked to react to
-/// right now, and abridging that is the one place this would actually change
-/// the answer.
+/// Oldest condensable step. The last pair is off limits -- its output is what
+/// the turn is answering.
 fn next_condensable(messages: &[ChatMessage]) -> Option<usize> {
     (0..messages.len().saturating_sub(2)).find(|&i| is_finished_step(messages, i))
 }
 
-/// Folds one finished step into a single message: the command that ran plus
-/// the result line and output it produced, with the assistant's narration in
-/// between thrown away. That narration is the bulk of a long chain and
-/// contains nothing the following messages don't already establish -- the UI
-/// draws exactly this line too, collapsing intermediate steps into
-/// "Thinking…" while final answers stay inline.
-///
-/// The result message's own first line is reused verbatim rather than
-/// re-derived, so a multi-step sequence that failed partway through keeps its
-/// real per-step exit codes instead of being flattened into one (possibly
-/// wrong) status.
+/// Command + result, narration discarded. The result's own first line is
+/// reused verbatim so a sequence that failed partway keeps its real per-step
+/// exit codes.
 fn condense_step(proposal: &ChatMessage, result: &ChatMessage) -> ChatMessage {
     let cmd = rules::extract_command(&proposal.content)
         .unwrap_or_else(|| "(command could not be re-read)".to_string());
@@ -147,17 +95,9 @@ fn condense_step(proposal: &ChatMessage, result: &ChatMessage) -> ChatMessage {
     }
 }
 
-/// Fits the conversation into `budget` (0 disables this entirely), doing the
-/// least destructive thing that works.
-///
-/// First pass condenses finished chain steps from the oldest end, which
-/// keeps every command and every byte of (short) output and only sheds the
-/// model's commentary about them. Only if that isn't enough does the second
-/// pass start dropping messages outright, and there two are privileged: the
-/// very first one -- normally the user's original request, and losing *that*
-/// is worse than losing any single later turn -- and the most recent one,
-/// which is the thing we're actually answering and so is kept even if it
-/// alone busts the budget, since dropping it accomplishes nothing.
+/// Condense, then drop, until it fits `budget` (0 disables). The first
+/// message (the original request) and the last (the turn being answered) are
+/// always kept, even if the last alone busts the budget.
 pub fn trim_to_budget(
     system_tokens: usize,
     history: Vec<ChatMessage>,
@@ -167,8 +107,6 @@ pub fn trim_to_budget(
     let history_tokens: usize = history.iter().map(|m| estimate_tokens(&m.content)).sum();
     let mut total = system_tokens + history_tokens;
 
-    // Condense before dropping: a step reduced to `$ cmd` + its output still
-    // answers "what has already been done here", which a dropped one can't.
     let mut condensed = 0;
     if budget != 0 {
         while total > budget {
@@ -199,8 +137,7 @@ pub fn trim_to_budget(
     let mut kept_tail: Vec<ChatMessage> = Vec::new();
     for (i, msg) in history.iter().enumerate().skip(1).rev() {
         let cost = estimate_tokens(&msg.content);
-        // `i == history.len() - 1` is the turn being answered right now:
-        // always keep it, budget or not.
+        // The last message is the turn being answered: keep it regardless.
         if used + cost > budget && i != history.len() - 1 {
             break;
         }
@@ -229,38 +166,23 @@ pub fn trim_to_budget(
 }
 
 // --- Summarization (opt-in, `AppConfig.summarize_before_dropping`) ---
-//
-// The last resort, sitting between condensing and dropping. Everything above
-// this line is mechanical and cannot invent a fact; this can, which is why
-// it's off by default, why the prompt below is written the way it is, and
-// why the result is handed back to the UI to be shown and edited rather than
-// quietly folded into the history.
 
-/// Where the summarizer is pointed. Same endpoint/model as the conversation
-/// itself -- deliberately not a separate "small model" setting, since there's
-/// only one thing configured here and a second one to get wrong is worse
-/// than reusing the first.
+/// Reuses the conversation's own endpoint/model rather than adding a second
+/// one to get wrong.
 pub struct Summarizer<'a> {
     pub endpoint: &'a str,
     pub model: &'a str,
     pub api_key: &'a str,
 }
 
-/// Below this, summarizing isn't worth a whole round-trip to the model --
-/// dropping two or three messages with a marker says as much as a summary of
-/// them would.
+/// Below this a round-trip isn't worth it -- a gap marker says as much.
 const MIN_MESSAGES_TO_SUMMARIZE: usize = 4;
 
-/// Hard cap on the summary, both to keep it from being a second transcript
-/// and so the space reserved for it before the call is actually enough.
+/// Also the space `pick_summary_span` reserves, so the two must agree.
 const SUMMARY_MAX_CHARS: usize = 1200;
 
-/// Every line here exists because of an observed failure mode, not as
-/// general good advice. The models this talks to have been caught reporting
-/// a directory reorganization that never ran, so the prompt keeps pointing
-/// back at command output as the only thing that counts as evidence, and
-/// asks for omission rather than a guess. Sent with temperature 0 and
-/// *without* the app's protocol rules -- there is no command to propose here.
+/// Written against observed fabrication, not as general advice: keep pointing
+/// at command output as the only evidence, and ask for omission over guessing.
 const SUMMARY_PROMPT: &str = "You are compressing the oldest part of a transcript between a user \
 and a file assistant, so it can be kept in a limited context window. Write the summary that will \
 replace it.\n\n\
@@ -283,14 +205,9 @@ fn summary_marker(count: usize) -> String {
     )
 }
 
-/// Picks how many messages after the first to hand to the summarizer: enough
-/// of the oldest ones to cover the overshoot plus room for the summary
-/// itself. Measured against the *un*-condensed history so the span maps back
-/// onto the real record cleanly -- condensing shrinks these same messages, so
-/// this errs toward taking slightly more than strictly needed, which is the
-/// safe direction (the drop pass is still there if it doesn't). Never
-/// includes message 0 (the original request) or the last one (the turn being
-/// answered).
+/// How many of the oldest messages (never the first or last) to summarize.
+/// Measured against the un-condensed history so the span maps onto the stored
+/// record; that over-takes slightly, which is the safe direction.
 fn pick_summary_span(history: &[ChatMessage], system_tokens: usize, budget: usize) -> usize {
     let total: usize = system_tokens
         + history
@@ -327,8 +244,7 @@ async fn summarize(s: &Summarizer<'_>, victims: &[ChatMessage]) -> anyhow::Resul
             content: transcript,
         },
     ];
-    // Temperature 0: this is a record, and a creative one is the failure
-    // mode. Also means re-running it on the same input is stable.
+    // Temperature 0: a creative record is the failure mode.
     let text = crate::llm::send_chat(s.endpoint, s.model, s.api_key, 0.0, &messages).await?;
     let text = text.trim();
     if text.is_empty() {
@@ -337,20 +253,15 @@ async fn summarize(s: &Summarizer<'_>, victims: &[ChatMessage]) -> anyhow::Resul
     Ok(truncate_with_note(text, SUMMARY_MAX_CHARS, "summary"))
 }
 
-/// What one turn's context handling produced.
 pub struct FitOutcome {
-    /// What to actually send this turn.
+    /// What to send this turn.
     pub messages: Vec<ChatMessage>,
-    /// The stored conversation, rewritten -- `Some` only when summarizing
-    /// replaced part of it. The caller is expected to adopt this as the new
-    /// history: a summary costs a round-trip and isn't reproducible, so it
-    /// gets written down once rather than recomputed (differently) every
-    /// turn. Condensing is left out of this on purpose -- it's free and
-    /// deterministic, so the full transcript stays recoverable.
+    /// `Some` only when summarizing ran; the caller must adopt it, so the
+    /// summary is paid for once instead of regenerated differently each turn.
+    /// Excludes condensing, which is free to redo and keeps the transcript.
     pub rewritten_history: Option<Vec<ChatMessage>>,
-    /// The summary text on its own, for showing (and editing) in the UI.
+    /// For showing and editing in the UI.
     pub summary: Option<String>,
-    /// Messages folded into that summary.
     pub summarized: usize,
     pub condensed: usize,
     pub dropped: usize,
@@ -371,16 +282,9 @@ impl FitOutcome {
     }
 }
 
-/// The full ladder: condense, then (only if that left something to be thrown
-/// away, and only when the user opted in) summarize, then drop whatever is
-/// still over budget.
-///
-/// Summarizing is gated on the mechanical passes having *already* failed --
-/// `trim.dropped > 0` is exactly the signal that turns were about to be lost
-/// outright, which is the only situation where paying a model to write the
-/// record is the better trade. If the call fails, or comes back empty, the
-/// result is simply the mechanical outcome: a dropped turn with an honest
-/// gap marker beats a summary that isn't there.
+/// Condense, then summarize (only if opted in *and* the mechanical passes
+/// already gave up -- `dropped > 0` is that signal), then drop. A failed
+/// summarizer falls back to the mechanical result.
 pub async fn fit_to_budget(
     system_tokens: usize,
     history: Vec<ChatMessage>,
@@ -412,10 +316,9 @@ pub async fn fit_to_budget(
     rewritten.splice(
         1..=span,
         [ChatMessage {
+            // A user message, so a ```sh fence in the summary can never be
+            // parsed as a command -- only assistant replies are scanned.
             role: "user".into(),
-            // Inserted as a *user* message, so even if the model puts a
-            // ```sh fence in its summary, nothing parses or runs it -- only
-            // assistant replies are scanned for commands.
             content: format!("{}\n{summary}", summary_marker(span)),
         }],
     );

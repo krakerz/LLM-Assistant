@@ -1,14 +1,11 @@
-//! Linux-only: confines shell commands proposed by the LLM to the selected
-//! working directory (plus explicitly granted paths) using `bwrap`, and
-//! shims `rm`/`rmdir` inside the jail to soft-delete into `.temp-trash/`
-//! instead of actually removing files. See project brainstorm notes for the
-//! rationale:
-//! we don't try to classify "is this command safe" from its text (that's
-//! unreliable) -- the sandbox makes "outside the folder" structurally
-//! impossible, and the trash shim makes "destructive inside the folder"
-//! recoverable. The only thing we *do* classify from text is "can this run
-//! without asking the user first", which only needs to be conservative in
-//! one direction (never wrongly say yes).
+//! Linux-only. Confines proposed commands to the working folder (plus
+//! granted paths) with `bwrap`, and shims destructive tools to soft-delete
+//! into `.temp-trash/`.
+//!
+//! We never try to judge "is this command safe" from its text. The sandbox
+//! makes "outside the folder" impossible and the shims make "destructive
+//! inside it" recoverable. The only text-based judgment is "can this run
+//! without asking", which only has to be conservative in one direction.
 
 use crate::config::GrantedPath;
 use std::fs;
@@ -21,9 +18,7 @@ const READ_ONLY_BINARIES: &[&str] = &[
     "find", "uname", "whoami", "id", "hostname",
 ];
 
-/// Any of these appearing in the raw command text means we can no longer
-/// reason about it as "just this one program" -- redirects, pipes, and
-/// command substitution can turn a harmless-looking binary into a write.
+/// Any of these and it's no longer "just this one program".
 const SHELL_METACHARACTERS: &[&str] = &["|", ">", "<", "&", ";", "`", "$(", "\n"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -53,7 +48,7 @@ pub fn classify_command(cmd: &str) -> Classification {
     if trimmed.is_empty() || has_metacharacters(trimmed) {
         return Classification::NeedsConfirmation;
     }
-    // `find` is read-only-shaped but can delete/exec; don't trust it blindly.
+    // `find` looks read-only but can delete/exec.
     if trimmed.contains("-delete") || trimmed.contains("-exec") {
         return Classification::NeedsConfirmation;
     }
@@ -63,9 +58,8 @@ pub fn classify_command(cmd: &str) -> Classification {
     }
 }
 
-/// A user can allow a specific program to always run without prompting.
-/// This still requires the command to have no shell metacharacters --
-/// otherwise "always allow cat" could be smuggled into "cat x > /etc/passwd".
+/// Metacharacters are still refused -- otherwise "always allow cat" becomes
+/// "cat x > /etc/passwd".
 pub fn is_auto_approved(cmd: &str, auto_approve: &[String]) -> bool {
     let trimmed = cmd.trim();
     if trimmed.is_empty() || has_metacharacters(trimmed) {
@@ -83,25 +77,14 @@ pub struct RunOutcome {
     pub exit_code: i32,
 }
 
-// Shared by both the `rm` and `rmdir` shims below -- moves whatever's named
-// into .temp-trash instead of unlinking/removing it, preserving each
-// target's path relative to the sandbox root so a manual restore just means
-// moving it back. Every invocation gets its own timestamped subfolder (all
-// targets of one call share it) so deleting the same path twice can never
-// silently clobber the earlier trashed copy -- mv -f below would otherwise
-// overwrite it without a trace. Note this means `rmdir` no longer fails on
-// a non-empty directory the way real rmdir would -- it always succeeds and
-// moves the whole thing to trash regardless of contents, trading that
-// specific signal for the same "nothing is ever truly gone" guarantee `rm`
-// already gets.
-// Dropping the shim directory from PATH is the first thing every shim does.
-// Without it a shim's own internal `mv`/`cp`/`mkdir` would resolve straight
-// back into the shim directory -- harmless while only rm/rmdir were shimmed,
-// but an infinite loop the moment `mv` and `cp` are too. The reduced PATH is
-// inherited by the real tool we hand off to, which is fine: none of these
-// shell out to anything.
+// Every shim drops the shim dir from PATH first, or its own internal
+// `mv`/`cp`/`mkdir` would re-enter the shim directory and loop forever.
 const SHIM_PATH_RESET: &str = "PATH=/usr/bin:/bin:/usr/local/bin\nexport PATH\n";
 
+// rm/rmdir: move the target into .temp-trash keeping its relative path, so a
+// restore is just moving it back. Each invocation gets its own timestamped
+// subfolder, or deleting the same path twice would have `mv -f` clobber the
+// first copy. Side effect: `rmdir` no longer fails on a non-empty directory.
 const TRASH_SHIM_SCRIPT: &str = r#"trash_root="${TRASH_ROOT:-$PWD/.temp-trash}/$(date +%Y%m%d-%H%M%S-%N)"
 for arg in "$@"; do
   case "$arg" in
@@ -117,25 +100,15 @@ for arg in "$@"; do
 done
 "#;
 
-/// The other half of the soft-delete guarantee: `rm` isn't the only way to
-/// destroy a file. `mv a b` and `cp a b` silently overwrite `b`, and
-/// `truncate -s 0 b` empties it in place -- all unrecoverable, and all
-/// previously gated only by the confirmation dialog. These shims copy
-/// whatever is about to be overwritten into `.temp-trash` first and then hand
-/// off to the real tool, so approving one of those still leaves a way back.
+/// mv/cp/truncate: copy what's about to be overwritten into `.temp-trash`,
+/// then `exec` the real tool with `"$@"` untouched.
 ///
-/// The operand scan is deliberately simple: skip anything starting with `-`
-/// (until a bare `--`), then treat the last remaining operand as the
-/// destination -- a directory means the victims are `dest/basename(src)`,
-/// otherwise the destination itself is the victim. `@ALL@` mode instead
-/// treats every operand as a victim, which is what `truncate` needs.
+/// Operand scan: skip `-*` until a bare `--`, treat the last operand as the
+/// destination (a directory means victims are `dest/basename(src)`). `@ALL@`
+/// instead treats every operand as a victim, which is what `truncate` needs.
 ///
-/// That scan gets option *arguments* wrong (`cp -t dir a b` puts the target
-/// in a place this doesn't understand), and that's an accepted limitation
-/// rather than an oversight: the consequence is copying a source file into
-/// the trash that didn't need saving. Wasted space, never a lost file, and
-/// never a changed command -- the real tool always receives `"$@"` untouched,
-/// so what the user approved is exactly what runs.
+/// It mis-reads option *arguments* (`cp -t dir a b`) -- accepted, because the
+/// cost is a needless trash copy, never a lost file or a changed command.
 const PRESERVE_SHIM_SCRIPT: &str = r#"tool="@TOOL@"
 real="$(command -v "$tool" 2>/dev/null)"
 if [ -z "$real" ]; then
@@ -230,10 +203,8 @@ pub fn run_sandboxed(
     cmd: &str,
 ) -> anyhow::Result<RunOutcome> {
     let mut c = Command::new("bwrap");
-    // Belt and suspenders: env_clear() stops our own process's environment
-    // from reaching bwrap at all, and --clearenv stops bwrap from passing
-    // anything through to the sandboxed shell either. Only PATH and
-    // TRASH_ROOT (set explicitly below) end up visible inside.
+    // env_clear() keeps our environment out of bwrap; --clearenv keeps
+    // anything out of the shell. Only PATH and TRASH_ROOT get through.
     c.env_clear();
     c.arg("--die-with-parent")
         .arg("--clearenv")
@@ -253,6 +224,13 @@ pub fn run_sandboxed(
 
     c.arg("--ro-bind").arg(shim_dir).arg(shim_dir);
 
+    // Scratch only. The rest of session memory stays unbound: `progress.md`
+    // is worth trusting only if nothing but this app can write it.
+    let scratch = crate::memory::temp_dir();
+    if scratch.is_dir() {
+        c.arg("--bind").arg(&scratch).arg(&scratch);
+    }
+
     for g in granted {
         let flag = if g.read_write { "--bind" } else { "--ro-bind" };
         let path = Path::new(&g.path);
@@ -262,10 +240,8 @@ pub fn run_sandboxed(
         if g.recursive {
             c.arg(flag).arg(path).arg(path);
         } else {
-            // A bind mount is inherently recursive, so "just this directory"
-            // means binding each top-level file individually instead of the
-            // whole tree -- subfolders simply aren't bound, so they don't
-            // show up inside the sandbox at all.
+            // Binds are recursive, so "just this directory" means binding
+            // each top-level file individually.
             if let Ok(entries) = fs::read_dir(path) {
                 for entry in entries.flatten() {
                     let entry_path = entry.path();
@@ -277,13 +253,9 @@ pub fn run_sandboxed(
         }
     }
 
-    // Bound last, deliberately: bwrap applies bind mounts in argument order,
-    // and a later mount on top of (or covering) an earlier one wins. If a
-    // granted path happens to be an ancestor of the working folder (e.g.
-    // granting ~/src while the folder open is ~/src/playground), binding it
-    // before root would silently make root read-only too. Binding root last
-    // means it always wins back its own subtree, regardless of what else
-    // was granted.
+    // Last, so it wins: binds apply in order, and a granted path that is an
+    // ancestor of root (grant ~/src, open ~/src/playground) would otherwise
+    // make root read-only.
     c.arg("--bind").arg(root).arg(root);
 
     let path_env = format!("{}:/usr/bin:/bin", shim_dir.display());
@@ -309,9 +281,7 @@ pub fn run_sandboxed(
     })
 }
 
-/// Only the files a trash batch actually holds, relative to the batch dir --
-/// used by the tests to say what was preserved without caring which
-/// timestamped subfolder it landed in.
+/// Trashed files across all batches, so tests needn't know which one.
 #[cfg(test)]
 fn trashed_files(trash_root: &Path) -> Vec<(PathBuf, String)> {
     fn walk(dir: &Path, base: &Path, out: &mut Vec<(PathBuf, String)>) {
@@ -346,19 +316,10 @@ mod tests {
     use super::*;
     use std::{thread::sleep, time::Duration};
 
-    /// Whether this machine will actually let `bwrap` build a sandbox right
-    /// now. Not every environment does: Ubuntu 24.04 restricts unprivileged
-    /// user namespaces through AppArmor, and container/CI environments often
-    /// refuse at the loopback-setup step that `--unshare-net` triggers
-    /// (`bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`).
-    ///
-    /// The tests below use this to skip rather than fail, because a red test
-    /// there says "this machine won't run bwrap", not "the shim is broken" --
-    /// and the second message is the one this suite exists to deliver. The
-    /// skip is printed loudly on purpose: a silent skip of the sandbox tests
-    /// is indistinguishable from them passing, so CI enables unprivileged
-    /// user namespaces up front (see `.github/workflows/autobuild.yml`) and
-    /// the skip line is how you find out that didn't work.
+    /// Ubuntu 24.04 and many CI runners refuse the loopback setup that
+    /// `--unshare-net` triggers. Tests skip rather than fail on those, since
+    /// red there means "this machine won't run bwrap", not "the shim broke".
+    /// The skip prints loudly -- a silent one looks exactly like passing.
     fn sandbox_available() -> bool {
         match Command::new("bwrap")
             .args(["--unshare-all", "--ro-bind", "/", "/", "/bin/true"])
@@ -379,11 +340,8 @@ mod tests {
         }
     }
 
-    // Proves the timestamped-subfolder fix for real, inside the actual
-    // bwrap sandbox: deleting the same relative path twice must land in two
-    // distinct .temp-trash subfolders, not silently overwrite the first
-    // trashed copy via mv -f. Requires bwrap and coreutils' `date`, same as
-    // the app itself does at runtime.
+    // Deleting the same path twice must land in two distinct trash batches,
+    // not have `mv -f` overwrite the first.
     #[test]
     fn repeated_rm_of_same_path_does_not_clobber_earlier_trash() {
         if !sandbox_available() {
@@ -438,8 +396,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Fresh working folder + shims for one test, named after the test so
-    /// concurrent runs don't share a directory.
+    /// Fresh folder + shims, named per test so parallel runs don't collide.
     fn scratch(name: &str) -> (PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "llm-assistant-sandbox-{name}-{}",
@@ -452,9 +409,8 @@ mod tests {
         (root, shim_dir)
     }
 
-    // `rm` was never the only way to lose a file: `mv` over an existing
-    // target destroys it just as permanently, and unlike `rm` it looks
-    // routine enough that it's a common thing to auto-approve.
+    // `mv` over an existing target destroys it as permanently as `rm`, and
+    // looks routine enough to be commonly auto-approved.
     #[test]
     fn mv_over_an_existing_file_keeps_the_overwritten_copy() {
         if !sandbox_available() {
@@ -536,8 +492,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    // truncate destroys content without deleting or replacing anything, so
-    // neither the rm shim nor the destination logic above would catch it.
+    // Destroys content without deleting or replacing, so neither the rm shim
+    // nor the destination logic catches it.
     #[test]
     fn truncate_keeps_the_contents_it_discards() {
         if !sandbox_available() {
@@ -559,11 +515,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    // The shims call mv/cp/mkdir internally. Now that mv and cp are
-    // themselves shimmed, an unqualified call would re-enter the shim
-    // directory -- this is the regression test for the PATH reset that stops
-    // that, and it fails by hanging or blowing the stack rather than
-    // returning a wrong answer.
+    // Regression test for the PATH reset: shims call mv/cp/mkdir internally,
+    // and those are now shimmed too. Fails by hanging, not by a wrong answer.
     #[test]
     fn shims_do_not_recurse_into_each_other() {
         if !sandbox_available() {
@@ -573,8 +526,6 @@ mod tests {
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::write(root.join("sub/a.txt"), "content").unwrap();
 
-        // rm's internal `mv`, then mv's internal `cp`, then cp's internal
-        // `cp` -- each one a chance to land back in the shim directory.
         let outcome = run_sandboxed(&root, &shim_dir, &[], "rm sub/a.txt").unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
 
@@ -587,10 +538,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    // rmdir isn't just gated behind confirmation like an unshimmed
-    // destructive command -- it needs to be structurally redirected the
-    // same way rm is, since a real rmdir permanently (if harmlessly, for an
-    // empty dir) removes its target with no recovery path.
+    // rmdir needs the same structural redirect as rm: a real one removes its
+    // target with no recovery path.
     #[test]
     fn rmdir_moves_target_to_trash_instead_of_removing_it() {
         if !sandbox_available() {

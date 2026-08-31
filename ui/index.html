@@ -78,6 +78,18 @@
       </label>
 
       <label class="checkbox-row">
+        <input type="checkbox" id="cfgMemoryEnabled" />
+        Keep a session record (what you asked for, what the folder looked like, every command that
+        actually ran and its exit code) and include it with each turn. Written by the app from what
+        it observed, never by the model, and it survives context trimming — so a long chain can
+        still tell what has and hasn't been done. Turn it off for a model with a small context
+        window, where the tokens are better spent on the conversation.
+      </label>
+      <label>Token budget for that record (recommended: about a tenth of the context budget above — 800 suits the default 8000; 0 = no cap). It goes in the system block, which is never trimmed, so this is the only thing keeping it in check.
+        <input id="cfgMemoryMaxTokens" type="number" step="100" min="0" />
+      </label>
+
+      <label class="checkbox-row">
         <input type="checkbox" id="cfgSummarizeBeforeDropping" />
         Summarize old turns instead of dropping them, when condensing isn't enough. Off by default
         on purpose: the summary is written by this same model and then becomes the record it works
