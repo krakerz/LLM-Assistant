@@ -49,6 +49,18 @@ pub struct AppConfig {
     /// Defaults to false (existing behavior: both files are sent).
     #[serde(default)]
     pub disable_builtin_rules: bool,
+    /// Rough token budget for everything sent in one turn (system block plus
+    /// the whole conversation). Older turns get dropped once it's exceeded,
+    /// see `context.rs`. 0 disables trimming entirely -- which is the old
+    /// behavior, and fine until a session gets long enough to overflow the
+    /// model's real context limit. The default leaves headroom because the
+    /// estimate is a cheap chars/4 approximation, not a real tokenizer.
+    #[serde(default = "default_max_context_tokens")]
+    pub max_context_tokens: u32,
+}
+
+fn default_max_context_tokens() -> u32 {
+    8000
 }
 
 fn default_max_auto_steps() -> u32 {
@@ -75,6 +87,7 @@ impl Default for AppConfig {
             auto_approve: vec![],
             max_auto_steps: default_max_auto_steps(),
             disable_builtin_rules: false,
+            max_context_tokens: default_max_context_tokens(),
         }
     }
 }

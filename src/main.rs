@@ -2,6 +2,7 @@
 
 mod chat_log;
 mod config;
+mod context;
 mod headless;
 mod llm;
 mod paths;
@@ -321,6 +322,22 @@ fn remove_auto_approve(binary: String) -> Result<AppConfig, String> {
     Ok(cfg)
 }
 
+/// What `send_message` hands back. More than just the reply text so the UI
+/// can tell the user when older turns had to be condensed or dropped to fit
+/// the context budget -- trimming that happens silently is exactly the
+/// failure mode `context.rs` exists to avoid.
+#[derive(serde::Serialize)]
+struct SendMessageResult {
+    reply: String,
+    /// Messages dropped from the front of the history this turn (0 normally).
+    dropped: usize,
+    /// Finished chain steps reduced to command + output this turn (0
+    /// normally). Reported separately from `dropped` because it's a much
+    /// milder thing to have happened -- nothing factual was lost.
+    condensed: usize,
+    estimated_tokens: usize,
+}
+
 /// Chat works with no folder open too (a plain assistant) -- the system
 /// prompt gets a note appended about whether a folder is currently open, so
 /// the model knows whether proposing shell commands makes sense right now.
@@ -328,7 +345,7 @@ fn remove_auto_approve(binary: String) -> Result<AppConfig, String> {
 async fn send_message(
     state: State<'_, AppState>,
     history: Vec<ChatMessage>,
-) -> Result<String, String> {
+) -> Result<SendMessageResult, String> {
     let cfg = config::load_or_init().map_err(|e| e.to_string())?;
     let general_rules = rules::load_general_or_init().map_err(|e| e.to_string())?;
     let command_rules = rules::load_command_or_init().map_err(|e| e.to_string())?;
@@ -348,11 +365,45 @@ async fn send_message(
     // per-turn folder-state note.
     let rules_block =
         rules::build_system_rules(&general_rules, &command_rules, cfg.disable_builtin_rules);
+    let system_content = format!("{}\n\n{}\n\n{}", rules_block, cfg.system_prompt, root_note);
+
+    // Condense finished chain steps, and drop the oldest turns if that still
+    // isn't enough, rather than letting this overflow the context window.
+    // The system block is never touched -- it's the contract the app's own
+    // parsing depends on.
+    let trimmed = context::trim_to_budget(
+        context::estimate_tokens(&system_content),
+        history,
+        cfg.max_context_tokens as usize,
+    );
+    if trimmed.condensed > 0 {
+        log::info!(
+            "send_message: condensed {} finished step(s) to command + output",
+            trimmed.condensed
+        );
+    }
+    if trimmed.dropped > 0 {
+        log::warn!(
+            "send_message: dropped {} old message(s) to fit ~{} token budget (~{} sent)",
+            trimmed.dropped,
+            cfg.max_context_tokens,
+            trimmed.estimated_tokens
+        );
+    } else {
+        log::debug!(
+            "send_message: ~{} estimated tokens",
+            trimmed.estimated_tokens
+        );
+    }
+    let dropped = trimmed.dropped;
+    let condensed = trimmed.condensed;
+    let estimated_tokens = trimmed.estimated_tokens;
+
     let mut messages = vec![ChatMessage {
         role: "system".into(),
-        content: format!("{}\n\n{}\n\n{}", rules_block, cfg.system_prompt, root_note),
+        content: system_content,
     }];
-    messages.extend(history);
+    messages.extend(trimmed.messages);
 
     // Spawned (rather than just awaited) so `stop_generation` has something
     // to abort -- an emergency stop needs to actually cancel the in-flight
@@ -374,7 +425,12 @@ async fn send_message(
     match result {
         Ok(Ok(reply)) => {
             log::debug!("send_message: reply {} bytes", reply.len());
-            Ok(reply)
+            Ok(SendMessageResult {
+                reply,
+                dropped,
+                condensed,
+                estimated_tokens,
+            })
         }
         Ok(Err(e)) => {
             log::error!("send_message failed: {e}");

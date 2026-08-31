@@ -13,9 +13,10 @@ whether to run it automatically or ask the user first. Chat also works with
 no folder open at all (plain assistant mode) — folder selection only gates
 whether commands can be proposed/run, not chat itself.
 
-Linux-only for now — the sandbox is built on `bubblewrap` (`bwrap`), which
-has no equivalent wired up for Windows/macOS yet (see `TODO.md`, gitignored,
-for planned follow-ups).
+Linux-only, deliberately — the sandbox is built on `bubblewrap` (`bwrap`),
+and no Windows/macOS port is planned (namespaces don't exist the same way, so
+there's no equivalent boundary to port to). `TODO.md` (gitignored) holds the
+planned follow-ups.
 
 Single-crate layout: `Cargo.toml`/`src/`/`tauri.conf.json` live at the repo
 root (no `src-tauri/` subdirectory — this was flattened deliberately since
@@ -91,6 +92,40 @@ enough edit to do by hand or ask Claude to do directly.
   of contents, trading that one signal for the same "nothing is ever truly
   gone" guarantee `rm` already gets. Beyond these two, see `TODO.md` for
   what's still unshimmed (e.g. `mv` overwriting an existing target).
+- `context.rs` — keeps a turn inside `AppConfig.max_context_tokens` (0 =
+  never trim), used by both `send_message` and `headless.rs`.
+  `estimate_tokens` is a deliberate chars/4 approximation, not a real
+  tokenizer — every endpoint tokenizes differently, and for a safety margin
+  cheap beats exact, which is why the default budget leaves headroom.
+  `trim_to_budget` does two things in order, cheapest loss first.
+  **Condensing**: a finished auto-continue step — an assistant message whose
+  reply contains a ```sh fence, immediately followed by the `[command output,
+  exit N]` message it produced — collapses into one entry holding the command
+  and the output, throwing away only the assistant's narration around them.
+  That narration is the bulk of a long chain (a 10-step chain is 20+
+  messages) and the UI already draws exactly this line, collapsing
+  intermediate steps into "Thinking…" while final answers stay inline. It
+  runs oldest-first and only while over budget, so a short conversation is
+  untouched; the *last* pair is never condensed, since that output is
+  precisely what the turn is answering. The result message's own first line
+  is reused verbatim rather than re-derived, so a `executeSequence` batch
+  that failed partway keeps its real per-step exit codes. Long output/command
+  text is cut at `CONDENSED_OUTPUT_CHARS`/`CONDENSED_COMMAND_CHARS` with an
+  explicit "N more characters condensed away" note. Detection hangs on three
+  places spelling the result prefix identically —
+  `context::COMMAND_OUTPUT_PREFIX`, `formatCommandFeedback` in `main.js`, and
+  `headless.rs` (which builds it from the constant); change one, change all
+  three, or condensing silently stops finding anything. **Dropping**: only if
+  condensing wasn't enough. Always keeps the first message (the original
+  request) and the last (the turn being answered, even if it alone busts the
+  budget) and leaves a `TRIM_MARKER` where messages were removed, so the
+  model sees an explicit gap rather than an unexplained jump. `send_message`
+  returns `condensed` and `dropped` alongside the reply so the UI can say
+  either happened — silent trimming is the exact failure this replaces —
+  reported separately since condensing loses no facts. Both are strictly
+  mechanical, no summarization: see `TODO.md` for why (a bad summary from a
+  small local model outranks a dropped turn as a hazard, since it becomes the
+  record with no transcript left to check it).
 - `paths.rs` — resolves `$XDG_CONFIG_HOME/llm-assistant` (falls back to
   `~/.config/llm-assistant`) for both config and logs. Deliberately not tied
   to the selected folder, since both need to exist before any folder is
@@ -146,6 +181,12 @@ enough edit to do by hand or ask Claude to do directly.
   functions themselves since those run every turn and would spam the log)
   so a stale edit, a reset that didn't take, or the disable toggle doing the
   wrong thing is visible directly in the log.
+  `extract_command` lives here too — the *read* side of the same fence
+  contract `PROTOCOL_PROMPT` writes down, shared by `headless.rs` (which runs
+  what it returns) and `context.rs` (which uses it to recognize a finished
+  step). Only an explicitly-tagged fence counts, and the earliest fence in
+  the reply wins rather than the first language that happens to match,
+  matching `parseAssistantReply` in `main.js`.
 - `chat_log.rs` — appends a flat, human-readable mirror of the GUI
   conversation (including collapsed "thinking" steps) to a session-scoped
   `<app-config-dir>/logs/chat-<timestamp>.log`, started fresh by `init()` at

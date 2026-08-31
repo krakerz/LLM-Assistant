@@ -76,6 +76,32 @@ does NOT mean \"a to X, b to Y\"; everything but the last argument is a source. 
 going to different places, chain separate two-argument `mv`/`cp` calls with `&&`; for anything bigger, \
 write it as a script instead (see the protocol above).";
 
+/// Pulls the proposed command back out of a reply, per the fence contract
+/// `PROTOCOL_PROMPT` above lays down. Lives here (rather than in whichever
+/// module happens to need it) because it's the read side of that same
+/// contract -- `headless.rs` runs what it returns, `context.rs` uses it to
+/// recognize a completed step. Only an explicitly-tagged fence counts,
+/// matching `parseAssistantReply` in `ui/main.js`: a plain ``` fence is the
+/// model showing text, not proposing something to execute.
+pub fn extract_command(text: &str) -> Option<String> {
+    // Earliest fence in the text wins, not the first language that happens
+    // to match -- a reply with ```bash before ```sh must still resolve to
+    // the one the frontend would have run.
+    let mut earliest: Option<usize> = None;
+    for lang in ["sh", "bash", "shell"] {
+        if let Some(pos) = text.find(&format!("```{lang}\n")) {
+            let start = pos + lang.len() + 4; // ``` + lang + \n
+            earliest = Some(match earliest {
+                Some(e) if e <= start => e,
+                _ => start,
+            });
+        }
+    }
+    let start = earliest?;
+    let end = text[start..].find("```")?;
+    Some(text[start..start + end].trim().to_string())
+}
+
 fn general_rules_path() -> PathBuf {
     app_config_dir().join("rules.md")
 }
@@ -171,5 +197,23 @@ mod tests {
         assert_eq!(combined, PROTOCOL_PROMPT);
         assert!(!combined.contains("GENERAL"));
         assert!(!combined.contains("COMMAND"));
+    }
+
+    #[test]
+    fn extract_command_reads_a_tagged_fence() {
+        let reply = "Let's look.\n```sh\nls -F\n```\n";
+        assert_eq!(extract_command(reply).as_deref(), Some("ls -F"));
+    }
+
+    #[test]
+    fn extract_command_ignores_an_untagged_fence() {
+        let reply = "Here's the file:\n```\nnot a command\n```\n";
+        assert_eq!(extract_command(reply), None);
+    }
+
+    #[test]
+    fn extract_command_takes_the_earliest_fence_not_the_first_language() {
+        let reply = "```bash\nfirst\n```\nand\n```sh\nsecond\n```";
+        assert_eq!(extract_command(reply).as_deref(), Some("first"));
     }
 }

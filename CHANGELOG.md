@@ -5,6 +5,40 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Added
+- Long conversations now **condense finished command steps instead of
+  dropping them**, whenever that's enough to fit `max_context_tokens`. The
+  biggest consumer of the context window isn't the user's own messages, it's
+  auto-continue chains -- a ten-step chain is twenty-plus messages, most of
+  which is the assistant narrating what it's about to do. Each finished
+  propose -> run step is now folded into a single entry holding just the
+  command that ran and the output it produced (long output is cut with an
+  explicit note saying how much), oldest first, and only if the turn *still*
+  doesn't fit does the existing oldest-first dropping kick in. The step being
+  answered right now is never condensed. Reported in the chat and in
+  `app.log`, separately from dropping, since nothing factual is lost this
+  way. Applies to headless mode too.
+  Still strictly mechanical -- the command text and its real output are kept
+  verbatim, so this can't invent a fact the way a summary could.
+
+## [1.6.0] - 2026-08-31
+### Added
+- Context-window management. Every turn previously sent the system block
+  plus the entire conversation with nothing ever trimmed, so a long enough
+  session would eventually overflow the model's context -- surfacing as an
+  endpoint error, or worse, the model quietly losing its earliest turns with
+  no indication. The oldest turns are now dropped once a turn would exceed
+  `max_context_tokens` (new setting, default 8000, 0 = never trim), with the
+  original request and the turn being answered always preserved, an explicit
+  gap marker left where messages were removed, and the drop reported both in
+  the chat and in `app.log` -- never silently. Token counting is a cheap
+  chars/4 estimate rather than a real tokenizer (every endpoint tokenizes
+  differently), so the default leaves headroom; set it under your model's
+  real limit. Applies to headless mode too.
+  Deliberately mechanical dropping only, no summarization for now: a bad
+  summary from a small local model is worse than a dropped turn, since it
+  becomes the authoritative record with no transcript left to check against.
+  See `TODO.md` for the staged plan beyond this.
 
 ## [1.5.1] - 2026-08-31
 ### Fixed

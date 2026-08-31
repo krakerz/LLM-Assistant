@@ -69,6 +69,9 @@
       <label>Max automatic steps (propose → run → respond cycles before it waits for you; 0 = no limit)
         <input id="cfgMaxAutoSteps" type="number" step="1" min="0" />
       </label>
+      <label>Context budget in tokens (oldest turns are dropped once a turn would exceed this; 0 = never trim). Rough estimate, not a real tokenizer — leave headroom under your model's actual limit.
+        <input id="cfgMaxContextTokens" type="number" step="500" min="0" />
+      </label>
       <label>System prompt (persona/focus -- behavior and command mechanics live in their own tabs)
         <textarea id="cfgSystemPrompt" rows="4"></textarea>
       </label>

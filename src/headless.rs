@@ -9,7 +9,7 @@
 
 use crate::llm::{self, ChatMessage};
 use crate::sandbox::Classification;
-use crate::{activate_root, config, rules, sandbox};
+use crate::{activate_root, config, context, rules, sandbox};
 use std::path::PathBuf;
 
 const PRIVILEGE_ESCALATION_BINARIES: &[&str] = &["sudo", "su", "doas", "pkexec"];
@@ -22,21 +22,6 @@ fn is_privilege_escalation(cmd: &str) -> bool {
         let bin = word.rsplit('/').next().unwrap_or(word);
         PRIVILEGE_ESCALATION_BINARIES.contains(&bin)
     })
-}
-
-/// Only an explicitly-tagged fence counts, matching the frontend's rule: a
-/// plain ``` fence is just the model showing text, not proposing a command.
-fn extract_sh_command(text: &str) -> Option<String> {
-    for lang in ["sh", "bash", "shell"] {
-        let marker = format!("```{lang}\n");
-        if let Some(pos) = text.find(&marker) {
-            let start = pos + marker.len();
-            if let Some(end) = text[start..].find("```") {
-                return Some(text[start..start + end].trim().to_string());
-            }
-        }
-    }
-    None
 }
 
 pub fn run(root: PathBuf, message: String) -> ! {
@@ -103,11 +88,29 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
     let mut last_executed: Option<String> = None;
 
     for step in 0..=max_steps {
+        let trimmed = context::trim_to_budget(
+            context::estimate_tokens(&system_content),
+            history.clone(),
+            cfg.max_context_tokens as usize,
+        );
+        if trimmed.condensed > 0 {
+            eprintln!(
+                "[condensed {} finished step(s) to command + output to fit the ~{} token context \
+                 budget]",
+                trimmed.condensed, cfg.max_context_tokens
+            );
+        }
+        if trimmed.dropped > 0 {
+            eprintln!(
+                "[dropped {} old message(s) to fit the ~{} token context budget]",
+                trimmed.dropped, cfg.max_context_tokens
+            );
+        }
         let mut messages = vec![ChatMessage {
             role: "system".into(),
             content: system_content.clone(),
         }];
-        messages.extend(history.clone());
+        messages.extend(trimmed.messages);
 
         let reply = match llm::send_chat(
             &cfg.endpoint,
@@ -132,7 +135,7 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
         println!("--- step {step} ---");
         println!("{reply}");
 
-        let Some(cmd) = extract_sh_command(&reply) else {
+        let Some(cmd) = rules::extract_command(&reply) else {
             break; // final answer, no more commands proposed
         };
 
@@ -202,8 +205,12 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
                     eprint!("{}", outcome.stderr);
                 }
                 let combined = format!("{}{}", outcome.stdout, outcome.stderr);
+                // Built from the shared prefix rather than spelled out, since
+                // `context.rs` recognizes a finished step by exactly this
+                // shape when condensing (as does `ui/main.js`).
                 let mut feedback = format!(
-                    "[command output, exit {}]\n{}",
+                    "{}{}]\n{}",
+                    context::COMMAND_OUTPUT_PREFIX,
                     outcome.exit_code,
                     combined.trim()
                 );
