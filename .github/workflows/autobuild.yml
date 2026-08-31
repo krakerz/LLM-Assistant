@@ -1,15 +1,15 @@
 name: Autobuild
 
 # Runs on every PR into main and every push to main. Push-to-main additionally
-# reads the version straight out of src-tauri/Cargo.toml and, only if that
+# reads the version straight out of Cargo.toml and, only if that
 # version hasn't been released yet, builds the full bundle and cuts a tag +
 # draft release (release notes pulled from the matching CHANGELOG.md
 # section). Everything else -- PRs, or a push to main that didn't bump the
 # version -- just gets fmt/clippy/test/build as a sanity check.
 #
-# Bump the version with scripts/release.sh (which also promotes
-# CHANGELOG.md's "Unreleased" section) before merging to main to trigger an
-# actual release.
+# To trigger an actual release: bump the version in Cargo.toml and
+# tauri.conf.json, promote CHANGELOG.md's "Unreleased" section to that
+# version, commit, and merge to main.
 on:
   push:
     branches: [main]
@@ -44,21 +44,21 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: .
 
       - name: Check formatting
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+        run: cargo fmt -- --check
 
       - name: Clippy
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test
 
       - name: Read version from Cargo.toml
         id: version
         run: |
-          version="$(grep -m1 '^version' src-tauri/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          version="$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Check whether this version has already been released
@@ -94,7 +94,7 @@ jobs:
       # plain build to confirm nothing's broken -- no tag, no release.
       - name: Build only
         if: "!(github.event_name == 'push' && steps.check_tag.outputs.should_release == 'true')"
-        run: cargo build --manifest-path src-tauri/Cargo.toml --release
+        run: cargo build --release
 
       - name: Build bundle and create draft release
         if: github.event_name == 'push' && steps.check_tag.outputs.should_release == 'true'

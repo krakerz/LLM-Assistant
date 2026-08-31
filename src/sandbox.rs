@@ -17,7 +17,7 @@ use std::process::Command;
 
 const READ_ONLY_BINARIES: &[&str] = &[
     "ls", "cat", "grep", "head", "tail", "wc", "file", "stat", "tree", "pwd", "echo", "du", "df",
-    "find",
+    "find", "uname", "whoami", "id", "hostname",
 ];
 
 /// Any of these appearing in the raw command text means we can no longer
@@ -116,7 +116,13 @@ pub fn run_sandboxed(
     cmd: &str,
 ) -> anyhow::Result<RunOutcome> {
     let mut c = Command::new("bwrap");
+    // Belt and suspenders: env_clear() stops our own process's environment
+    // from reaching bwrap at all, and --clearenv stops bwrap from passing
+    // anything through to the sandboxed shell either. Only PATH and
+    // TRASH_ROOT (set explicitly below) end up visible inside.
+    c.env_clear();
     c.arg("--die-with-parent")
+        .arg("--clearenv")
         .arg("--unshare-all")
         .arg("--proc")
         .arg("/proc")
@@ -136,7 +142,26 @@ pub fn run_sandboxed(
 
     for g in granted {
         let flag = if g.read_write { "--bind" } else { "--ro-bind" };
-        c.arg(flag).arg(&g.path).arg(&g.path);
+        let path = Path::new(&g.path);
+        if !path.exists() {
+            continue; // a stale grant shouldn't break every command
+        }
+        if g.recursive {
+            c.arg(flag).arg(path).arg(path);
+        } else {
+            // A bind mount is inherently recursive, so "just this directory"
+            // means binding each top-level file individually instead of the
+            // whole tree -- subfolders simply aren't bound, so they don't
+            // show up inside the sandbox at all.
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if entry_path.is_file() {
+                        c.arg(flag).arg(&entry_path).arg(&entry_path);
+                    }
+                }
+            }
+        }
     }
 
     let path_env = format!("{}:/usr/bin:/bin", shim_dir.display());

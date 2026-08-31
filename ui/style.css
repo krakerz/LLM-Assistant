@@ -8,6 +8,7 @@
   --accent: #7dd3fc;
   --danger: #f87171;
   --ok: #4ade80;
+  --ui-font-size: 14px;
 }
 
 * {
@@ -25,7 +26,9 @@ body {
   flex-direction: column;
   background: var(--bg);
   color: var(--text);
-  font: 14px/1.45 -apple-system, "Segoe UI", Inter, sans-serif;
+  font-family: -apple-system, "Segoe UI", Inter, sans-serif;
+  font-size: var(--ui-font-size);
+  line-height: 1.45;
 }
 
 .topbar {
@@ -105,7 +108,7 @@ button:disabled {
   background: none;
 }
 
-.bubble.output {
+details.bubble.output {
   align-self: stretch;
   background: #0f1116;
   border: 1px solid var(--border);
@@ -113,14 +116,112 @@ button:disabled {
   font-size: 12.5px;
 }
 
-.output-cmd {
+details.bubble.output summary {
   color: var(--accent);
-  margin-bottom: 4px;
+  cursor: pointer;
+  list-style: revert;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+details.bubble.output summary::marker {
+  color: var(--muted);
+}
+
+details.bubble.output pre {
+  margin: 8px 0 0;
+}
+
+.bubble.manual-cmd {
+  align-self: stretch;
+  background: #241c10;
+  border: 1px solid #6b4a1a;
+}
+
+.manual-cmd-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #e0b35c;
+  font-size: 13px;
+}
+
+.bubble.manual-cmd pre {
+  margin: 8px 0 0;
+  font-family: ui-monospace, monospace;
+  font-size: 12.5px;
+}
+
+details.bubble.thinking {
+  align-self: stretch;
+  background: none;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  padding: 8px 12px;
+}
+
+details.bubble.thinking summary {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  list-style: revert;
+}
+
+details.bubble.thinking summary::marker {
+  color: var(--muted);
+}
+
+details.bubble.thinking[open] summary {
+  margin-bottom: 8px;
+}
+
+details.bubble.thinking > .bubble,
+details.bubble.thinking > details.bubble.output {
+  max-width: 100%;
+  margin-top: 8px;
+}
+
+details.bubble.thinking > .bubble.assistant {
+  background: #191c24;
+  font-size: 0.95em;
 }
 
 .badge {
   color: var(--muted);
   font-size: 11px;
+}
+
+.copy-btn {
+  margin-left: auto;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-family: inherit;
+}
+
+.bubble.assistant code {
+  background: #0f1116;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: ui-monospace, monospace;
+  font-size: 0.9em;
+}
+
+.bubble.assistant pre.md-code {
+  background: #0f1116;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+
+.bubble.assistant pre.md-code code {
+  background: none;
+  border: none;
+  padding: 0;
 }
 
 .chat-form {
@@ -149,6 +250,7 @@ dialog {
   border-radius: 10px;
   padding: 18px;
   width: min(560px, 90vw);
+  font-size: var(--ui-font-size);
 }
 
 dialog::backdrop {
@@ -162,6 +264,51 @@ dialog h3 {
 dialog .explain {
   color: var(--muted);
   font-size: 13px;
+}
+
+.confirm-context {
+  background: #191c24;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13.5px;
+  white-space: pre-wrap;
+}
+
+.confirm-context:empty {
+  display: none;
+}
+
+#settingsDialog {
+  max-height: 85vh;
+  overflow-y: auto;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+
+.tab-btn {
+  background: none;
+  border: none;
+  border-radius: 0;
+  border-bottom: 2px solid transparent;
+  padding: 6px 4px;
+  color: var(--muted);
+}
+
+.tab-btn:hover {
+  background: none;
+  color: var(--text);
+}
+
+.tab-btn.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
 }
 
 dialog .cmd {
@@ -184,9 +331,16 @@ dialog .cmd {
 
 .dialog-actions {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
   gap: 8px;
   margin-top: 14px;
+}
+
+.app-version {
+  margin-right: auto;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 #approveBtn {
@@ -199,7 +353,17 @@ dialog .cmd {
   border-color: #7a2f2f;
 }
 
-#settingsDialog label {
+.stop-btn {
+  background: #5c2424;
+  border-color: #7a2f2f;
+}
+
+.stop-btn:hover {
+  background: #7a2f2f;
+}
+
+#settingsDialog label,
+#addPathDialog label {
   display: block;
   margin: 10px 0 4px;
   color: var(--muted);
@@ -210,7 +374,9 @@ dialog .cmd {
 
 #settingsDialog input[type="text"],
 #settingsDialog input[type="number"],
-#settingsDialog textarea {
+#settingsDialog textarea,
+#addPathDialog input[type="text"],
+#addPathDialog textarea {
   width: 100%;
   background: #0f1116;
   color: var(--text);
@@ -245,31 +411,69 @@ legend {
 .granted-list li {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
-  font-size: 13px;
-  font-family: ui-monospace, monospace;
-}
-
-.granted-add {
-  display: flex;
-  gap: 6px;
-  margin-top: 8px;
-}
-
-.granted-add input {
+  padding: 8px 10px;
   background: #0f1116;
-  color: var(--text);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 6px 8px;
-  font: inherit;
 }
 
-.granted-add input:first-child {
-  flex: 2;
+.granted-empty {
+  color: var(--muted);
+  font-size: 13px;
+  justify-content: flex-start !important;
+  background: none !important;
+  border-style: dashed !important;
 }
 
-.granted-add input:nth-child(2) {
+.granted-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.granted-path-line {
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.granted-note-line {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.quick-add-btn {
+  margin-top: 8px;
+  width: 100%;
+  border-style: dashed;
+  color: var(--accent);
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--accent);
+  padding: 4px 0;
+  font-size: 12px;
+  text-decoration: underline;
+}
+
+.link-btn:hover {
+  background: none;
+  color: var(--text);
+}
+
+.path-row {
+  display: flex;
+  gap: 6px;
+}
+
+.path-row input {
   flex: 1;
 }
 

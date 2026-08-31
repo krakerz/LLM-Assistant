@@ -10,18 +10,23 @@
   <header class="topbar">
     <button id="pickBtn">Select Folder…</button>
     <span id="rootPath" class="root-path">No folder selected</span>
+    <button id="fontDecBtn" title="Decrease font size" class="icon-btn">A−</button>
+    <button id="fontIncBtn" title="Increase font size" class="icon-btn">A+</button>
+    <button id="clearChatBtn" title="Clear the chat">Clear</button>
+    <button id="unmountBtn" title="Stop file access, go back to chat-only">Unmount</button>
     <button id="settingsBtn" title="Settings" class="icon-btn">⚙</button>
   </header>
 
   <main id="chatLog" class="chat-log"></main>
 
   <form id="chatForm" class="chat-form">
-    <textarea id="chatInput" placeholder="Ask the assistant to do something in this folder…" rows="2" disabled></textarea>
-    <button type="submit" id="sendBtn" disabled>Send</button>
+    <textarea id="chatInput" placeholder="Chat, or select a folder above to let it act on files… (Enter to send, Shift+Enter for newline)" rows="2"></textarea>
+    <button type="submit" id="sendBtn">Send</button>
   </form>
 
   <dialog id="confirmDialog">
     <h3>This command needs your approval</h3>
+    <p id="confirmContext" class="confirm-context"></p>
     <p class="explain">
       It writes, deletes, or otherwise changes something — or uses pipes/redirects the sandbox can't
       pre-check. Deletes inside the folder are soft: they land in <code>.temp-trash/</code>, not gone
@@ -40,37 +45,86 @@
 
   <dialog id="settingsDialog">
     <h3>Settings</h3>
-    <label>Endpoint
-      <input id="cfgEndpoint" type="text" placeholder="http://localhost:11434/v1/chat/completions" />
-    </label>
-    <label>Model
-      <input id="cfgModel" type="text" placeholder="llama3.1" />
-    </label>
-    <label>Temperature
-      <input id="cfgTemperature" type="number" step="0.1" min="0" max="2" />
-    </label>
-    <label>System prompt
-      <textarea id="cfgSystemPrompt" rows="6"></textarea>
-    </label>
 
-    <fieldset>
-      <legend>Granted paths (readable outside the folder)</legend>
-      <ul id="grantedList" class="granted-list"></ul>
-      <div class="granted-add">
-        <input id="grantPathInput" type="text" placeholder="/absolute/path" />
-        <input id="grantNoteInput" type="text" placeholder="why" />
-        <button id="grantAddBtn" type="button">Grant read access</button>
-      </div>
-    </fieldset>
+    <div class="tabs">
+      <button type="button" class="tab-btn active" data-tab="general">General</button>
+      <button type="button" class="tab-btn" data-tab="rules">Rules</button>
+    </div>
 
-    <fieldset>
-      <legend>Always-allowed programs</legend>
-      <p id="autoApproveList" class="auto-approve-list"></p>
-    </fieldset>
+    <div class="tab-panel" data-panel="general">
+      <label>Endpoint
+        <input id="cfgEndpoint" type="text" placeholder="http://localhost:11434/v1/chat/completions" />
+      </label>
+      <label>Model
+        <input id="cfgModel" type="text" placeholder="llama3.1" />
+      </label>
+      <label>API key (optional -- sent as an Authorization: Bearer header)
+        <input id="cfgApiKey" type="password" placeholder="leave blank if the endpoint doesn't need one" autocomplete="off" />
+      </label>
+      <label>Temperature
+        <input id="cfgTemperature" type="number" step="0.1" min="0" max="2" />
+      </label>
+      <label>Max automatic steps (propose → run → respond cycles before it waits for you; 0 = no limit)
+        <input id="cfgMaxAutoSteps" type="number" step="1" min="0" />
+      </label>
+      <label>System prompt (persona/focus -- the mechanical rules live in the Rules tab)
+        <textarea id="cfgSystemPrompt" rows="4"></textarea>
+      </label>
+      <button id="resetPromptBtn" type="button" class="link-btn">Reset to default</button>
+
+      <fieldset>
+        <legend>Granted paths (readable outside the folder)</legend>
+        <ul id="grantedList" class="granted-list"></ul>
+        <button id="grantQuickAddBtn" type="button" class="quick-add-btn">+ Add another folder…</button>
+      </fieldset>
+
+      <fieldset>
+        <legend>Always-allowed programs</legend>
+        <p id="autoApproveList" class="auto-approve-list"></p>
+      </fieldset>
+    </div>
+
+    <div class="tab-panel" data-panel="rules" hidden>
+      <p class="explain">
+        Read by the assistant before your system prompt, on every turn. This is the command format,
+        quoting, confirmation, and safety guidance -- edit it if you know what you're changing, or use
+        the system prompt tab for persona/focus instead.
+      </p>
+      <label>Working rules
+        <textarea id="cfgRules" rows="16"></textarea>
+      </label>
+      <button id="resetRulesBtn" type="button" class="link-btn">Reset to default</button>
+    </div>
 
     <div class="dialog-actions">
+      <span id="appVersion" class="app-version"></span>
       <button id="settingsCloseBtn" type="button">Close</button>
       <button id="settingsSaveBtn" type="button">Save</button>
+    </div>
+  </dialog>
+
+  <dialog id="addPathDialog">
+    <h3>Add a readable folder</h3>
+    <p class="explain">
+      The assistant can read (but not modify) this folder for reference, even though it's outside
+      the working directory.
+    </p>
+    <label>Folder
+      <div class="path-row">
+        <input id="addPathInput" type="text" placeholder="/absolute/path" />
+        <button id="addPathBrowseBtn" type="button">Browse…</button>
+      </div>
+    </label>
+    <label>What's it for? (optional -- the assistant sees this, so it knows when to use it)
+      <textarea id="addPathContext" rows="2" placeholder="e.g. check this for reference docs on the API"></textarea>
+    </label>
+    <label class="checkbox-row">
+      <input type="checkbox" id="addPathRecursive" checked />
+      Include subfolders (uncheck to grant only the files directly in this folder)
+    </label>
+    <div class="dialog-actions">
+      <button id="addPathCancelBtn" type="button">Cancel</button>
+      <button id="addPathConfirmBtn" type="button">Grant read access</button>
     </div>
   </dialog>
 
