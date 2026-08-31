@@ -121,8 +121,18 @@ details.bubble.output summary {
   cursor: pointer;
   list-style: revert;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
+}
+
+/* A multi-line command wraps the "$ ..." text across several lines inside
+   this flex row -- without this, the badge and Copy button (also flex
+   children) center vertically across the whole wrapped block instead of
+   sitting next to the first line. */
+details.bubble.output summary .badge,
+details.bubble.output summary .copy-btn {
+  flex-shrink: 0;
+  margin-top: 0.15em;
 }
 
 details.bubble.output summary::marker {
@@ -367,11 +377,16 @@ dialog .cmd {
 
 .checkbox-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   color: var(--muted);
   font-size: 13px;
   margin: 10px 0;
+}
+
+.checkbox-row input[type="checkbox"] {
+  margin-top: 2px;
+  flex-shrink: 0;
 }
 
 .checkbox-row[hidden] {

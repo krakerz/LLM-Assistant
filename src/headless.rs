@@ -80,10 +80,9 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
     };
 
     let root_note = config::build_root_note(Some(root.as_path()), &cfg.granted_paths);
-    let system_content = format!(
-        "{}\n\n{}\n\n{}\n\n{}",
-        general_rules, command_rules, cfg.system_prompt, root_note
-    );
+    let rules_block =
+        rules::build_system_rules(&general_rules, &command_rules, cfg.disable_builtin_rules);
+    let system_content = format!("{}\n\n{}\n\n{}", rules_block, cfg.system_prompt, root_note);
 
     let mut history = vec![ChatMessage {
         role: "user".into(),

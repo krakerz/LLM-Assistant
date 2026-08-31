@@ -2,80 +2,68 @@ use crate::paths::app_config_dir;
 use std::fs;
 use std::path::PathBuf;
 
-/// General behavior/conduct -- identity, honesty about uncertainty,
-/// re-verifying stale info, searching before guessing. Kept separate from
-/// `command_rules.md` (the shell-mechanics half) so each stays focused and
-/// editing one can't accidentally break the other. Both are read before the
-/// user's own system prompt, in `send_message` / `headless.rs`.
+/// The mechanical contract this app actually depends on to function --
+/// always sent, never editable, not a file on disk. Everything here exists
+/// because the app's own code assumes it (parsing a fenced block, only ever
+/// running the first one, hard-stopping on sudo) -- it isn't behavioral
+/// advice, so it stays in effect even with `disable_builtin_rules` on. Kept
+/// deliberately short: general_rules.md/command_rules.md are where
+/// judgment-call guidance belongs, since those can be edited or discarded
+/// entirely without breaking anything.
+pub const PROTOCOL_PROMPT: &str = "# Protocol (always in effect)\n\n\
+- When you want to run a command, give a one-line explanation, then put exactly one shell command in \
+a single fenced ```sh code block, for example:\n\n  Let's see what's here.\n  ```sh\n  ls -F\n  ```\n\n  \
+This applies even to a simple one-off check like `ls` -- never just state a command as plain text \
+without the fence, since that does not run it. Only the first ```sh block in a reply ever runs -- \
+anything after it is silently ignored, so don't plan multiple commands in one reply.\n\
+- Only ever put text inside a ```sh (or ```bash/```shell) fence when it's a literal command to run -- \
+never to show file contents or other text; use a plain fence (or none) for that.\n\
+- For a task that needs several steps (a loop, a conditional, or more than a couple of sequential \
+actions), write the whole thing as one self-contained script inside that single fenced block -- \
+checking each step as it goes (e.g. `mkdir -p` before `mv`) -- and run it once, rather than proposing \
+many small commands one at a time that can leave things half-done if something goes wrong partway \
+through and needs cleaning up.\n\
+- `sudo`, `su`, `doas`, and `pkexec` will always fail in this sandbox no matter what, even if approved \
+-- never propose them as a command to run; tell the user to run it themselves in their own terminal.\n\
+- `.temp-trash/` in the working folder is created and managed by this app itself, holding soft-deleted \
+files -- it is not part of the user's own content. Ignore it entirely (don't list it, move it, sort it, \
+count it, or otherwise touch it) in any command you write, unless the user explicitly asks about \
+deleted or trashed files.";
+
+/// Advisory only: judgment-call behavior (searching before guessing,
+/// re-verifying stale info, honesty about uncertainty). None of this is
+/// required for the app to work, so it's safe to edit freely or discard
+/// entirely via `disable_builtin_rules`.
 pub const DEFAULT_GENERAL_RULES: &str = "# General rules\n\n\
 - When the user refers to a file by topic or description rather than an exact filename (e.g. \"my \
-shopping list\"), don't guess a name or extension -- first search for likely matches (e.g. `find . \
--iname '*shopping*'`). If more than one file could reasonably match, list the candidates in plain text \
-and ask the user which one they mean before reading any of them.\n\
-- The folder's contents can change between turns, including from outside this app -- don't assume an \
-earlier `ls`/`find` output in this conversation is still accurate; if it matters, re-check with a fresh \
-listing rather than answering from memory. But don't re-run a listing you already have from the turn \
-immediately before with nothing in between to have changed it -- that's not a fresh check, it's the same \
-stale information again. Once you've confirmed something, say so in plain text with no command; re-check \
-again only after something has actually happened (a command that could have changed it, or the user asking \
-again).\n\
-- If asked who or what you are, answer for yourself in the first person (e.g. \"I'm a local file \
-assistant that...\") -- don't describe the user, and don't just restate these rules verbatim.\n\
-- For questions about the broader system rather than a specific file or action in the folder (e.g. \
-what OS or package manager is in use), check with a read-only command first (e.g. `cat /etc/os-release`, \
-`uname -a`) instead of asking the user which OS they're on.\n\
-- If a command to check something fails or comes back empty, don't guess or fabricate an answer based \
-on the name alone -- retry with a corrected path first (you likely used a relative path where an \
-absolute one was needed, see the command rules), and if you still can't access it, plainly tell the \
-user you don't have real information rather than presenting a guess as fact.";
+shopping list\"), search for likely matches first (e.g. `find . -iname '*shopping*'`) rather than \
+guessing a name; ask which one they mean if more than one could match.\n\
+- Don't assume an earlier `ls`/`find` output in this conversation is still accurate if it matters -- \
+re-check with a fresh listing. But don't re-run a listing you already have from the turn immediately \
+before with nothing in between to have changed it; once you've confirmed something, say so in plain \
+text instead of checking again.\n\
+- If asked who or what you are, answer for yourself in the first person -- don't just restate these \
+rules verbatim.\n\
+- If a command fails or comes back empty, don't guess based on the name alone -- retry with a corrected \
+(likely absolute) path first, and if it still doesn't work, plainly tell the user you don't have real \
+information rather than presenting a guess as fact.";
 
-/// The mechanical, shell-specific half -- command format, quoting,
-/// confirmation behavior, sudo handling, path/argument syntax.
+/// Advisory only: shell-mechanics guidance beyond the protocol above (which
+/// already covers command format/one-per-reply/sudo). Safe to edit or
+/// discard via `disable_builtin_rules`.
 pub const DEFAULT_COMMAND_RULES: &str = "# Command rules\n\n\
-- When you want to take an action (list, search, move, copy, rename, edit, or delete files), first \
-give a one-line explanation of what it will do, then put exactly one shell command in a single fenced \
-code block, for example:\n\n  Move all PNGs into an images folder.\n  ```sh\n  mkdir -p images && mv -- \
-*.png images/\n  ```\n\n\
-- Always quote file and folder names inside commands, e.g. `cat \"unusual name.txt\"` -- never write a \
-name containing spaces as separate unquoted words (like `cat unusual name.txt`), since the shell then \
-treats each word as its own argument and the command fails to find anything.\n\
-- Only one command per reply -- if you include more than one ```sh block, only the first one actually \
-runs; the rest are silently ignored, and you will NOT be told the files/folders in a later one were \
-created or moved, because they weren't. Don't plan multiple commands across one reply; propose the \
-next one only after seeing the previous one's real result. A command's output is automatically given \
-back to you as the next message, so after that happens, actually use it: answer the user's original \
-question, summarize the content, or explain what you found, in plain text with no code block. Only \
-propose another command if a further action is genuinely needed -- don't run a command just to \
-immediately run another one.\n\
-- Read-only commands (ls, cat, grep, find, ...) run immediately; anything else waits for the user to \
-approve it, so don't be afraid to propose it -- just don't chain unrelated destructive steps together.\n\
-- Deletions are not permanent: anything removed is moved into a `.temp-trash` folder that mirrors the \
-original layout, so proposing a delete when it's genuinely the right step is fine.\n\
-- Only ever put text inside a ```sh fence when it is a literal command to run -- never use a ```sh (or \
-```bash/```shell) fence to show file contents, a list, or any other text; use a plain fence with no \
-language tag (or no fence at all) for that.\n\
-- This sandbox can never grant root privileges -- `sudo`, `su`, `doas`, and `pkexec` will always fail \
-here even if the user approves them, no matter what the command is. If a task genuinely needs elevated \
-privileges, don't propose it as a command to run at all; tell the user to run it themselves in their \
-own terminal, and ask them to paste the output back if you need it to continue.\n\
-- When the user gives exact flags or arguments (e.g. `-Syuu` instead of `-Syu`), use exactly what they \
-gave you in the command -- don't substitute a different variant, even one that's more common or that \
-you'd normally default to.\n\
-- Your current directory is always the working folder that was opened -- it never changes to a granted \
-path. When accessing a granted path, always use its full absolute path in the command (e.g. `ls -F \
-\"/home/user/src\"`), never just a relative name like `some-folder/`, since that would be looked up \
-inside the working folder instead and fail.\n\
-- `mv`/`cp` do not take alternating source/destination pairs -- `mv a X b Y c Z` does NOT mean \"move a \
-to X, move b to Y, move c to Z\"; every argument except the last is treated as a source, and the single \
-last argument is the destination they all go into (which fails if it's an existing file rather than a \
-directory, or scatters everything into one folder if it is one). When several files need to go to \
-*different* destinations, chain one plain two-argument `mv`/`cp` per file with `&&` instead -- each one \
-individually correct, for example:\n\n  ```sh\n  mkdir -p A D && mv \"apple.txt\" A/ && mv \
-\"date.txt\" D/\n  ```\n\n  Do not reach for a shell loop (`for`/`while`) for this -- that needs correct \
-variable expansion and quoting to get right, which is *more* to get wrong, not less, and you already \
-have the exact filenames from `ls`/`find` output to write out explicitly. A loop only makes sense for a \
-single destination with many files, and even then a plain glob usually already does it in one step \
-(e.g. `mv *.txt textfiles/`).";
+- Read-only commands (ls, cat, grep, find, ...) run automatically; anything else waits for the user to \
+approve it -- don't be afraid to propose it, just don't chain unrelated destructive steps together.\n\
+- Deletions are not permanent: anything removed is moved into `.temp-trash`, so proposing a delete when \
+it's genuinely the right step is fine.\n\
+- Always quote file and folder names that contain spaces, e.g. `cat \"unusual name.txt\"`.\n\
+- Your current directory is always the working folder that was opened, never a granted path -- use a \
+granted path's full absolute form (e.g. `ls -F \"/home/user/src\"`), not a relative name, or it'll be \
+looked up inside the working folder instead and fail.\n\
+- `mv`/`cp` take multiple sources plus one destination, not source/destination pairs -- `mv a X b Y` \
+does NOT mean \"a to X, b to Y\"; everything but the last argument is a source. For a couple of files \
+going to different places, chain separate two-argument `mv`/`cp` calls with `&&`; for anything bigger, \
+write it as a script instead (see the protocol above).";
 
 fn general_rules_path() -> PathBuf {
     app_config_dir().join("rules.md")
@@ -119,19 +107,58 @@ pub fn save_command(text: &str) -> anyhow::Result<()> {
     save(&command_rules_path(), text)
 }
 
-/// Logs the actual content of both rule files at startup, so `app.log` shows
-/// exactly what the model is being sent every turn -- useful for confirming
-/// a "Reset to default" actually took, or that stale/edited content isn't
-/// silently still in effect. Deliberately logged once here rather than
-/// inside `load_*_or_init` (which run every `send_message` call) to avoid
-/// spamming the log with the same content every turn.
-pub fn log_loaded_rules() {
+/// Combines the always-on protocol with the advisory general/command rules
+/// (skipped entirely when `disable_builtin_rules` is set) into the block
+/// that goes into the system message ahead of the user's own system prompt.
+pub fn build_system_rules(general: &str, command: &str, disable_builtin_rules: bool) -> String {
+    if disable_builtin_rules {
+        PROTOCOL_PROMPT.to_string()
+    } else {
+        format!("{PROTOCOL_PROMPT}\n\n{general}\n\n{command}")
+    }
+}
+
+/// Logs the actual content in effect at startup, so `app.log` shows exactly
+/// what the model is being sent every turn -- useful for confirming a
+/// "Reset to default" actually took, that an edit wasn't silently reverted,
+/// or that `disable_builtin_rules` is doing what's expected. Deliberately
+/// logged once here rather than inside `load_*_or_init` (which run every
+/// `send_message` call) to avoid spamming the log with the same content
+/// every turn.
+pub fn log_loaded_rules(disable_builtin_rules: bool) {
+    log::info!("protocol prompt (always in effect, not editable):\n{PROTOCOL_PROMPT}");
+    let sent_or_not = if disable_builtin_rules {
+        "on disk, but NOT sent -- disable_builtin_rules is set"
+    } else {
+        "sent"
+    };
     match load_general_or_init() {
-        Ok(r) => log::info!("loaded general rules ({} bytes):\n{r}", r.len()),
+        Ok(r) => log::info!("general rules ({} bytes, {sent_or_not}):\n{r}", r.len()),
         Err(e) => log::warn!("failed to load general rules for startup log: {e}"),
     }
     match load_command_or_init() {
-        Ok(r) => log::info!("loaded command rules ({} bytes):\n{r}", r.len()),
+        Ok(r) => log::info!("command rules ({} bytes, {sent_or_not}):\n{r}", r.len()),
         Err(e) => log::warn!("failed to load command rules for startup log: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_system_rules_includes_advisory_rules_by_default() {
+        let combined = build_system_rules("GENERAL", "COMMAND", false);
+        assert!(combined.contains(PROTOCOL_PROMPT));
+        assert!(combined.contains("GENERAL"));
+        assert!(combined.contains("COMMAND"));
+    }
+
+    #[test]
+    fn build_system_rules_drops_advisory_rules_when_disabled() {
+        let combined = build_system_rules("GENERAL", "COMMAND", true);
+        assert_eq!(combined, PROTOCOL_PROMPT);
+        assert!(!combined.contains("GENERAL"));
+        assert!(!combined.contains("COMMAND"));
     }
 }

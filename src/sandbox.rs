@@ -1,7 +1,8 @@
 //! Linux-only: confines shell commands proposed by the LLM to the selected
 //! working directory (plus explicitly granted paths) using `bwrap`, and
-//! shims `rm` inside the jail to soft-delete into `.temp-trash/` instead of
-//! actually removing files. See project brainstorm notes for the rationale:
+//! shims `rm`/`rmdir` inside the jail to soft-delete into `.temp-trash/`
+//! instead of actually removing files. See project brainstorm notes for the
+//! rationale:
 //! we don't try to classify "is this command safe" from its text (that's
 //! unreliable) -- the sandbox makes "outside the folder" structurally
 //! impossible, and the trash shim makes "destructive inside the folder"
@@ -82,13 +83,18 @@ pub struct RunOutcome {
     pub exit_code: i32,
 }
 
-const RM_SHIM_SCRIPT: &str = r#"#!/bin/sh
-# Soft-delete shim: moves rm's targets into .temp-trash instead of unlinking
-# them, preserving their path relative to the sandbox root so a manual
-# restore just means moving them back. Every invocation gets its own
-# timestamped subfolder (all targets of one rm call share it) so deleting
-# the same path twice can never silently clobber the earlier trashed copy --
-# mv -f below would otherwise overwrite it without a trace.
+// Shared by both the `rm` and `rmdir` shims below -- moves whatever's named
+// into .temp-trash instead of unlinking/removing it, preserving each
+// target's path relative to the sandbox root so a manual restore just means
+// moving it back. Every invocation gets its own timestamped subfolder (all
+// targets of one call share it) so deleting the same path twice can never
+// silently clobber the earlier trashed copy -- mv -f below would otherwise
+// overwrite it without a trace. Note this means `rmdir` no longer fails on
+// a non-empty directory the way real rmdir would -- it always succeeds and
+// moves the whole thing to trash regardless of contents, trading that
+// specific signal for the same "nothing is ever truly gone" guarantee `rm`
+// already gets.
+const TRASH_SHIM_SCRIPT: &str = r#"#!/bin/sh
 trash_root="${TRASH_ROOT:-$PWD/.temp-trash}/$(date +%Y%m%d-%H%M%S-%N)"
 for arg in "$@"; do
   case "$arg" in
@@ -106,9 +112,11 @@ done
 
 pub fn ensure_shims(shim_dir: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(shim_dir)?;
-    let rm_shim = shim_dir.join("rm");
-    fs::write(&rm_shim, RM_SHIM_SCRIPT)?;
-    fs::set_permissions(&rm_shim, fs::Permissions::from_mode(0o755))?;
+    for name in ["rm", "rmdir"] {
+        let shim = shim_dir.join(name);
+        fs::write(&shim, TRASH_SHIM_SCRIPT)?;
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))?;
+    }
     Ok(())
 }
 
@@ -258,6 +266,45 @@ mod tests {
         assert!(
             contents.contains(&"version2".to_string()),
             "second trashed copy missing: {contents:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // rmdir isn't just gated behind confirmation like an unshimmed
+    // destructive command -- it needs to be structurally redirected the
+    // same way rm is, since a real rmdir permanently (if harmlessly, for an
+    // empty dir) removes its target with no recovery path.
+    #[test]
+    fn rmdir_moves_target_to_trash_instead_of_removing_it() {
+        let root = std::env::temp_dir().join(format!(
+            "llm-assistant-sandbox-rmdir-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("empty_folder")).unwrap();
+
+        let shim_dir = root.join("shims");
+        ensure_shims(&shim_dir).unwrap();
+
+        let outcome = run_sandboxed(&root, &shim_dir, &[], "rmdir empty_folder").unwrap();
+        assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+
+        assert!(
+            !root.join("empty_folder").exists(),
+            "empty_folder should no longer be at its original location"
+        );
+        let trash_root = root.join(".temp-trash");
+        let moved: Vec<PathBuf> = fs::read_dir(&trash_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().join("empty_folder"))
+            .filter(|p| p.is_dir())
+            .collect();
+        assert_eq!(
+            moved.len(),
+            1,
+            "expected empty_folder to land in exactly one trash batch, got {moved:?}"
         );
 
         let _ = fs::remove_dir_all(&root);
