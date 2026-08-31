@@ -67,6 +67,12 @@ pub struct AppConfig {
     /// `max_context_tokens` is sane. 0 = no cap.
     #[serde(default = "default_memory_max_tokens")]
     pub memory_max_tokens: u32,
+    /// Chat mode's equivalent of `memory_max_tokens` -- same reasoning,
+    /// different feature: a session's ` ```state ``` ` snapshot sits in the
+    /// system message every turn, which `context.rs` never trims, so this is
+    /// the only thing keeping it in check. 0 = no cap.
+    #[serde(default = "default_chat_state_max_tokens")]
+    pub chat_state_max_tokens: u32,
 }
 
 fn default_confirm_fade_after() -> u32 {
@@ -79,6 +85,10 @@ fn default_memory_enabled() -> bool {
 
 fn default_memory_max_tokens() -> u32 {
     800
+}
+
+fn default_chat_state_max_tokens() -> u32 {
+    500
 }
 
 fn default_max_context_tokens() -> u32 {
@@ -112,6 +122,7 @@ impl Default for AppConfig {
             confirm_fade_after: default_confirm_fade_after(),
             memory_enabled: default_memory_enabled(),
             memory_max_tokens: default_memory_max_tokens(),
+            chat_state_max_tokens: default_chat_state_max_tokens(),
         }
     }
 }

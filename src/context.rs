@@ -27,7 +27,7 @@ const CONDENSED_OUTPUT_CHARS: usize = 400;
 /// `trim_to_budget` re-measures after each step and keeps going.
 const CONDENSED_MIN_BLOCK_CHARS: usize = 60;
 
-fn truncate_with_note(text: &str, max: usize, what: &str) -> String {
+pub(crate) fn truncate_with_note(text: &str, max: usize, what: &str) -> String {
     let total = text.chars().count();
     if total <= max {
         return text.to_string();

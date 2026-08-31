@@ -104,6 +104,22 @@ describe any file as moved, created, or deleted unless output above shows it act
 part of this conversation was summarized or dropped to save context, don't reconstruct what was in \
 it: say you no longer have it rather than describing file contents you cannot see.]";
 
+/// Chat mode's entire mechanical contract -- mechanical because only the app
+/// parses the ` ```state ` fence it describes, so only the app can teach the
+/// syntax exists at all. What's actually worth tracking is up to whatever
+/// persona is loaded (a character sheet might say to track HP, or a
+/// relationship level, or nothing) -- this text never says what to track,
+/// only how. Always sent in chat mode; there's no `disable_builtin_rules`
+/// equivalent here since there's nothing else to conflict with it.
+pub const CHAT_PROTOCOL_PROMPT: &str = "If you want something to reliably persist for the rest of \
+this conversation -- a stat, a fact, a relationship status, anything your character sheet says to \
+keep track of -- put the COMPLETE current version of it in a single fenced ```state code block \
+somewhere in your reply, for example:\n\n```state\nHP: 85/100\nTrust in the user: growing\n```\n\n\
+This replaces everything you wrote in your last ```state block, so restate everything you still \
+want remembered, not just what changed -- anything you leave out is gone. It is never shown to the \
+user as part of your reply, so don't reference it as if they can see it. If nothing needs to \
+change, you don't need to include one at all.";
+
 /// The read side of `PROTOCOL_PROMPT`'s fence contract. Only an
 /// explicitly-tagged fence counts, matching `parseAssistantReply` in
 /// `ui/main.js`: a plain ``` fence is the model showing text.
@@ -184,6 +200,36 @@ fn collapse_blank_runs(text: &str) -> String {
         }
     }
     out
+}
+
+/// The read side of `CHAT_PROTOCOL_PROMPT`'s ` ```state ` contract -- only
+/// the first block counts, matching how only the first ` ```sh ` fence ever
+/// runs in operation mode. `None` means the model didn't update its state
+/// this turn, not that it cleared it.
+pub fn extract_state_block(text: &str) -> Option<String> {
+    let marker = "```state\n";
+    let start = text.find(marker)? + marker.len();
+    let end = text[start..].find("```")?;
+    Some(text[start..start + end].trim().to_string())
+}
+
+/// Removes every ` ```state ` block from `text` for display -- the model is
+/// told this content is never shown to the user, so leaving a stray one
+/// in the chat bubble would contradict that.
+pub fn strip_state_blocks(text: &str) -> String {
+    let mut out = text.to_string();
+    loop {
+        let marker = "```state\n";
+        let Some(pos) = out.find(marker) else {
+            break;
+        };
+        let body_start = pos + marker.len();
+        let Some(end_rel) = out[body_start..].find("```") else {
+            break;
+        };
+        out.replace_range(pos..body_start + end_rel + 3, "");
+    }
+    collapse_blank_runs(&out).trim().to_string()
 }
 
 fn general_rules_path() -> PathBuf {
@@ -267,6 +313,39 @@ pub fn build_system_content(
         log::debug!("session record sent this turn:\n{block}");
         out.push_str("\n\n");
         out.push_str(&block);
+    }
+    out
+}
+
+/// Chat mode's whole system message: the mechanical `CHAT_PROTOCOL_PROMPT`,
+/// then the persona's own content (if one is loaded), then the session's
+/// current ` ```state ` snapshot (if it's ever written one). No root note,
+/// no rules.md/command-rules.md -- those are operation-mode concepts with
+/// nothing to say here.
+///
+/// `state` is capped at `state_max_tokens` (0 = no cap) with an explicit
+/// truncation note, same reasoning as `memory::build_block`'s cap: this goes
+/// in the system message, which `context::fit_to_budget` never trims, so
+/// nothing else is in a position to keep it in check.
+pub fn build_chat_system_content(
+    persona: Option<&str>,
+    state: &str,
+    state_max_tokens: u32,
+) -> String {
+    let mut out = CHAT_PROTOCOL_PROMPT.to_string();
+    if let Some(persona) = persona {
+        out.push_str("\n\n");
+        out.push_str(persona);
+    }
+    let state = state.trim();
+    if !state.is_empty() {
+        let capped = if state_max_tokens == 0 {
+            state.to_string()
+        } else {
+            crate::context::truncate_with_note(state, (state_max_tokens as usize) * 4, "state")
+        };
+        out.push_str("\n\n## Your persistent state from earlier in this conversation\n");
+        out.push_str(&capped);
     }
     out
 }
@@ -361,5 +440,60 @@ mod tests {
             "a truncated reply should not have its only fence silently eaten: {display:?}"
         );
         assert_eq!(extra, 0);
+    }
+
+    #[test]
+    fn extract_state_block_reads_the_content() {
+        let reply = "Sure!\n```state\nHP: 85/100\n```\nDone.";
+        assert_eq!(extract_state_block(reply).as_deref(), Some("HP: 85/100"));
+    }
+
+    #[test]
+    fn extract_state_block_is_none_when_absent() {
+        assert_eq!(extract_state_block("just a normal reply"), None);
+    }
+
+    #[test]
+    fn strip_state_blocks_hides_it_from_display() {
+        let reply = "Here's what happened.\n```state\nHP: 85/100\n```\nAnything else?";
+        let display = strip_state_blocks(reply);
+        assert!(!display.contains("```state"), "{display}");
+        assert!(!display.contains("HP: 85/100"), "{display}");
+        assert!(display.contains("Here's what happened."));
+        assert!(display.contains("Anything else?"));
+    }
+
+    #[test]
+    fn strip_state_blocks_is_a_no_op_without_one() {
+        let reply = "just a normal reply";
+        assert_eq!(strip_state_blocks(reply), reply);
+    }
+
+    #[test]
+    fn build_chat_system_content_includes_persona_and_state() {
+        let out = build_chat_system_content(Some("You are Aria, a shopkeeper."), "HP: 90", 0);
+        assert!(out.contains(CHAT_PROTOCOL_PROMPT));
+        assert!(out.contains("You are Aria, a shopkeeper."));
+        assert!(out.contains("HP: 90"));
+    }
+
+    #[test]
+    fn build_chat_system_content_omits_empty_state() {
+        let out = build_chat_system_content(None, "   ", 0);
+        assert!(!out.contains("persistent state"));
+    }
+
+    #[test]
+    fn build_chat_system_content_caps_a_long_state() {
+        let long_state = "x".repeat(10_000);
+        let out = build_chat_system_content(None, &long_state, 50);
+        assert!(
+            out.len() < long_state.len(),
+            "expected the state to be truncated"
+        );
+        assert!(
+            out.contains("condensed away"),
+            "truncation must be stated, not silent: {out}"
+        );
     }
 }

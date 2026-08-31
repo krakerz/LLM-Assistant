@@ -22,13 +22,63 @@ body {
 }
 
 body {
-  display: flex;
-  flex-direction: column;
   background: var(--bg);
   color: var(--text);
   font-family: -apple-system, "Segoe UI", Inter, sans-serif;
   font-size: var(--ui-font-size);
   line-height: 1.45;
+}
+
+/* The rail plus whichever view is active, side by side. Used to be just
+   `body { display:flex; flex-direction:column }` before there were two
+   views to switch between. */
+.app-shell {
+  display: flex;
+  height: 100%;
+}
+
+.mode-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 6px;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.mode-rail-btn {
+  width: 40px;
+  height: 40px;
+  font-size: 18px;
+  padding: 0;
+  border-radius: 8px;
+  background: none;
+  border: 1px solid transparent;
+}
+
+.mode-rail-btn:hover {
+  background: #2a2e3a;
+}
+
+.mode-rail-btn.active {
+  background: #2a2e3a;
+  border-color: var(--accent);
+}
+
+/* Both file-ops and chat mode fill whatever space the rail leaves --
+   this is what `body` used to be. */
+.view {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+}
+
+.view[hidden] {
+  display: none;
 }
 
 .topbar {
@@ -477,7 +527,9 @@ dialog .cmd {
    explanatory sentences, and a shouted paragraph is unreadable. Hierarchy
    comes from colour and size instead. */
 #settingsDialog label,
-#addPathDialog label {
+#addPathDialog label,
+#newPersonaDialog label,
+#renameSessionDialog label {
   display: block;
   margin: 12px 0 4px;
   color: var(--muted);
@@ -490,7 +542,10 @@ dialog .cmd {
 #settingsDialog input[type="password"],
 #settingsDialog textarea,
 #addPathDialog input[type="text"],
-#addPathDialog textarea {
+#addPathDialog textarea,
+#newPersonaDialog input[type="text"],
+#newPersonaDialog textarea,
+#renameSessionDialog input[type="text"] {
   width: 100%;
   background: #0f1116;
   color: var(--text);
@@ -610,4 +665,110 @@ legend {
   border-radius: 6px;
   font-family: ui-monospace, monospace;
   font-size: 13px;
+}
+
+/* --- Chat mode --- */
+
+select {
+  background: #0f1116;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font: inherit;
+}
+
+.chat-mode-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.chat-session-pane {
+  width: 220px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+}
+
+.new-session-btn {
+  width: 100%;
+}
+
+.chat-session-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.chat-session-list li {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.chat-session-list li:hover {
+  background: #262a36;
+}
+
+.chat-session-list li.active {
+  background: #2b3a52;
+}
+
+.chat-session-item-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.chat-session-item-actions {
+  display: none;
+  gap: 2px;
+}
+
+.chat-session-list li:hover .chat-session-item-actions {
+  display: flex;
+}
+
+.chat-session-item-actions button {
+  padding: 2px 6px;
+  font-size: 11px;
+}
+
+.chat-session-empty {
+  color: var(--muted);
+  font-size: 13px;
+  padding: 8px;
+}
+
+.chat-mode-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Same amber "the app is telling you something worth reading" family as the
+   sudo callout and the summarizer bubble, but quieter -- a state update is
+   routine, not a warning. */
+.bubble.state-updated {
+  align-self: center;
+  color: var(--muted);
+  font-size: 12px;
+  background: none;
+  font-style: italic;
 }

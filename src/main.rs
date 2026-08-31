@@ -1,12 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod chat_log;
+mod chat_session;
 mod config;
 mod context;
 mod headless;
 mod llm;
 mod memory;
 mod paths;
+mod persona;
 mod rules;
 mod sandbox;
 
@@ -523,6 +525,195 @@ fn stop_generation(state: State<AppState>) -> bool {
     }
 }
 
+// --- Chat mode: personas ---
+
+#[tauri::command]
+fn list_personas() -> Result<Vec<persona::PersonaSummary>, String> {
+    persona::list_personas().map_err(|e| e.to_string())
+}
+
+/// Native file picker filtered to `.md`, for importing an existing persona.
+/// Separate from `pick_granted_path`/`pick_folder_path`: those pick a
+/// directory, this picks one file.
+#[tauri::command]
+async fn pick_persona_file(app: AppHandle) -> Result<Option<String>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("Markdown", &["md"])
+        .pick_file(move |file| {
+            let _ = tx.send(file);
+        });
+    let picked = rx.await.map_err(|e| e.to_string())?;
+    Ok(picked.map(|p| p.to_string()))
+}
+
+#[tauri::command]
+fn import_persona(path: String) -> Result<persona::PersonaSummary, String> {
+    persona::import_persona(std::path::Path::new(&path)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_new_persona(name: String, content: String) -> Result<persona::PersonaSummary, String> {
+    persona::save_new_persona(&name, &content).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_persona(name: String) -> Result<(), String> {
+    persona::delete_persona(&name).map_err(|e| e.to_string())
+}
+
+// --- Chat mode: sessions ---
+
+#[tauri::command]
+fn list_chat_sessions() -> Result<Vec<chat_session::SessionSummary>, String> {
+    chat_session::list_sessions().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn create_chat_session(persona: Option<String>) -> Result<chat_session::SessionSummary, String> {
+    chat_session::create_session(persona.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn load_chat_session(session_id: String) -> Result<serde_json::Value, String> {
+    let (meta, history) = chat_session::load_session(&session_id).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "meta": meta, "history": history }))
+}
+
+#[tauri::command]
+fn rename_chat_session(session_id: String, title: String) -> Result<(), String> {
+    chat_session::rename_session(&session_id, &title).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_chat_session(session_id: String) -> Result<(), String> {
+    chat_session::delete_session(&session_id).map_err(|e| e.to_string())
+}
+
+/// Keeps a session's title on `chat_session::DEFAULT_TITLE` from growing
+/// unbounded -- the leading slice of the first message is plenty to
+/// recognize a chat in the session list.
+const AUTO_TITLE_MAX_CHARS: usize = 40;
+
+fn auto_title_from(message: &str) -> String {
+    let flat: String = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > AUTO_TITLE_MAX_CHARS {
+        format!(
+            "{}…",
+            flat.chars().take(AUTO_TITLE_MAX_CHARS).collect::<String>()
+        )
+    } else {
+        flat
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SendChatMessageResult {
+    reply: String,
+    /// Whether this turn's reply included a ` ```state ``` ` block that got
+    /// saved -- the UI shows a small indicator rather than the raw block.
+    state_updated: bool,
+    dropped: usize,
+    condensed: usize,
+    summarized: usize,
+    summary: Option<String>,
+    rewritten_history: Option<Vec<ChatMessage>>,
+}
+
+/// Chat mode's turn: no sandbox, no auto-continue chain, one reply per
+/// message. `history` is the frontend's live copy (already including the new
+/// user message); the updated history -- reply appended, any ` ```state ```
+/// ` block stripped before being stored, since `state.md` already keeps that
+/// content and repeating it in every future turn's history would just waste
+/// tokens re-explaining what the system prompt already says -- is persisted
+/// here before returning, so a session survives a crash up to its last
+/// successful reply.
+#[tauri::command]
+async fn send_chat_message(
+    session_id: String,
+    history: Vec<ChatMessage>,
+) -> Result<SendChatMessageResult, String> {
+    let cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let (meta, _) = chat_session::load_session(&session_id).map_err(|e| e.to_string())?;
+    let persona_content = match &meta.persona {
+        Some(name) => persona::load_persona(name).ok(),
+        None => None,
+    };
+    let state = chat_session::read_state(&session_id);
+    let system_content = rules::build_chat_system_content(
+        persona_content.as_deref(),
+        &state,
+        cfg.chat_state_max_tokens,
+    );
+
+    let summarizer = cfg.summarize_before_dropping.then(|| context::Summarizer {
+        endpoint: &cfg.endpoint,
+        model: &cfg.model,
+        api_key: &cfg.api_key,
+    });
+    let trimmed = context::fit_to_budget(
+        context::estimate_tokens(&system_content),
+        history.clone(),
+        cfg.max_context_tokens as usize,
+        summarizer,
+    )
+    .await;
+    let dropped = trimmed.dropped;
+    let condensed = trimmed.condensed;
+    let summarized = trimmed.summarized;
+    let summary = trimmed.summary;
+    let rewritten_history = trimmed.rewritten_history;
+
+    let mut messages = vec![ChatMessage {
+        role: "system".into(),
+        content: system_content,
+    }];
+    messages.extend(trimmed.messages);
+
+    let reply = llm::send_chat(
+        &cfg.endpoint,
+        &cfg.model,
+        &cfg.api_key,
+        cfg.temperature,
+        &messages,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let state_block = rules::extract_state_block(&reply);
+    let state_updated = state_block.is_some();
+    if let Some(new_state) = &state_block {
+        chat_session::update_state(&session_id, new_state).map_err(|e| e.to_string())?;
+    }
+    // Stored/re-sent history keeps the state block stripped -- `state.md` is
+    // the durable copy, so leaving it in history would just repeat it back
+    // into the system prompt every subsequent turn for no reason.
+    let stored_reply = rules::strip_state_blocks(&reply);
+
+    let mut full_history = rewritten_history.clone().unwrap_or_else(|| history.clone());
+    full_history.push(ChatMessage {
+        role: "assistant".into(),
+        content: stored_reply.clone(),
+    });
+    let title_hint = (full_history.len() == 2)
+        .then(|| full_history.first())
+        .flatten()
+        .map(|m| auto_title_from(&m.content));
+    chat_session::save_history(&session_id, &full_history, title_hint.as_deref())
+        .map_err(|e| e.to_string())?;
+
+    Ok(SendChatMessageResult {
+        reply: stored_reply,
+        state_updated,
+        dropped,
+        condensed,
+        summarized,
+        summary,
+        rewritten_history,
+    })
+}
+
 fn print_help() {
     println!(
         "llm-assistant {} -- chat-driven local file assistant, sandboxed to a chosen folder",
@@ -669,6 +860,17 @@ fn main() {
             start_memory_task,
             record_blocked_command,
             append_chat_log,
+            list_personas,
+            pick_persona_file,
+            import_persona,
+            save_new_persona,
+            delete_persona,
+            list_chat_sessions,
+            create_chat_session,
+            load_chat_session,
+            rename_chat_session,
+            delete_chat_session,
+            send_chat_message,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

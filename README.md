@@ -34,6 +34,15 @@ see [`bwrap(1)`](https://github.com/containers/bubblewrap)), this app makes
 ## Features
 
 - **Sandboxed execution** -- see above.
+- **Two modes, one app** -- File Operations (the sandboxed chat above) and a
+  separate **Chat mode**, switched from an icon rail on the left: purely
+  conversational, no folder, no commands. Load a persona (freeform `.md`
+  character sheet, import one or write your own), keep as many independent
+  conversations as you want (never auto-cleared, unlike everything else this
+  app keeps a rolling history of), and let a persona track something that
+  needs to persist for the whole conversation -- RPG-style stats are the
+  motivating example, but it's really just "whatever the character sheet
+  says to remember."
 - **Works with or without a folder open** -- chat as a plain assistant, or
   select a folder to enable file/command access.
 - **Automatic follow-through** -- after a command runs, the assistant

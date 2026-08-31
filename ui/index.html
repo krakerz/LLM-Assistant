@@ -7,22 +7,85 @@
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <header class="topbar">
-    <button id="pickBtn">Select Folder…</button>
-    <span id="rootPath" class="root-path">No folder selected</span>
-    <button id="fontDecBtn" title="Decrease font size" class="icon-btn">A−</button>
-    <button id="fontIncBtn" title="Increase font size" class="icon-btn">A+</button>
-    <button id="clearChatBtn" title="Clear the chat">Clear</button>
-    <button id="unmountBtn" title="Stop file access, go back to chat-only">Unmount</button>
-    <button id="settingsBtn" title="Settings" class="icon-btn">⚙</button>
-  </header>
+  <div class="app-shell">
+    <nav id="modeRail" class="mode-rail">
+      <button id="fileOpsModeBtn" class="mode-rail-btn active" title="File Operations">🗀</button>
+      <button id="chatModeBtn" class="mode-rail-btn" title="Chat">💬</button>
+    </nav>
 
-  <main id="chatLog" class="chat-log"></main>
+    <div id="fileOpsView" class="view">
+      <header class="topbar">
+        <button id="pickBtn">Select Folder…</button>
+        <span id="rootPath" class="root-path">No folder selected</span>
+        <button id="fontDecBtn" title="Decrease font size" class="icon-btn">A−</button>
+        <button id="fontIncBtn" title="Increase font size" class="icon-btn">A+</button>
+        <button id="clearChatBtn" title="Clear the chat">Clear</button>
+        <button id="unmountBtn" title="Stop file access, go back to chat-only">Unmount</button>
+        <button id="settingsBtn" title="Settings" class="icon-btn">⚙</button>
+      </header>
 
-  <form id="chatForm" class="chat-form">
-    <textarea id="chatInput" placeholder="Chat, or select a folder above to let it act on files… (Enter to send, Shift+Enter for newline)" rows="2"></textarea>
-    <button type="submit" id="sendBtn">Send</button>
-  </form>
+      <main id="chatLog" class="chat-log"></main>
+
+      <form id="chatForm" class="chat-form">
+        <textarea id="chatInput" placeholder="Chat, or select a folder above to let it act on files… (Enter to send, Shift+Enter for newline)" rows="2"></textarea>
+        <button type="submit" id="sendBtn">Send</button>
+      </form>
+    </div>
+
+    <div id="chatModeView" class="view" hidden>
+      <header class="topbar">
+        <select id="personaSelect" title="Persona">
+          <option value="">(no persona)</option>
+        </select>
+        <button id="importPersonaBtn" class="icon-btn" title="Import a persona .md file">⬆</button>
+        <button id="newPersonaBtn" class="icon-btn" title="Write a new persona">＋</button>
+        <button id="deletePersonaBtn" class="icon-btn" title="Delete the selected persona">🗑</button>
+        <span class="root-path" style="flex:1"></span>
+        <button id="chatFontDecBtn" title="Decrease font size" class="icon-btn">A−</button>
+        <button id="chatFontIncBtn" title="Increase font size" class="icon-btn">A+</button>
+      </header>
+
+      <div class="chat-mode-body">
+        <aside id="chatSessionPane" class="chat-session-pane">
+          <button id="newChatSessionBtn" class="new-session-btn">＋ New chat</button>
+          <ul id="chatSessionList" class="chat-session-list"></ul>
+        </aside>
+
+        <div class="chat-mode-main">
+          <main id="chatModeLog" class="chat-log"></main>
+          <form id="chatModeForm" class="chat-form">
+            <textarea id="chatModeInput" placeholder="Message… (Enter to send, Shift+Enter for newline)" rows="2"></textarea>
+            <button type="submit" id="chatModeSendBtn">Send</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <dialog id="newPersonaDialog">
+    <h3>New persona</h3>
+    <label>Name
+      <input id="newPersonaName" type="text" placeholder="e.g. Aria the Shopkeeper" />
+    </label>
+    <label>Character sheet (plain text or Markdown -- whatever the model should know)
+      <textarea id="newPersonaContent" rows="10" placeholder="You are Aria, a cheerful shopkeeper who..."></textarea>
+    </label>
+    <div class="dialog-actions">
+      <button id="newPersonaCancelBtn" type="button">Cancel</button>
+      <button id="newPersonaSaveBtn" type="button">Save</button>
+    </div>
+  </dialog>
+
+  <dialog id="renameSessionDialog">
+    <h3>Rename chat</h3>
+    <label>Title
+      <input id="renameSessionInput" type="text" />
+    </label>
+    <div class="dialog-actions">
+      <button id="renameSessionCancelBtn" type="button">Cancel</button>
+      <button id="renameSessionSaveBtn" type="button">Save</button>
+    </div>
+  </dialog>
 
   <dialog id="confirmDialog">
     <h3>This command needs your approval</h3>
@@ -87,6 +150,9 @@
       </label>
       <label>Token budget for that record (recommended: about a tenth of the context budget above — 800 suits the default 8000; 0 = no cap). It goes in the system block, which is never trimmed, so this is the only thing keeping it in check.
         <input id="cfgMemoryMaxTokens" type="number" step="100" min="0" />
+      </label>
+      <label>Chat mode's persistent-state budget (same reasoning, different feature — a chat session's saved state also sits in the system block every turn; 0 = no cap).
+        <input id="cfgChatStateMaxTokens" type="number" step="100" min="0" />
       </label>
 
       <label class="checkbox-row">
