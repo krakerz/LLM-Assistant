@@ -85,8 +85,11 @@ pub struct RunOutcome {
 const RM_SHIM_SCRIPT: &str = r#"#!/bin/sh
 # Soft-delete shim: moves rm's targets into .temp-trash instead of unlinking
 # them, preserving their path relative to the sandbox root so a manual
-# restore just means moving them back.
-trash_root="${TRASH_ROOT:-$PWD/.temp-trash}"
+# restore just means moving them back. Every invocation gets its own
+# timestamped subfolder (all targets of one rm call share it) so deleting
+# the same path twice can never silently clobber the earlier trashed copy --
+# mv -f below would otherwise overwrite it without a trace.
+trash_root="${TRASH_ROOT:-$PWD/.temp-trash}/$(date +%Y%m%d-%H%M%S-%N)"
 for arg in "$@"; do
   case "$arg" in
     -*) continue ;;
@@ -197,4 +200,66 @@ pub fn run_sandboxed(
 
 pub fn default_shim_dir() -> PathBuf {
     std::env::temp_dir().join("llm-assistant-shims")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{thread::sleep, time::Duration};
+
+    // Proves the timestamped-subfolder fix for real, inside the actual
+    // bwrap sandbox: deleting the same relative path twice must land in two
+    // distinct .temp-trash subfolders, not silently overwrite the first
+    // trashed copy via mv -f. Requires bwrap and coreutils' `date`, same as
+    // the app itself does at runtime.
+    #[test]
+    fn repeated_rm_of_same_path_does_not_clobber_earlier_trash() {
+        let root =
+            std::env::temp_dir().join(format!("llm-assistant-sandbox-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/note.txt"), "version1").unwrap();
+
+        let shim_dir = root.join("shims");
+        ensure_shims(&shim_dir).unwrap();
+
+        let outcome = run_sandboxed(&root, &shim_dir, &[], "rm sub/note.txt").unwrap();
+        assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+
+        // Force a distinct nanosecond-precision timestamp for the second rm.
+        sleep(Duration::from_millis(20));
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/note.txt"), "version2").unwrap();
+        let outcome = run_sandboxed(&root, &shim_dir, &[], "rm sub/note.txt").unwrap();
+        assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+
+        let trash_root = root.join(".temp-trash");
+        let mut timestamp_dirs: Vec<PathBuf> = fs::read_dir(&trash_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        timestamp_dirs.sort();
+        assert_eq!(
+            timestamp_dirs.len(),
+            2,
+            "expected two separate trash batches, got {timestamp_dirs:?}"
+        );
+
+        let contents: Vec<String> = timestamp_dirs
+            .iter()
+            .map(|d| fs::read_to_string(d.join("sub/note.txt")).unwrap())
+            .collect();
+        assert!(
+            contents.contains(&"version1".to_string()),
+            "first trashed copy was lost: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"version2".to_string()),
+            "second trashed copy missing: {contents:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

@@ -196,28 +196,46 @@ fn app_version() -> &'static str {
 }
 
 #[tauri::command]
-fn load_rules() -> Result<String, String> {
-    rules::load_or_init().map_err(|e| e.to_string())
+fn load_general_rules() -> Result<String, String> {
+    rules::load_general_or_init().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn save_rules(rules: String) -> Result<(), String> {
-    log::info!("save_rules: {} bytes", rules.len());
-    rules::save(&rules).map_err(|e| e.to_string())
+fn save_general_rules(rules: String) -> Result<(), String> {
+    log::info!("save_general_rules: {} bytes", rules.len());
+    rules::save_general(&rules).map_err(|e| e.to_string())
 }
 
-/// Appends one entry to `<app-config-dir>/last-chat.log`, mirroring exactly
-/// what the GUI shows (including collapsed "thinking" steps, since a flat
-/// log file has no collapse concept) -- for debugging without driving the
-/// window. Cleared at the start of every GUI launch, see `main()`.
+#[tauri::command]
+fn default_general_rules() -> &'static str {
+    rules::DEFAULT_GENERAL_RULES
+}
+
+#[tauri::command]
+fn load_command_rules() -> Result<String, String> {
+    rules::load_command_or_init().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_command_rules(rules: String) -> Result<(), String> {
+    log::info!("save_command_rules: {} bytes", rules.len());
+    rules::save_command(&rules).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn default_command_rules() -> &'static str {
+    rules::DEFAULT_COMMAND_RULES
+}
+
+/// Appends one entry to this session's `<app-config-dir>/logs/chat-*.log`,
+/// mirroring exactly what the GUI shows (including collapsed "thinking"
+/// steps, since a flat log file has no collapse concept) -- for debugging
+/// without driving the window. A fresh timestamped file is started at the
+/// beginning of every GUI launch (up to 5 kept, oldest deleted first), see
+/// `chat_log::init` and `main()`.
 #[tauri::command]
 fn append_chat_log(text: String) -> Result<(), String> {
     chat_log::append(&text).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn default_rules() -> &'static str {
-    rules::DEFAULT_RULES
 }
 
 #[tauri::command]
@@ -294,6 +312,15 @@ fn add_auto_approve(binary: String) -> Result<AppConfig, String> {
     Ok(cfg)
 }
 
+#[tauri::command]
+fn remove_auto_approve(binary: String) -> Result<AppConfig, String> {
+    let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    log::info!("remove_auto_approve: {binary}");
+    cfg.auto_approve.retain(|b| b != &binary);
+    config::save(&cfg).map_err(|e| e.to_string())?;
+    Ok(cfg)
+}
+
 /// Chat works with no folder open too (a plain assistant) -- the system
 /// prompt gets a note appended about whether a folder is currently open, so
 /// the model knows whether proposing shell commands makes sense right now.
@@ -303,7 +330,8 @@ async fn send_message(
     history: Vec<ChatMessage>,
 ) -> Result<String, String> {
     let cfg = config::load_or_init().map_err(|e| e.to_string())?;
-    let rules = rules::load_or_init().map_err(|e| e.to_string())?;
+    let general_rules = rules::load_general_or_init().map_err(|e| e.to_string())?;
+    let command_rules = rules::load_command_or_init().map_err(|e| e.to_string())?;
     let root = state.root.lock().unwrap().clone();
     log::info!(
         "send_message: endpoint={} model={} root={:?} history_len={}",
@@ -315,11 +343,15 @@ async fn send_message(
 
     let root_note = config::build_root_note(root.as_deref(), &cfg.granted_paths);
 
-    // Rules first (mechanical/protocol, rarely edited), then the user's own
-    // customizable system prompt, then the per-turn folder-state note.
+    // General rules, then command rules (mechanical/protocol, rarely
+    // edited), then the user's own customizable system prompt, then the
+    // per-turn folder-state note.
     let mut messages = vec![ChatMessage {
         role: "system".into(),
-        content: format!("{}\n\n{}\n\n{}", rules, cfg.system_prompt, root_note),
+        content: format!(
+            "{}\n\n{}\n\n{}\n\n{}",
+            general_rules, command_rules, cfg.system_prompt, root_note
+        ),
     }];
     messages.extend(history);
 
@@ -405,8 +437,8 @@ fn print_help() {
         ),
         ("logs/app.log", "internal debug log"),
         (
-            "last-chat.log",
-            "mirror of the GUI conversation, cleared each launch",
+            "logs/chat-*.log",
+            "mirror of the GUI conversation, one per launch, up to 5 kept",
         ),
     ];
     for (name, desc) in files {
@@ -426,6 +458,11 @@ fn main() {
         "LLM Assistant starting, config dir = {}",
         paths::app_config_dir().display()
     );
+    // Logged once at startup (not on every send_message load) so app.log
+    // shows exactly what's in effect for this session -- useful for
+    // confirming a Reset-to-default actually took, or that an edit wasn't
+    // silently reverted.
+    rules::log_loaded_rules();
 
     // `llm-assistant <folder> <message...>` runs headless: one turn (plus
     // any commands it leads to) printed to stdout, no GUI. `llm-assistant
@@ -440,8 +477,9 @@ fn main() {
         log::warn!("ignoring CLI arguments: {:?} is not a directory", args[1]);
     }
 
-    if let Err(e) = chat_log::clear() {
-        log::warn!("failed to clear last-chat.log: {e}");
+    match chat_log::init() {
+        Ok(path) => log::info!("chat log for this session: {}", path.display()),
+        Err(e) => log::warn!("failed to start a new chat log: {e}"),
     }
 
     let cli_root = resolve_cli_root();
@@ -471,14 +509,18 @@ fn main() {
             save_config,
             default_system_prompt,
             app_version,
-            load_rules,
-            save_rules,
-            default_rules,
+            load_general_rules,
+            save_general_rules,
+            default_general_rules,
+            load_command_rules,
+            save_command_rules,
+            default_command_rules,
             classify_command,
             run_command,
             add_granted_path,
             remove_granted_path,
             add_auto_approve,
+            remove_auto_approve,
             send_message,
             stop_generation,
             append_chat_log,
