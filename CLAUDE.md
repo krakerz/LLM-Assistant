@@ -82,7 +82,21 @@ enough edit to do by hand or ask Claude to do directly.
   that's prepended inside the jail, both moving targets into
   `.temp-trash/<timestamp>/<original relative path>` instead of deleting
   them — this runs unconditionally, independent of the read-only/confirmation
-  split, so even a user-approved destructive command stays recoverable. The
+  split, so even a user-approved destructive command stays recoverable. `mv`,
+  `cp` and `truncate` are shimmed too, via `PRESERVE_SHIM_SCRIPT`: they copy
+  whatever is about to be overwritten into the trash and then `exec` the real
+  tool with `"$@"` untouched, so what the user approved is exactly what runs.
+  Its operand scan is deliberately simple (skip `-*` until a bare `--`, treat
+  the last operand as the destination; a directory destination means the
+  victims are `dest/basename(src)`) and gets option *arguments* wrong — `cp
+  -t dir a b` will preserve a source file needlessly. That's an accepted
+  limitation, not an oversight: the failure mode is a wasted copy in the
+  trash, never a lost file and never a changed command. Shell redirection
+  (`>`) can't be reached this way at all since it isn't a program, and stays
+  confirmation-gated only. Every shim starts by resetting `PATH` to drop the
+  shim directory (`SHIM_PATH_RESET`) — without it the `rm` shim's internal
+  `mv` would re-enter the `mv` shim, which is what
+  `shims_do_not_recurse_into_each_other` guards. The
   shim computes its own `date +%Y%m%d-%H%M%S-%N` timestamp per invocation
   (all targets of one call land in the same batch); without it, `mv -f`
   deleting the same path a second time would silently overwrite the first
@@ -122,10 +136,30 @@ enough edit to do by hand or ask Claude to do directly.
   model sees an explicit gap rather than an unexplained jump. `send_message`
   returns `condensed` and `dropped` alongside the reply so the UI can say
   either happened — silent trimming is the exact failure this replaces —
-  reported separately since condensing loses no facts. Both are strictly
-  mechanical, no summarization: see `TODO.md` for why (a bad summary from a
-  small local model outranks a dropped turn as a hazard, since it becomes the
-  record with no transcript left to check it).
+  reported separately since condensing loses no facts. **Summarizing**:
+  `fit_to_budget` (async, the entry point both callers now use) inserts an
+  opt-in third rung *between* those two, gated on
+  `AppConfig.summarize_before_dropping`, default off. Note the ordering
+  carefully — summarizing is the risky rung, not the safe fallback: a
+  model-written summary becomes the record with no transcript left to check
+  it against, whereas a dropped turn leaves a marker saying something was
+  there. So it only fires once `trim_to_budget` reports `dropped > 0` (i.e.
+  the mechanical passes already gave up), runs at temperature 0 without the
+  protocol rules, is capped at `SUMMARY_MAX_CHARS`, and `SUMMARY_PROMPT` is
+  written entirely against observed failures (report only what output shows,
+  prefer output over the assistant's prose, omit rather than guess). A failed
+  or empty call falls back to the mechanical outcome. Unlike condensing, the
+  summary is *persistent*: `FitOutcome.rewritten_history` comes back for the
+  caller to adopt, so it's paid for and written down once instead of being
+  regenerated differently every turn — which is also what makes the span
+  selection (`pick_summary_span`) work on the un-condensed history, so
+  indices map onto the real record. `send_message` returns `summary` +
+  `summarized` + `rewritten_history`; `main.js` adopts the history *before*
+  pushing the turn's reply and renders the summary through `appendSummary` as
+  an expanded, editable bubble (saving matches the message back by content,
+  not a remembered index, since later turns reshuffle the array). Showing and
+  allowing edits is the guardrail, not decoration — a model-written record
+  nobody reads is the whole hazard.
 - `paths.rs` — resolves `$XDG_CONFIG_HOME/llm-assistant` (falls back to
   `~/.config/llm-assistant`) for both config and logs. Deliberately not tied
   to the selected folder, since both need to exist before any folder is
@@ -201,7 +235,10 @@ enough edit to do by hand or ask Claude to do directly.
   commands it leads to) without the GUI, printing to stdout and exiting.
   Mirrors `ui/main.js`'s orchestration logic; anything that would need a
   confirmation click just gets reported and stops the loop instead of
-  running unattended.
+  running unattended. Every turn including the repeat-guard wrap-up goes
+  through `context::fit_to_budget` — the wrap-up used to send the whole
+  untrimmed history, making the turn most likely to overflow the model's real
+  context the only one not protected from it.
 - `llm.rs` — POSTs to `<endpoint>` in OpenAI `/chat/completions` shape; works
   against both Ollama and LM Studio without a vendor SDK. Sends
   `Authorization: Bearer <api_key>` when one is configured (LM Studio can be
@@ -287,7 +324,14 @@ worded *not* to presuppose success — an earlier version asked for "what was
 done and what the final result is", and after two denied commands (nothing
 having run at all) the model duly invented a completed reorganization,
 naming files and folders that didn't exist. It now asks for the current
-state strictly from output actually received.
+state strictly from output actually received, plus a clause covering the
+trimming case (if part of the conversation was summarized or dropped, say so
+rather than reconstructing file contents from filenames — observed inventing
+"a document about Project B" for a file whose contents had been trimmed
+away). That text lives in `rules::FINAL_ANSWER_PROMPT` and must stay
+byte-identical to the copy in `finalAnswerTurn`: headless carried the old
+presupposing wording for a release after the GUI was fixed, and reproduced
+the fabrication, which is why they now share a constant.
 
 Denying a command likewise ends the chain rather than auto-continuing — a
 denial is a deliberate "no", and continuing let the model keep flailing and
@@ -309,7 +353,18 @@ exactly what caused it to loop re-proposing the same sudo command. The
 "always allow" checkbox in the confirm dialog calls `add_auto_approve`, which
 is still gated by the same no-shell-metacharacters check inside
 `sandbox::is_auto_approved` — a user can whitelist a program, never a
-pipe/redirect shape. `splitCommandSequence` (used by `requestApproval` to
+pipe/redirect shape. Alongside it, `recordApproval`/`sessionApproved`
+implement a much weaker session-scoped version of the same idea: after
+`confirm_fade_after` approvals (default 3, 0 = off) of the same program, the
+app stops asking about it — announced with a "Keep asking" undo, reset by
+`resetApprovalFade` when the folder changes or the chat is cleared, and
+revoked entirely by a single denial (`recordDenial`). It's inferred rather
+than chosen, and confirmation fatigue is the reason it exists: a dialog that
+always appears and is always approved stops being read, which is worse than
+one that appears rarely. The list is handed to `classify_command` and
+evaluated by that *same* `is_auto_approved` in Rust rather than checked in
+JS, so the metacharacter rule can't drift out of sync with a second copy of
+itself. `splitCommandSequence` (used by `requestApproval` to
 decide whether the confirm dialog shows a checklist or one opaque block)
 splits on bare newlines as well as `&&`/`;`, not just `&&`/`;` -- a model
 asked to do several things in sequence often just writes one command per
@@ -335,6 +390,16 @@ rather than a cramped inline row — that note isn't just cosmetic, it's folded
 into `config::build_root_note` so the model can proactively decide to read a
 granted path for a matching task instead of only when the user states the
 absolute path themselves.
+
+The sandbox tests in `sandbox.rs` run `bwrap` for real, which not every
+machine allows — Ubuntu 24.04 restricts unprivileged user namespaces through
+AppArmor, and the failure surfaces as `bwrap: loopback: Failed RTM_NEWADDR:
+Operation not permitted` when `--unshare-net` tries to bring up loopback.
+`sandbox_available()` probes for this and the tests skip rather than fail,
+since a red test there means "this machine won't run bwrap", not "the shim is
+broken". The skip prints the bwrap error loudly on purpose: a silent skip of
+the sandbox tests is indistinguishable from them passing, so CI relaxes the
+restriction up front and that line is how you find out it didn't work.
 
 **CI** (`.github/workflows/autobuild.yml`) is a single workflow triggered
 only by pushes to `main` (a PR by itself triggers nothing; no manual tag

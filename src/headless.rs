@@ -88,17 +88,37 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
     let mut last_executed: Option<String> = None;
 
     for step in 0..=max_steps {
-        let trimmed = context::trim_to_budget(
+        let summarizer = cfg.summarize_before_dropping.then(|| context::Summarizer {
+            endpoint: &cfg.endpoint,
+            model: &cfg.model,
+            api_key: &cfg.api_key,
+        });
+        let trimmed = context::fit_to_budget(
             context::estimate_tokens(&system_content),
             history.clone(),
             cfg.max_context_tokens as usize,
-        );
+            summarizer,
+        )
+        .await;
         if trimmed.condensed > 0 {
             eprintln!(
                 "[condensed {} finished step(s) to command + output to fit the ~{} token context \
                  budget]",
                 trimmed.condensed, cfg.max_context_tokens
             );
+        }
+        if let Some(summary) = &trimmed.summary {
+            // Printed in full, same as the GUI shows it: a model-written
+            // record nobody gets to look at is the whole hazard here.
+            eprintln!(
+                "[summarized {} old message(s) to fit the ~{} token context budget]\n{summary}",
+                trimmed.summarized, cfg.max_context_tokens
+            );
+        }
+        // Adopted as the real history so the summary is written once rather
+        // than re-generated (differently) on every following step.
+        if let Some(rewritten) = trimmed.rewritten_history {
+            history = rewritten;
         }
         if trimmed.dropped > 0 {
             eprintln!(
@@ -150,23 +170,28 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
             // One final no-command turn so the run ends on a real answer.
             history.push(ChatMessage {
                 role: "user".into(),
-                content: "[you proposed the exact same command again immediately after it already \
-                          ran, with nothing new to justify re-running it -- it was not run again. \
-                          You already have its output above.]"
-                    .into(),
+                content: rules::REPEATED_COMMAND_NOTE.into(),
             });
+            history.push(ChatMessage {
+                role: "user".into(),
+                content: rules::FINAL_ANSWER_PROMPT.into(),
+            });
+            // Through the same budget as every other turn. This used to send
+            // the whole untrimmed history, which meant the one turn most
+            // likely to overflow the model's real context was the only one
+            // not protected from doing so.
+            let trimmed = context::fit_to_budget(
+                context::estimate_tokens(&system_content),
+                history.clone(),
+                cfg.max_context_tokens as usize,
+                None,
+            )
+            .await;
             let mut messages = vec![ChatMessage {
                 role: "system".into(),
                 content: system_content.clone(),
             }];
-            messages.extend(history.clone());
-            messages.push(ChatMessage {
-                role: "user".into(),
-                content: "[don't run anything else -- you already have everything you need. Reply \
-                          now in plain text, with no command and no code fence, telling the user \
-                          what was done and what the final result is.]"
-                    .into(),
-            });
+            messages.extend(trimmed.messages);
             match llm::send_chat(
                 &cfg.endpoint,
                 &cfg.model,

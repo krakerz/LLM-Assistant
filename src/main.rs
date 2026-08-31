@@ -186,6 +186,53 @@ fn save_config(cfg: AppConfig) -> Result<(), String> {
     config::save(&cfg).map_err(|e| e.to_string())
 }
 
+/// Checks the endpoint/model/key the user has typed *in the dialog*, not what
+/// is on disk -- the point is to find out whether it works before saving it.
+/// Sends a real (tiny) completion rather than pinging `/models`, because the
+/// failures worth catching here are the ones a bare reachability check
+/// misses: a wrong model name, a missing or rejected API key, an endpoint URL
+/// pointing at the right server but the wrong path.
+#[tauri::command]
+async fn test_connection(
+    endpoint: String,
+    model: String,
+    api_key: String,
+) -> Result<String, String> {
+    log::info!("test_connection: endpoint={endpoint} model={model}");
+    let probe = vec![ChatMessage {
+        role: "user".into(),
+        content: "Reply with the single word: ok".into(),
+    }];
+    match llm::send_chat(&endpoint, &model, &api_key, 0.0, &probe).await {
+        Ok(reply) => {
+            let reply = reply.trim();
+            log::info!("test_connection: ok, model replied {reply:?}");
+            // The content doesn't matter -- a reply of any kind means the
+            // whole path (URL, auth, model name, response shape) works.
+            Ok(if reply.is_empty() {
+                "Connected, but the model returned an empty reply.".into()
+            } else {
+                format!("Connected. {model} replied: {}", first_line(reply))
+            })
+        }
+        Err(e) => {
+            log::warn!("test_connection failed: {e}");
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Keeps a chatty model's test reply to one line in the dialog; the full
+/// thing is in `app.log` if it matters.
+fn first_line(text: &str) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.chars().count() > 80 {
+        format!("{}…", line.chars().take(80).collect::<String>())
+    } else {
+        line.to_string()
+    }
+}
+
 #[tauri::command]
 fn default_system_prompt() -> &'static str {
     config::DEFAULT_SYSTEM_PROMPT
@@ -239,12 +286,24 @@ fn append_chat_log(text: String) -> Result<(), String> {
     chat_log::append(&text).map_err(|e| e.to_string())
 }
 
+/// `session_approved` is the frontend's fade-out list (see
+/// `confirm_fade_after`): programs the user has already approved enough times
+/// in this session that it stopped asking. It's evaluated here, through the
+/// same `is_auto_approved`, rather than being checked in JS -- that function
+/// also refuses anything containing a shell metacharacter, and a second copy
+/// of that rule living in `main.js` is exactly the kind of thing that would
+/// quietly stop matching the real one.
 #[tauri::command]
-fn classify_command(cmd: String) -> Result<serde_json::Value, String> {
+fn classify_command(
+    cmd: String,
+    session_approved: Vec<String>,
+) -> Result<serde_json::Value, String> {
     let cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let mut allowed = cfg.auto_approve.clone();
+    allowed.extend(session_approved);
     Ok(serde_json::json!({
         "classification": sandbox::classify_command(&cmd),
-        "auto_approved": sandbox::is_auto_approved(&cmd, &cfg.auto_approve),
+        "auto_approved": sandbox::is_auto_approved(&cmd, &allowed),
     }))
 }
 
@@ -335,6 +394,17 @@ struct SendMessageResult {
     /// normally). Reported separately from `dropped` because it's a much
     /// milder thing to have happened -- nothing factual was lost.
     condensed: usize,
+    /// How many messages were folded into `summary` (0 unless the opt-in
+    /// summarizer ran).
+    summarized: usize,
+    /// The summary text itself, so the UI can show it and let the user fix
+    /// it. Handing it back rather than swallowing it is the whole guardrail:
+    /// a model-written record nobody ever sees is the risk this feature
+    /// carries.
+    summary: Option<String>,
+    /// The conversation with the summary spliced in, for the frontend to
+    /// adopt as its new history. `None` whenever nothing was summarized.
+    rewritten_history: Option<Vec<ChatMessage>>,
     estimated_tokens: usize,
 }
 
@@ -367,19 +437,35 @@ async fn send_message(
         rules::build_system_rules(&general_rules, &command_rules, cfg.disable_builtin_rules);
     let system_content = format!("{}\n\n{}\n\n{}", rules_block, cfg.system_prompt, root_note);
 
-    // Condense finished chain steps, and drop the oldest turns if that still
-    // isn't enough, rather than letting this overflow the context window.
-    // The system block is never touched -- it's the contract the app's own
-    // parsing depends on.
-    let trimmed = context::trim_to_budget(
+    // Condense finished chain steps, optionally summarize what would
+    // otherwise be lost, and drop the oldest turns if it still doesn't fit,
+    // rather than letting this overflow the context window. The system block
+    // is never touched -- it's the contract the app's own parsing depends on.
+    let summarizer = cfg.summarize_before_dropping.then(|| context::Summarizer {
+        endpoint: &cfg.endpoint,
+        model: &cfg.model,
+        api_key: &cfg.api_key,
+    });
+    let trimmed = context::fit_to_budget(
         context::estimate_tokens(&system_content),
         history,
         cfg.max_context_tokens as usize,
-    );
+        summarizer,
+    )
+    .await;
     if trimmed.condensed > 0 {
         log::info!(
             "send_message: condensed {} finished step(s) to command + output",
             trimmed.condensed
+        );
+    }
+    if let Some(summary) = &trimmed.summary {
+        // Logged in full: the summary becomes the record the model works
+        // from, so it needs to be checkable after the fact, not just at the
+        // moment it scrolls past in the chat.
+        log::warn!(
+            "send_message: summarized {} old message(s) into:\n{summary}",
+            trimmed.summarized
         );
     }
     if trimmed.dropped > 0 {
@@ -397,6 +483,9 @@ async fn send_message(
     }
     let dropped = trimmed.dropped;
     let condensed = trimmed.condensed;
+    let summarized = trimmed.summarized;
+    let summary = trimmed.summary;
+    let rewritten_history = trimmed.rewritten_history;
     let estimated_tokens = trimmed.estimated_tokens;
 
     let mut messages = vec![ChatMessage {
@@ -429,6 +518,9 @@ async fn send_message(
                 reply,
                 dropped,
                 condensed,
+                summarized,
+                summary,
+                rewritten_history,
                 estimated_tokens,
             })
         }
@@ -564,6 +656,7 @@ fn main() {
             load_config,
             save_config,
             default_system_prompt,
+            test_connection,
             app_version,
             load_general_rules,
             save_general_rules,

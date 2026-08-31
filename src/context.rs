@@ -7,18 +7,28 @@
 //! This trims from the oldest end instead, and says so out loud rather than
 //! dropping things silently.
 //!
-//! Two mechanisms, tried in that order because the first loses less: an
-//! auto-continue chain's finished steps are *condensed* to the command that
-//! ran and what it printed (the model's running commentary is what bulks
-//! those up, and it's the part with no facts in it), and only if that still
-//! doesn't fit are whole messages dropped from the oldest end.
+//! Three mechanisms, tried in that order because each loses more than the
+//! last:
 //!
-//! Deliberately *only* mechanical, no summarization: the local models this
-//! app talks to have already been caught fabricating a whole completed
-//! directory reorganization that never happened, and a bad summary is worse
-//! than a dropped turn -- it becomes the authoritative record with no
-//! transcript left to check it against. Condensing keeps the command text
-//! and the real output verbatim, so nothing here ever invents a fact.
+//! 1. **Condensing** -- an auto-continue chain's finished steps collapse to
+//!    the command that ran and what it printed. The model's running
+//!    commentary is what bulks those up, and it's the part with no facts in
+//!    it.
+//! 2. **Summarizing** -- opt-in (`AppConfig.summarize_before_dropping`), and
+//!    only once the mechanical pass has already given up and something was
+//!    about to be lost outright.
+//! 3. **Dropping** -- oldest first, with an explicit gap marker left behind.
+//!
+//! Note the ordering of 2 and 3: summarizing is *not* the safe fallback, it
+//! is the risky one. The local models this app talks to have been caught
+//! fabricating a whole completed directory reorganization that never
+//! happened, and a summary is worse than a dropped turn in exactly that
+//! case, because it becomes the authoritative record with no transcript left
+//! to check it against -- whereas a gap marker at least says "something was
+//! here, go and look". So it's off by default, prompted at temperature 0 to
+//! report only what command output actually shows, and handed back to the UI
+//! to be displayed and edited rather than quietly applied. Steps 1 and 3
+//! stay purely mechanical and cannot invent anything.
 
 use crate::llm::ChatMessage;
 use crate::rules;
@@ -218,6 +228,210 @@ pub fn trim_to_budget(
     }
 }
 
+// --- Summarization (opt-in, `AppConfig.summarize_before_dropping`) ---
+//
+// The last resort, sitting between condensing and dropping. Everything above
+// this line is mechanical and cannot invent a fact; this can, which is why
+// it's off by default, why the prompt below is written the way it is, and
+// why the result is handed back to the UI to be shown and edited rather than
+// quietly folded into the history.
+
+/// Where the summarizer is pointed. Same endpoint/model as the conversation
+/// itself -- deliberately not a separate "small model" setting, since there's
+/// only one thing configured here and a second one to get wrong is worse
+/// than reusing the first.
+pub struct Summarizer<'a> {
+    pub endpoint: &'a str,
+    pub model: &'a str,
+    pub api_key: &'a str,
+}
+
+/// Below this, summarizing isn't worth a whole round-trip to the model --
+/// dropping two or three messages with a marker says as much as a summary of
+/// them would.
+const MIN_MESSAGES_TO_SUMMARIZE: usize = 4;
+
+/// Hard cap on the summary, both to keep it from being a second transcript
+/// and so the space reserved for it before the call is actually enough.
+const SUMMARY_MAX_CHARS: usize = 1200;
+
+/// Every line here exists because of an observed failure mode, not as
+/// general good advice. The models this talks to have been caught reporting
+/// a directory reorganization that never ran, so the prompt keeps pointing
+/// back at command output as the only thing that counts as evidence, and
+/// asks for omission rather than a guess. Sent with temperature 0 and
+/// *without* the app's protocol rules -- there is no command to propose here.
+const SUMMARY_PROMPT: &str = "You are compressing the oldest part of a transcript between a user \
+and a file assistant, so it can be kept in a limited context window. Write the summary that will \
+replace it.\n\n\
+- Report only what the text actually shows. Never say a file was created, moved, renamed, or \
+deleted unless a command's output in the text shows that it happened.\n\
+- Command output is the record. Where the assistant's prose disagrees with the output it got, go \
+with the output.\n\
+- Say plainly when something failed, was denied, or never ran. Those matter more than successes.\n\
+- Keep exact names verbatim: files, folders, paths, commands.\n\
+- Keep what the user asked for and any constraints or preferences they stated.\n\
+- If the text doesn't establish something, leave it out. Never fill a gap with a guess.\n\
+- Answer with short factual bullet points and nothing else: no preamble, no closing remarks, no \
+code fences, no offers to help.";
+
+fn summary_marker(count: usize) -> String {
+    format!(
+        "[summary of {count} earlier messages, written by the model to save context -- a lossy \
+         record, not evidence. Don't treat anything here as proof that something happened; if a \
+         detail matters, re-check it with a command.]"
+    )
+}
+
+/// Picks how many messages after the first to hand to the summarizer: enough
+/// of the oldest ones to cover the overshoot plus room for the summary
+/// itself. Measured against the *un*-condensed history so the span maps back
+/// onto the real record cleanly -- condensing shrinks these same messages, so
+/// this errs toward taking slightly more than strictly needed, which is the
+/// safe direction (the drop pass is still there if it doesn't). Never
+/// includes message 0 (the original request) or the last one (the turn being
+/// answered).
+fn pick_summary_span(history: &[ChatMessage], system_tokens: usize, budget: usize) -> usize {
+    let total: usize = system_tokens
+        + history
+            .iter()
+            .map(|m| estimate_tokens(&m.content))
+            .sum::<usize>();
+    let reserve = SUMMARY_MAX_CHARS.div_ceil(4) + estimate_tokens(&summary_marker(0));
+    let mut need = (total + reserve).saturating_sub(budget);
+
+    let mut taken = 0;
+    for msg in history.iter().skip(1).take(history.len().saturating_sub(2)) {
+        if need == 0 {
+            break;
+        }
+        need = need.saturating_sub(estimate_tokens(&msg.content));
+        taken += 1;
+    }
+    taken
+}
+
+async fn summarize(s: &Summarizer<'_>, victims: &[ChatMessage]) -> anyhow::Result<String> {
+    let transcript = victims
+        .iter()
+        .map(|m| format!("{}: {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: SUMMARY_PROMPT.into(),
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: transcript,
+        },
+    ];
+    // Temperature 0: this is a record, and a creative one is the failure
+    // mode. Also means re-running it on the same input is stable.
+    let text = crate::llm::send_chat(s.endpoint, s.model, s.api_key, 0.0, &messages).await?;
+    let text = text.trim();
+    if text.is_empty() {
+        anyhow::bail!("summarizer returned nothing");
+    }
+    Ok(truncate_with_note(text, SUMMARY_MAX_CHARS, "summary"))
+}
+
+/// What one turn's context handling produced.
+pub struct FitOutcome {
+    /// What to actually send this turn.
+    pub messages: Vec<ChatMessage>,
+    /// The stored conversation, rewritten -- `Some` only when summarizing
+    /// replaced part of it. The caller is expected to adopt this as the new
+    /// history: a summary costs a round-trip and isn't reproducible, so it
+    /// gets written down once rather than recomputed (differently) every
+    /// turn. Condensing is left out of this on purpose -- it's free and
+    /// deterministic, so the full transcript stays recoverable.
+    pub rewritten_history: Option<Vec<ChatMessage>>,
+    /// The summary text on its own, for showing (and editing) in the UI.
+    pub summary: Option<String>,
+    /// Messages folded into that summary.
+    pub summarized: usize,
+    pub condensed: usize,
+    pub dropped: usize,
+    pub estimated_tokens: usize,
+}
+
+impl FitOutcome {
+    fn mechanical(trim: TrimOutcome) -> Self {
+        Self {
+            messages: trim.messages,
+            rewritten_history: None,
+            summary: None,
+            summarized: 0,
+            condensed: trim.condensed,
+            dropped: trim.dropped,
+            estimated_tokens: trim.estimated_tokens,
+        }
+    }
+}
+
+/// The full ladder: condense, then (only if that left something to be thrown
+/// away, and only when the user opted in) summarize, then drop whatever is
+/// still over budget.
+///
+/// Summarizing is gated on the mechanical passes having *already* failed --
+/// `trim.dropped > 0` is exactly the signal that turns were about to be lost
+/// outright, which is the only situation where paying a model to write the
+/// record is the better trade. If the call fails, or comes back empty, the
+/// result is simply the mechanical outcome: a dropped turn with an honest
+/// gap marker beats a summary that isn't there.
+pub async fn fit_to_budget(
+    system_tokens: usize,
+    history: Vec<ChatMessage>,
+    budget: usize,
+    summarizer: Option<Summarizer<'_>>,
+) -> FitOutcome {
+    let mechanical = trim_to_budget(system_tokens, history.clone(), budget);
+    let Some(s) = summarizer else {
+        return FitOutcome::mechanical(mechanical);
+    };
+    if budget == 0 || mechanical.dropped == 0 {
+        return FitOutcome::mechanical(mechanical);
+    }
+
+    let span = pick_summary_span(&history, system_tokens, budget);
+    if span < MIN_MESSAGES_TO_SUMMARIZE {
+        return FitOutcome::mechanical(mechanical);
+    }
+
+    let summary = match summarize(&s, &history[1..=span]).await {
+        Ok(text) => text,
+        Err(e) => {
+            log::warn!("summarizing older turns failed, falling back to dropping them: {e}");
+            return FitOutcome::mechanical(mechanical);
+        }
+    };
+
+    let mut rewritten = history;
+    rewritten.splice(
+        1..=span,
+        [ChatMessage {
+            role: "user".into(),
+            // Inserted as a *user* message, so even if the model puts a
+            // ```sh fence in its summary, nothing parses or runs it -- only
+            // assistant replies are scanned for commands.
+            content: format!("{}\n{summary}", summary_marker(span)),
+        }],
+    );
+
+    let trim = trim_to_budget(system_tokens, rewritten.clone(), budget);
+    FitOutcome {
+        messages: trim.messages,
+        rewritten_history: Some(rewritten),
+        summary: Some(summary),
+        summarized: span,
+        condensed: trim.condensed,
+        dropped: trim.dropped,
+        estimated_tokens: trim.estimated_tokens,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +610,65 @@ mod tests {
             condensed.content.contains("condensed away"),
             "truncation must be stated, not silent: {condensed:?}"
         );
+    }
+
+    #[test]
+    fn summary_span_never_takes_the_first_or_last_message() {
+        let h = history(40);
+        let span = pick_summary_span(&h, 50, 600);
+        assert!(span > 0);
+        assert!(
+            span <= h.len() - 2,
+            "span {span} would swallow the turn being answered"
+        );
+    }
+
+    #[test]
+    fn summary_span_is_zero_when_everything_already_fits() {
+        let h = history(4);
+        assert_eq!(pick_summary_span(&h, 50, 100_000), 0);
+    }
+
+    /// The summarizer is an LLM call, so the paths worth pinning down in a
+    /// unit test are the ones that decide *whether* to make it. Everything
+    /// here must resolve without one.
+    #[tokio::test]
+    async fn no_summarizer_configured_falls_back_to_mechanical_trimming() {
+        let out = fit_to_budget(50, history(40), 600, None).await;
+        assert!(out.dropped > 0);
+        assert!(out.summary.is_none());
+        assert!(out.rewritten_history.is_none());
+    }
+
+    #[tokio::test]
+    async fn summarizing_is_skipped_when_condensing_alone_was_enough() {
+        // A pointless endpoint: reaching it would be the bug this asserts
+        // against, since nothing was going to be dropped here.
+        let s = Summarizer {
+            endpoint: "http://127.0.0.1:1/never",
+            model: "none",
+            api_key: "",
+        };
+        let out = fit_to_budget(20, chain(6), 400, Some(s)).await;
+        assert!(out.condensed > 0);
+        assert_eq!(out.dropped, 0);
+        assert!(out.summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_summarizer_falls_back_to_dropping() {
+        let s = Summarizer {
+            endpoint: "http://127.0.0.1:1/refused",
+            model: "none",
+            api_key: "",
+        };
+        let out = fit_to_budget(50, history(40), 600, Some(s)).await;
+        assert!(
+            out.summary.is_none(),
+            "a failed call must not fabricate one"
+        );
+        assert!(out.dropped > 0, "the mechanical result must still apply");
+        assert!(out.messages.iter().any(|m| m.content == TRIM_MARKER));
     }
 
     #[test]

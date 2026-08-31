@@ -20,6 +20,80 @@ All notable changes to this project are documented here. The format follows
   way. Applies to headless mode too.
   Still strictly mechanical -- the command text and its real output are kept
   verbatim, so this can't invent a fact the way a summary could.
+- **Summarize old turns instead of dropping them** — new setting, **off by
+  default on purpose**. When condensing isn't enough and turns were about to
+  be lost outright, the model is asked (at temperature 0) to summarize the
+  oldest stretch into a few factual bullets, which then replace those
+  messages. The summary is written once and kept, not regenerated each turn.
+  Off by default because this is the risky rung of the ladder, not the safe
+  one: a wrong summary becomes the record the assistant works from, with no
+  transcript left to check it against, whereas a dropped turn at least leaves
+  a gap marker saying "something was here". The guardrails are the point --
+  the prompt insists on reporting only what command output actually shows and
+  on omitting rather than guessing, the summary is shown expanded in the chat
+  and **can be edited in place**, and it's written to `app.log` in full. If
+  the call fails, trimming just falls back to dropping.
+
+- **`mv`, `cp` and `truncate` are now shimmed too**, so the soft-delete
+  guarantee covers more than `rm`/`rmdir`. `mv a b` and `cp a b` silently
+  destroy `b`, and `truncate -s 0 b` empties it in place — all unrecoverable,
+  and previously gated only by the confirmation dialog. Whatever is about to
+  be overwritten is copied into `.temp-trash` first, then the real tool runs
+  with its arguments untouched, so what the user approved is exactly what
+  executes. Shell redirection (`>`) still can't be caught this way — it isn't
+  a program — and remains confirmation-gated only.
+- **Confirmation fade-out.** After three approvals of the same program in one
+  session (`confirm_fade_after`, new setting, 0 = always ask), the app stops
+  asking about that program — announced in the chat with a "Keep asking"
+  undo. A dialog that appears every time and is approved every time stops
+  being read, which is worse than one that appears rarely. Much weaker than
+  the existing "always allow" checkbox on purpose: nothing is written to
+  config, it's forgotten when the app closes or you open a different folder,
+  and a single denial puts that program straight back to always-asking. The
+  permission check still runs through `sandbox::is_auto_approved` in Rust, so
+  this can fade a program, never a pipe or a redirect.
+- **"Test connection" button** in Settings, next to the endpoint. Sends a real
+  one-word completion using what's currently typed in the dialog rather than
+  what's saved, so a wrong model name, a rejected API key, or an endpoint URL
+  pointing at the right server but the wrong path all show up before you
+  commit the change. Failures show the raw endpoint error, since a 404 and a
+  401 need different fixes.
+- The "add a readable folder" dialog now names the endpoint those files would
+  be sent to, and warns when it isn't on this machine. Granting a path is a
+  data-egress decision, and the endpoint lives on a different Settings tab
+  from the dialog where that decision gets made.
+
+### Changed
+- The protocol prompt now tells the model to write the line above a command
+  in the future tense ("this will move the files"), not the past ("the files
+  have been organized"). The command hasn't run yet at that point and can
+  still be refused or fail — and that pre-emptive phrasing is the habit that
+  fed a real fabricated completion report.
+
+### Fixed
+- **CI failed on every push.** The sandbox tests run `bwrap` for real, and
+  `--unshare-net` brings up loopback inside the new network namespace, which
+  Ubuntu 24.04 refuses for unprivileged user namespaces: `bwrap: loopback:
+  Failed RTM_NEWADDR: Operation not permitted`. The workflow now relaxes that
+  restriction before running tests, and the tests probe for a usable sandbox
+  and skip — loudly, with the bwrap error printed — instead of reporting a
+  failure that isn't about this code.
+- **Headless mode's wrap-up turn could fabricate a completion report.** When
+  the repeat guard stops a chain, headless asked the model to say "what was
+  done and what the final result is" — the exact presupposing wording that
+  was removed from the GUI in 1.5.1 for inviting invented results, but never
+  updated here. Observed directly: after context trimming had dropped the
+  file contents it had read, it closed by describing `b.md` as "a document
+  about Project B" and `notes/a.md` as "personal notes outlining tasks",
+  neither of which existed. Both places now share one constant
+  (`rules::FINAL_ANSWER_PROMPT`), which also adds a clause for the trimming
+  case: if part of the conversation was summarized or dropped, say so rather
+  than reconstructing file contents from the filename. The same run now ends
+  with just the listing it actually still has.
+- Headless mode's wrap-up turn sent the entire untrimmed history, so the one
+  turn most likely to overflow the model's real context was the only one not
+  going through the context budget. It now takes the same path as every
+  other turn.
 
 ## [1.6.0] - 2026-08-31
 ### Added

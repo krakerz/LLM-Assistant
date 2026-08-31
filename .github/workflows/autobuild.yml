@@ -42,6 +42,22 @@ jobs:
             patchelf \
             bubblewrap
 
+      # The sandbox tests actually run bwrap, and bwrap's --unshare-net
+      # brings up loopback inside the new netns -- which Ubuntu 24.04 refuses
+      # for unprivileged user namespaces by default, failing with
+      # "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted".
+      # Relaxing the AppArmor restriction here is what lets those tests run
+      # for real rather than skip themselves (see `sandbox_available` in
+      # src/sandbox.rs). Not fatal if it doesn't take: the probe line in the
+      # test output is where you find out they were skipped.
+      - name: Allow unprivileged user namespaces (needed by bwrap)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          echo "bwrap sandbox probe:"
+          bwrap --unshare-all --ro-bind / / /bin/true \
+            && echo "  OK -- sandbox tests will run" \
+            || echo "  UNAVAILABLE -- sandbox tests will skip themselves"
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
