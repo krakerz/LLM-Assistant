@@ -27,7 +27,7 @@ const CONDENSED_OUTPUT_CHARS: usize = 400;
 /// `trim_to_budget` re-measures after each step and keeps going.
 const CONDENSED_MIN_BLOCK_CHARS: usize = 60;
 
-fn truncate_with_note(text: &str, max: usize, what: &str) -> String {
+pub(crate) fn truncate_with_note(text: &str, max: usize, what: &str) -> String {
     let total = text.chars().count();
     if total <= max {
         return text.to_string();
@@ -43,6 +43,26 @@ fn truncate_with_note(text: &str, max: usize, what: &str) -> String {
 /// differently. Runs optimistic on shell output, so budgets need headroom.
 pub fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
+}
+
+/// A base64 image easily runs to hundreds of thousands of characters, and a
+/// real vision model's actual per-image token cost is nowhere near
+/// proportional to that -- it's a much smaller, roughly fixed amount that
+/// depends on the model and the image's resolution, not its encoded length.
+/// Running the encoded blob through `chars/4` like ordinary text would make
+/// trimming think one attached picture costs 100k+ tokens and start
+/// aggressively condensing or dropping history the moment someone attaches
+/// one. This flat per-image estimate is a deliberately rough placeholder
+/// instead -- cheap and wrong in a bounded way, matching the spirit of
+/// `estimate_tokens` itself, rather than wrong in an unbounded one.
+const ESTIMATED_TOKENS_PER_IMAGE: usize = 1000;
+
+/// Every message-token estimate in this module goes through here rather
+/// than `estimate_tokens(&msg.content)` directly, so an image attachment
+/// (chat mode only -- operation mode never has one) is never invisible to
+/// the budget it's actually part of.
+fn estimate_message_tokens(msg: &ChatMessage) -> usize {
+    estimate_tokens(&msg.content) + msg.images.len() * ESTIMATED_TOKENS_PER_IMAGE
 }
 
 pub struct TrimOutcome {
@@ -111,14 +131,14 @@ fn condense_result(content: &str, budget: usize) -> String {
 fn condense_step(proposal: &ChatMessage, result: &ChatMessage) -> ChatMessage {
     let cmd = rules::extract_command(&proposal.content)
         .unwrap_or_else(|| "(command could not be re-read)".to_string());
-    ChatMessage {
-        role: "user".into(),
-        content: format!(
+    ChatMessage::text(
+        "user",
+        format!(
             "{CONDENSED_MARKER} $ {}\n{}",
             truncate_with_note(&cmd, CONDENSED_COMMAND_CHARS, "command"),
             condense_result(&result.content, CONDENSED_OUTPUT_CHARS)
         ),
-    }
+    )
 }
 
 /// Condense, then drop, until it fits `budget` (0 disables). The first
@@ -130,7 +150,7 @@ pub fn trim_to_budget(
     budget: usize,
 ) -> TrimOutcome {
     let mut history = history;
-    let history_tokens: usize = history.iter().map(|m| estimate_tokens(&m.content)).sum();
+    let history_tokens: usize = history.iter().map(estimate_message_tokens).sum();
     let mut total = system_tokens + history_tokens;
 
     let mut condensed = 0;
@@ -140,7 +160,7 @@ pub fn trim_to_budget(
                 break;
             };
             let before =
-                estimate_tokens(&history[i].content) + estimate_tokens(&history[i + 1].content);
+                estimate_message_tokens(&history[i]) + estimate_message_tokens(&history[i + 1]);
             let merged = condense_step(&history[i], &history[i + 1]);
             total = total + estimate_tokens(&merged.content) - before;
             history.splice(i..=i + 1, [merged]);
@@ -158,11 +178,11 @@ pub fn trim_to_budget(
     }
 
     let first = history[0].clone();
-    let mut used = system_tokens + estimate_tokens(&first.content) + estimate_tokens(TRIM_MARKER);
+    let mut used = system_tokens + estimate_message_tokens(&first) + estimate_tokens(TRIM_MARKER);
 
     let mut kept_tail: Vec<ChatMessage> = Vec::new();
     for (i, msg) in history.iter().enumerate().skip(1).rev() {
-        let cost = estimate_tokens(&msg.content);
+        let cost = estimate_message_tokens(msg);
         // The last message is the turn being answered: keep it regardless.
         if used + cost > budget && i != history.len() - 1 {
             break;
@@ -176,10 +196,7 @@ pub fn trim_to_budget(
     let mut messages = Vec::with_capacity(kept_tail.len() + 2);
     messages.push(first);
     if dropped > 0 {
-        messages.push(ChatMessage {
-            role: "user".into(),
-            content: TRIM_MARKER.into(),
-        });
+        messages.push(ChatMessage::text("user", TRIM_MARKER));
     }
     messages.extend(kept_tail);
 
@@ -235,11 +252,7 @@ fn summary_marker(count: usize) -> String {
 /// Measured against the un-condensed history so the span maps onto the stored
 /// record; that over-takes slightly, which is the safe direction.
 fn pick_summary_span(history: &[ChatMessage], system_tokens: usize, budget: usize) -> usize {
-    let total: usize = system_tokens
-        + history
-            .iter()
-            .map(|m| estimate_tokens(&m.content))
-            .sum::<usize>();
+    let total: usize = system_tokens + history.iter().map(estimate_message_tokens).sum::<usize>();
     let reserve = SUMMARY_MAX_CHARS.div_ceil(4) + estimate_tokens(&summary_marker(0));
     let mut need = (total + reserve).saturating_sub(budget);
 
@@ -248,7 +261,7 @@ fn pick_summary_span(history: &[ChatMessage], system_tokens: usize, budget: usiz
         if need == 0 {
             break;
         }
-        need = need.saturating_sub(estimate_tokens(&msg.content));
+        need = need.saturating_sub(estimate_message_tokens(msg));
         taken += 1;
     }
     taken
@@ -261,14 +274,8 @@ async fn summarize(s: &Summarizer<'_>, victims: &[ChatMessage]) -> anyhow::Resul
         .collect::<Vec<_>>()
         .join("\n\n");
     let messages = vec![
-        ChatMessage {
-            role: "system".into(),
-            content: SUMMARY_PROMPT.into(),
-        },
-        ChatMessage {
-            role: "user".into(),
-            content: transcript,
-        },
+        ChatMessage::text("system", SUMMARY_PROMPT),
+        ChatMessage::text("user", transcript),
     ];
     // Temperature 0: a creative record is the failure mode.
     let text = crate::llm::send_chat(s.endpoint, s.model, s.api_key, 0.0, &messages).await?;
@@ -341,12 +348,12 @@ pub async fn fit_to_budget(
     let mut rewritten = history;
     rewritten.splice(
         1..=span,
-        [ChatMessage {
-            // A user message, so a ```sh fence in the summary can never be
-            // parsed as a command -- only assistant replies are scanned.
-            role: "user".into(),
-            content: format!("{}\n{summary}", summary_marker(span)),
-        }],
+        // A user message, so a ```sh fence in the summary can never be
+        // parsed as a command -- only assistant replies are scanned.
+        [ChatMessage::text(
+            "user",
+            format!("{}\n{summary}", summary_marker(span)),
+        )],
     );
 
     let trim = trim_to_budget(system_tokens, rewritten.clone(), budget);
@@ -366,10 +373,30 @@ mod tests {
     use super::*;
 
     fn msg(role: &str, content: &str) -> ChatMessage {
-        ChatMessage {
-            role: role.into(),
-            content: content.into(),
-        }
+        ChatMessage::text(role, content)
+    }
+
+    // An attached image is chat-mode-only in practice, but `trim_to_budget`
+    // is shared code -- this pins the exact bug the flat-per-image estimate
+    // exists to prevent: naive chars/4 on a base64 blob would make one
+    // attached picture look like ~100k tokens and get the rest of a short,
+    // legitimate conversation dropped to "fit" around it.
+    #[test]
+    fn an_attached_image_does_not_blow_the_token_estimate() {
+        let mut with_image = msg("user", "what's in this picture?");
+        with_image.images = vec![format!("data:image/png;base64,{}", "A".repeat(500_000))];
+
+        let h = vec![msg("user", "hello"), msg("assistant", "hi"), with_image];
+        let out = trim_to_budget(20, h, 5000);
+        assert_eq!(
+            out.dropped, 0,
+            "a short conversation plus one image should still fit 5000"
+        );
+        assert!(
+            out.estimated_tokens < 50_000,
+            "flat-per-image estimate should dominate, not chars/4 of the base64 blob: {}",
+            out.estimated_tokens
+        );
     }
 
     fn history(n: usize) -> Vec<ChatMessage> {

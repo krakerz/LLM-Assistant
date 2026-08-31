@@ -1,12 +1,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod chat_cli;
 mod chat_log;
+mod chat_session;
+mod chat_turn;
 mod config;
 mod context;
 mod headless;
 mod llm;
 mod memory;
 mod paths;
+mod persona;
 mod rules;
 mod sandbox;
 
@@ -184,10 +188,7 @@ async fn test_connection(
     api_key: String,
 ) -> Result<String, String> {
     log::info!("test_connection: endpoint={endpoint} model={model}");
-    let probe = vec![ChatMessage {
-        role: "user".into(),
-        content: "Reply with the single word: ok".into(),
-    }];
+    let probe = vec![ChatMessage::text("user", "Reply with the single word: ok")];
     match llm::send_chat(&endpoint, &model, &api_key, 0.0, &probe).await {
         Ok(reply) => {
             let reply = reply.trim();
@@ -446,10 +447,7 @@ async fn send_message(
     let rewritten_history = trimmed.rewritten_history;
     let estimated_tokens = trimmed.estimated_tokens;
 
-    let mut messages = vec![ChatMessage {
-        role: "system".into(),
-        content: system_content,
-    }];
+    let mut messages = vec![ChatMessage::text("system", system_content)];
     messages.extend(trimmed.messages);
 
     // Spawned, not awaited, so `stop_generation` has something to abort.
@@ -523,13 +521,188 @@ fn stop_generation(state: State<AppState>) -> bool {
     }
 }
 
+// --- Chat mode: personas ---
+
+#[tauri::command]
+fn list_personas() -> Result<Vec<persona::PersonaSummary>, String> {
+    persona::list_personas().map_err(|e| e.to_string())
+}
+
+/// Native file picker filtered to `.md`, for importing an existing persona.
+/// Separate from `pick_granted_path`/`pick_folder_path`: those pick a
+/// directory, this picks one file.
+#[tauri::command]
+async fn pick_persona_file(app: AppHandle) -> Result<Option<String>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("Markdown", &["md"])
+        .pick_file(move |file| {
+            let _ = tx.send(file);
+        });
+    let picked = rx.await.map_err(|e| e.to_string())?;
+    Ok(picked.map(|p| p.to_string()))
+}
+
+#[tauri::command]
+fn import_persona(path: String) -> Result<persona::PersonaSummary, String> {
+    persona::import_persona(std::path::Path::new(&path)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_new_persona(name: String, content: String) -> Result<persona::PersonaSummary, String> {
+    persona::save_new_persona(&name, &content).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_persona(name: String) -> Result<(), String> {
+    persona::delete_persona(&name).map_err(|e| e.to_string())
+}
+
+// --- Chat mode: sessions ---
+
+#[tauri::command]
+fn list_chat_sessions() -> Result<Vec<chat_session::SessionSummary>, String> {
+    chat_session::list_sessions().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn create_chat_session(persona: Option<String>) -> Result<chat_session::SessionSummary, String> {
+    chat_session::create_session(persona.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn load_chat_session(session_id: String) -> Result<serde_json::Value, String> {
+    let (meta, history) = chat_session::load_session(&session_id).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "meta": meta, "history": history }))
+}
+
+#[tauri::command]
+fn rename_chat_session(session_id: String, title: String) -> Result<(), String> {
+    chat_session::rename_session(&session_id, &title).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_chat_session(session_id: String) -> Result<(), String> {
+    chat_session::delete_session(&session_id).map_err(|e| e.to_string())
+}
+
+/// Keeps a session's title on `chat_session::DEFAULT_TITLE` from growing
+/// unbounded -- the leading slice of the first message is plenty to
+/// recognize a chat in the session list.
+#[derive(serde::Serialize)]
+struct SendChatMessageResult {
+    reply: String,
+    thinking: Option<String>,
+    /// Whether this turn's reply included a ` ```state ``` ` block that got
+    /// saved -- the UI shows a small indicator rather than the raw block.
+    state_updated: bool,
+    dropped: usize,
+    condensed: usize,
+    summarized: usize,
+    summary: Option<String>,
+    rewritten_history: Option<Vec<ChatMessage>>,
+}
+
+/// Thin wrapper around `chat_turn::run_chat_turn`, the logic shared with the
+/// `--persona-chat` CLI (`chat_cli.rs`) -- this command just loads config and
+/// maps the error type Tauri expects.
+#[tauri::command]
+async fn send_chat_message(
+    session_id: String,
+    history: Vec<ChatMessage>,
+) -> Result<SendChatMessageResult, String> {
+    let cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let outcome = chat_turn::run_chat_turn(&cfg, &session_id, history)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(SendChatMessageResult {
+        reply: outcome.reply,
+        thinking: outcome.thinking,
+        state_updated: outcome.state_updated,
+        dropped: outcome.dropped,
+        condensed: outcome.condensed,
+        summarized: outcome.summarized,
+        summary: outcome.summary,
+        rewritten_history: outcome.rewritten_history,
+    })
+}
+
+/// Passive, best-effort hint for whether the configured model supports
+/// vision -- never authoritative (see `llm::probe_vision_capability`'s own
+/// doc comment for why). `None` means neither known backend answered, not
+/// "no vision."
+#[tauri::command]
+async fn probe_vision_capability(endpoint: String, model: String) -> Option<bool> {
+    llm::probe_vision_capability(&endpoint, &model).await
+}
+
+/// A small, fixed, solid-red 2x2 PNG -- deliberately trivial for a model to
+/// describe correctly, so a reply that doesn't mention red is as telling as
+/// an outright error. Hand-built (raw scanlines + zlib + PNG chunk framing,
+/// no image crate needed for something this small) and round-trip verified
+/// -- decoded, decompressed, and pixel-checked -- before being embedded here.
+const VISION_TEST_IMAGE_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR42mP4z8AARAwQCgAf7gP9Y167WwAAAABJRU5ErkJggg==";
+
+/// Sends the test image plus a one-word question, mirroring
+/// `test_connection`'s honesty: the raw reply or the raw error, never a
+/// guess dressed up as a verdict. A non-vision model/backend either errors
+/// outright or answers without ever mentioning red -- both read clearly as
+/// "no" without this trying to parse the reply itself beyond that one check.
+#[tauri::command]
+async fn test_vision_support(
+    endpoint: String,
+    model: String,
+    api_key: String,
+) -> Result<String, String> {
+    log::info!("test_vision_support: endpoint={endpoint} model={model}");
+    let mut probe = ChatMessage::text(
+        "user",
+        "What color is this image? Answer with just the color name.",
+    );
+    probe.images = vec![format!(
+        "data:image/png;base64,{VISION_TEST_IMAGE_PNG_BASE64}"
+    )];
+    match llm::send_chat(&endpoint, &model, &api_key, 0.0, &[probe]).await {
+        Ok(reply) => {
+            let reply = reply.trim();
+            log::info!("test_vision_support: model replied {reply:?}");
+            if reply.to_lowercase().contains("red") {
+                Ok(format!("Vision works. {model} correctly saw a red image."))
+            } else if reply.is_empty() {
+                Err("The model replied with nothing at all.".into())
+            } else {
+                Err(format!(
+                    "The model replied but never said \"red\" -- it probably can't see the \
+                     image. It said: {}",
+                    first_line(reply)
+                ))
+            }
+        }
+        Err(e) => {
+            log::warn!("test_vision_support failed: {e}");
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Finds `--flag <value>` anywhere in argv and returns `<value>`. Simple on
+/// purpose -- chat mode's CLI has exactly two optional flags, not enough to
+/// justify a real argument-parsing dependency.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
 fn print_help() {
     println!(
         "llm-assistant {} -- chat-driven local file assistant, sandboxed to a chosen folder",
         env!("CARGO_PKG_VERSION")
     );
     println!("\nUSAGE:");
-    let usage: [(&str, &str); 4] = [
+    let usage: [(&str, &str); 8] = [
         ("llm-assistant", "Launch the GUI, no folder preloaded"),
         (
             "llm-assistant <folder>",
@@ -538,6 +711,22 @@ fn print_help() {
         (
             "llm-assistant <folder> <message>",
             "Headless: run one turn against <folder>, print the result, and exit -- no GUI",
+        ),
+        (
+            "llm-assistant <folder> --chat",
+            "Interactive file-ops chat against <folder> -- no GUI, Ctrl+D/Ctrl+C to exit",
+        ),
+        (
+            "llm-assistant --persona-chat [--persona <name>] [--session <id>]",
+            "Chat mode's own CLI -- no folder, no shell commands, purely conversational",
+        ),
+        (
+            "llm-assistant --list-personas",
+            "List saved personas, for use with --persona",
+        ),
+        (
+            "llm-assistant --list-sessions",
+            "List chat mode sessions, for use with --session",
         ),
         ("llm-assistant --help | -h", "Show this help"),
     ];
@@ -567,6 +756,14 @@ fn print_help() {
 }
 
 fn main() {
+    // WebKitGTK's DMABUF renderer draws a blank white window on many
+    // driver/compositor combinations. It bites the AppImage hardest, which
+    // ships its own WebKitGTK, so a working host copy doesn't save it. Set
+    // before any GTK/WebKit init; an explicit value from the environment wins.
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     let args: Vec<String> = std::env::args().collect();
     if args.iter().skip(1).any(|a| a == "--help" || a == "-h") {
         print_help();
@@ -578,6 +775,31 @@ fn main() {
         "LLM Assistant starting, config dir = {}",
         paths::app_config_dir().display()
     );
+
+    // `--persona-chat` is chat mode's own CLI, entirely separate from
+    // operation mode's folder-based dispatch below: no folder, ever, and
+    // none of operation mode's rules/memory apply. Checked before the
+    // rules-logging and memory-init steps below, which are both irrelevant
+    // noise for a pure chat-mode invocation (rules::log_loaded_rules alone
+    // dumps the whole protocol prompt to the log at INFO level).
+    if args.iter().any(|a| a == "--list-personas") {
+        chat_cli::list_personas();
+        return;
+    }
+    if args.iter().any(|a| a == "--list-sessions") {
+        chat_cli::list_sessions();
+        return;
+    }
+    if args.iter().any(|a| a == "--persona-chat") {
+        let persona = flag_value(&args, "--persona");
+        let session_id = flag_value(&args, "--session");
+        log::info!("persona chat CLI: persona={persona:?} session={session_id:?}");
+        chat_cli::run(chat_cli::Options {
+            persona,
+            session_id,
+        });
+    }
+
     // Once at startup, so app.log shows what's in effect without spamming.
     let startup_cfg = config::load_or_init().unwrap_or_default();
     rules::log_loaded_rules(startup_cfg.disable_builtin_rules);
@@ -591,10 +813,15 @@ fn main() {
         Err(e) => log::warn!("failed to start session memory: {e}"),
     }
 
-    // `<folder> <message...>` runs headless; `<folder>` alone preloads the GUI.
+    // `<folder> <message...>` runs headless; `<folder> --chat` starts an
+    // interactive terminal session; `<folder>` alone preloads the GUI.
     if args.len() >= 3 {
         let root = PathBuf::from(&args[1]);
         if root.is_dir() {
+            if args.len() == 3 && args[2] == "--chat" {
+                log::info!("interactive chat mode: root={}", root.display());
+                headless::run_chat(root);
+            }
             let message = args[2..].join(" ");
             log::info!("headless mode: root={} message={message:?}", root.display());
             headless::run(root, message);
@@ -652,6 +879,19 @@ fn main() {
             start_memory_task,
             record_blocked_command,
             append_chat_log,
+            list_personas,
+            pick_persona_file,
+            import_persona,
+            save_new_persona,
+            delete_persona,
+            list_chat_sessions,
+            create_chat_session,
+            load_chat_session,
+            rename_chat_session,
+            delete_chat_session,
+            send_chat_message,
+            probe_vision_capability,
+            test_vision_support,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -75,6 +75,21 @@ pub const REPEATED_COMMAND_NOTE: &str = "[you proposed the exact same command ag
 after it already ran, with nothing new to justify re-running it -- it was not run again. You \
 already have its output above.]";
 
+/// The immediate-repeat check above only catches a command run twice *in a
+/// row* -- an alternating loop (`ls -F`, `cat notes.txt`, `ls -F`, `cat
+/// notes.txt`, ...) walks straight past it, and with `max_auto_steps = 0`
+/// (unlimited) that reproduced as a genuinely endless chain during testing.
+/// This is the second guard: once one exact command string has been run
+/// this many times in a single auto-continue chain, regardless of what ran
+/// in between, treat it as stuck. Must stay identical to the constant of
+/// the same name in `ui/main.js`.
+pub const STUCK_LOOP_REPEAT_THRESHOLD: u32 = 4;
+
+/// Must stay identical to the note pushed in `ui/main.js` for the same guard.
+pub const STUCK_LOOP_NOTE: &str = "[that exact command has come up too many times in this \
+conversation without moving anything forward -- it was not run again. You already have its \
+output from earlier -- work from that, or try something genuinely different.]";
+
 /// Wrap-up turn after a hard stop, commands off the table. Every clause is
 /// load-bearing: "what was done and what the final result is" presupposed
 /// success and got a fabricated reorganization; "you already have everything
@@ -88,6 +103,22 @@ actually received above. If commands were denied, never ran, or failed, say that
 describe any file as moved, created, or deleted unless output above shows it actually happened. If \
 part of this conversation was summarized or dropped to save context, don't reconstruct what was in \
 it: say you no longer have it rather than describing file contents you cannot see.]";
+
+/// Chat mode's entire mechanical contract -- mechanical because only the app
+/// parses the ` ```state ` fence it describes, so only the app can teach the
+/// syntax exists at all. What's actually worth tracking is up to whatever
+/// persona is loaded (a character sheet might say to track HP, or a
+/// relationship level, or nothing) -- this text never says what to track,
+/// only how. Always sent in chat mode; there's no `disable_builtin_rules`
+/// equivalent here since there's nothing else to conflict with it.
+pub const CHAT_PROTOCOL_PROMPT: &str = "If you want something to reliably persist for the rest of \
+this conversation -- a stat, a fact, a relationship status, anything your character sheet says to \
+keep track of -- put the COMPLETE current version of it in a single fenced ```state code block \
+somewhere in your reply, for example:\n\n```state\nHP: 85/100\nTrust in the user: growing\n```\n\n\
+This replaces everything you wrote in your last ```state block, so restate everything you still \
+want remembered, not just what changed -- anything you leave out is gone. It is never shown to the \
+user as part of your reply, so don't reference it as if they can see it. If nothing needs to \
+change, you don't need to include one at all.";
 
 /// The read side of `PROTOCOL_PROMPT`'s fence contract. Only an
 /// explicitly-tagged fence counts, matching `parseAssistantReply` in
@@ -107,6 +138,183 @@ pub fn extract_command(text: &str) -> Option<String> {
     let start = earliest?;
     let end = text[start..].find("```")?;
     Some(text[start..start + end].trim().to_string())
+}
+
+/// Strips every ```sh/```bash/```shell fence out of `text`, mirroring
+/// `parseAssistantReply` in `ui/main.js`: only the first fence in a reply
+/// ever runs (see `extract_command` above), so a plain terminal client that
+/// echoed the rest back would show commands that look pending but never run.
+/// Returns the cleaned prose (blank-line runs collapsed, trimmed) plus how
+/// many *extra* fences were found beyond the first -- the caller decides
+/// whether that's worth telling the model about, same as the GUI does.
+pub fn strip_command_fences(text: &str) -> (String, usize) {
+    let mut out = text.to_string();
+    let mut found: usize = 0;
+    loop {
+        let mut earliest: Option<(usize, usize)> = None;
+        for lang in ["sh", "bash", "shell"] {
+            let marker = format!("```{lang}\n");
+            if let Some(pos) = out.find(&marker) {
+                let body_start = pos + marker.len();
+                let is_earlier = match earliest {
+                    Some((e, _)) => pos < e,
+                    None => true,
+                };
+                if is_earlier {
+                    earliest = Some((pos, body_start));
+                }
+            }
+        }
+        let Some((marker_start, body_start)) = earliest else {
+            break;
+        };
+        // An unterminated fence (a truncated reply) is left in place rather
+        // than guessed at.
+        let Some(end_rel) = out[body_start..].find("```") else {
+            break;
+        };
+        out.replace_range(marker_start..body_start + end_rel + 3, "");
+        found += 1;
+    }
+    (
+        collapse_blank_runs(&out).trim().to_string(),
+        found.saturating_sub(1),
+    )
+}
+
+/// `\n{3,}` -> `\n\n`, same as the JS regex `parseAssistantReply` uses --
+/// otherwise the gap a removed fence leaves behind reads as several empty
+/// paragraphs.
+fn collapse_blank_runs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut newline_run = 0;
+    for ch in text.chars() {
+        if ch == '\n' {
+            newline_run += 1;
+            if newline_run <= 2 {
+                out.push(ch);
+            }
+        } else {
+            newline_run = 0;
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// The read side of `CHAT_PROTOCOL_PROMPT`'s ` ```state ` contract -- only
+/// the first block counts, matching how only the first ` ```sh ` fence ever
+/// runs in operation mode. `None` means the model didn't update its state
+/// this turn, not that it cleared it.
+pub fn extract_state_block(text: &str) -> Option<String> {
+    let marker = "```state\n";
+    let start = text.find(marker)? + marker.len();
+    let end = text[start..].find("```")?;
+    Some(text[start..start + end].trim().to_string())
+}
+
+/// Removes every ` ```state ` block from `text` for display -- the model is
+/// told this content is never shown to the user, so leaving a stray one
+/// in the chat bubble would contradict that.
+pub fn strip_state_blocks(text: &str) -> String {
+    let mut out = text.to_string();
+    loop {
+        let marker = "```state\n";
+        let Some(pos) = out.find(marker) else {
+            break;
+        };
+        let body_start = pos + marker.len();
+        let Some(end_rel) = out[body_start..].find("```") else {
+            break;
+        };
+        out.replace_range(pos..body_start + end_rel + 3, "");
+    }
+    collapse_blank_runs(&out).trim().to_string()
+}
+
+/// The two tags reasoning-capable models are actually seen using in the
+/// wild for their own chain-of-thought, wrapped around it in the plain
+/// `content` string rather than in some separate API field -- which is the
+/// only place this app, talking to an arbitrary OpenAI-compatible endpoint,
+/// can look. Not something the app teaches the model to do (unlike
+/// ` ```state ``` `/` ```sh ``` `) -- this only reads what a model already
+/// produces unprompted, so there's no protocol text for it.
+const THINKING_TAGS: &[&str] = &["think", "thinking"];
+
+/// The model's own reasoning, if it wrapped any in a recognized tag --
+/// `None` either because the model didn't, or because it's a plain
+/// non-reasoning model. Only the first block is read, matching every other
+/// fence/tag convention in this file.
+pub fn extract_thinking_block(text: &str) -> Option<String> {
+    for tag in THINKING_TAGS {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        if let Some(start) = text.find(&open) {
+            let body_start = start + open.len();
+            if let Some(end_rel) = text[body_start..].find(&close) {
+                return Some(text[body_start..body_start + end_rel].trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Removes every recognized thinking tag from `text` for display -- shown
+/// separately (or not at all, per `chat_show_thinking`), never left inline
+/// where it would read as part of the answer itself.
+pub fn strip_thinking_blocks(text: &str) -> String {
+    let mut out = text.to_string();
+    loop {
+        let mut removed_any = false;
+        for tag in THINKING_TAGS {
+            let open = format!("<{tag}>");
+            let close = format!("</{tag}>");
+            let Some(start) = out.find(&open) else {
+                continue;
+            };
+            let body_start = start + open.len();
+            let Some(end_rel) = out[body_start..].find(&close) else {
+                continue;
+            };
+            out.replace_range(start..body_start + end_rel + close.len(), "");
+            removed_any = true;
+        }
+        if !removed_any {
+            break;
+        }
+    }
+    collapse_blank_runs(&out).trim().to_string()
+}
+
+/// Cosmetic, for terminal display only (both CLI entry points use this --
+/// `headless.rs` and `chat_cli.rs`) -- stored/re-sent history always keeps
+/// the raw reply, markup included, since that's what the model itself
+/// wrote and re-reads. Strips `**bold**` and `` `code` `` markers so prose
+/// reads as plain text instead of raw Markdown source; newlines are left
+/// alone.
+pub fn to_plain_text(text: &str) -> String {
+    strip_paired_marker(&strip_paired_marker(text, "**"), "`")
+}
+
+fn strip_paired_marker(text: &str, marker: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let Some(start) = rest.find(marker) else {
+            out.push_str(rest);
+            break;
+        };
+        let after = &rest[start + marker.len()..];
+        let Some(end) = after.find(marker) else {
+            // Unmatched marker -- leave the rest verbatim rather than guess.
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        out.push_str(&after[..end]);
+        rest = &after[end + marker.len()..];
+    }
+    out
 }
 
 fn general_rules_path() -> PathBuf {
@@ -194,6 +402,39 @@ pub fn build_system_content(
     out
 }
 
+/// Chat mode's whole system message: the mechanical `CHAT_PROTOCOL_PROMPT`,
+/// then the persona's own content (if one is loaded), then the session's
+/// current ` ```state ` snapshot (if it's ever written one). No root note,
+/// no rules.md/command-rules.md -- those are operation-mode concepts with
+/// nothing to say here.
+///
+/// `state` is capped at `state_max_tokens` (0 = no cap) with an explicit
+/// truncation note, same reasoning as `memory::build_block`'s cap: this goes
+/// in the system message, which `context::fit_to_budget` never trims, so
+/// nothing else is in a position to keep it in check.
+pub fn build_chat_system_content(
+    persona: Option<&str>,
+    state: &str,
+    state_max_tokens: u32,
+) -> String {
+    let mut out = CHAT_PROTOCOL_PROMPT.to_string();
+    if let Some(persona) = persona {
+        out.push_str("\n\n");
+        out.push_str(persona);
+    }
+    let state = state.trim();
+    if !state.is_empty() {
+        let capped = if state_max_tokens == 0 {
+            state.to_string()
+        } else {
+            crate::context::truncate_with_note(state, (state_max_tokens as usize) * 4, "state")
+        };
+        out.push_str("\n\n## Your persistent state from earlier in this conversation\n");
+        out.push_str(&capped);
+    }
+    out
+}
+
 /// Once at startup, not in `load_*_or_init` (which run every turn), so a
 /// stale edit or a reset that didn't take is visible without spamming.
 pub fn log_loaded_rules(disable_builtin_rules: bool) {
@@ -249,5 +490,130 @@ mod tests {
     fn extract_command_takes_the_earliest_fence_not_the_first_language() {
         let reply = "```bash\nfirst\n```\nand\n```sh\nsecond\n```";
         assert_eq!(extract_command(reply).as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn strip_command_fences_removes_the_fence_and_reports_no_extras() {
+        let reply = "Let's look.\n```sh\nls -F\n```";
+        let (display, extra) = strip_command_fences(reply);
+        assert_eq!(display, "Let's look.");
+        assert_eq!(extra, 0);
+    }
+
+    #[test]
+    fn strip_command_fences_counts_every_extra_fence() {
+        let reply = "one\n```sh\ncmd1\n```\ntwo\n```bash\ncmd2\n```\nthree";
+        let (display, extra) = strip_command_fences(reply);
+        assert_eq!(display, "one\n\ntwo\n\nthree");
+        assert_eq!(extra, 1, "two fences means one extra beyond the first");
+    }
+
+    #[test]
+    fn strip_command_fences_leaves_an_untagged_fence_alone() {
+        let reply = "Here's the file:\n```\nnot a command\n```";
+        let (display, extra) = strip_command_fences(reply);
+        assert_eq!(display, reply, "no tagged fence means nothing to strip");
+        assert_eq!(extra, 0);
+    }
+
+    #[test]
+    fn strip_command_fences_leaves_an_unterminated_fence_in_place() {
+        let reply = "starting a command\n```sh\nls -F";
+        let (display, extra) = strip_command_fences(reply);
+        assert!(
+            display.contains("```sh"),
+            "a truncated reply should not have its only fence silently eaten: {display:?}"
+        );
+        assert_eq!(extra, 0);
+    }
+
+    #[test]
+    fn extract_state_block_reads_the_content() {
+        let reply = "Sure!\n```state\nHP: 85/100\n```\nDone.";
+        assert_eq!(extract_state_block(reply).as_deref(), Some("HP: 85/100"));
+    }
+
+    #[test]
+    fn extract_state_block_is_none_when_absent() {
+        assert_eq!(extract_state_block("just a normal reply"), None);
+    }
+
+    #[test]
+    fn strip_state_blocks_hides_it_from_display() {
+        let reply = "Here's what happened.\n```state\nHP: 85/100\n```\nAnything else?";
+        let display = strip_state_blocks(reply);
+        assert!(!display.contains("```state"), "{display}");
+        assert!(!display.contains("HP: 85/100"), "{display}");
+        assert!(display.contains("Here's what happened."));
+        assert!(display.contains("Anything else?"));
+    }
+
+    #[test]
+    fn strip_state_blocks_is_a_no_op_without_one() {
+        let reply = "just a normal reply";
+        assert_eq!(strip_state_blocks(reply), reply);
+    }
+
+    #[test]
+    fn build_chat_system_content_includes_persona_and_state() {
+        let out = build_chat_system_content(Some("You are Aria, a shopkeeper."), "HP: 90", 0);
+        assert!(out.contains(CHAT_PROTOCOL_PROMPT));
+        assert!(out.contains("You are Aria, a shopkeeper."));
+        assert!(out.contains("HP: 90"));
+    }
+
+    #[test]
+    fn build_chat_system_content_omits_empty_state() {
+        let out = build_chat_system_content(None, "   ", 0);
+        assert!(!out.contains("persistent state"));
+    }
+
+    #[test]
+    fn build_chat_system_content_caps_a_long_state() {
+        let long_state = "x".repeat(10_000);
+        let out = build_chat_system_content(None, &long_state, 50);
+        assert!(
+            out.len() < long_state.len(),
+            "expected the state to be truncated"
+        );
+        assert!(
+            out.contains("condensed away"),
+            "truncation must be stated, not silent: {out}"
+        );
+    }
+
+    #[test]
+    fn extract_thinking_block_reads_a_think_tag() {
+        let reply = "<think>The user wants the weather.</think>It's sunny.";
+        assert_eq!(
+            extract_thinking_block(reply).as_deref(),
+            Some("The user wants the weather.")
+        );
+    }
+
+    #[test]
+    fn extract_thinking_block_reads_a_thinking_tag_too() {
+        let reply = "<thinking>hmm</thinking>ok then";
+        assert_eq!(extract_thinking_block(reply).as_deref(), Some("hmm"));
+    }
+
+    #[test]
+    fn extract_thinking_block_is_none_for_a_plain_reply() {
+        assert_eq!(extract_thinking_block("just an answer"), None);
+    }
+
+    #[test]
+    fn strip_thinking_blocks_removes_it_from_display() {
+        let reply = "<think>secret reasoning</think>The answer is 4.";
+        let display = strip_thinking_blocks(reply);
+        assert!(!display.contains("secret reasoning"), "{display}");
+        assert!(!display.contains("<think>"), "{display}");
+        assert_eq!(display, "The answer is 4.");
+    }
+
+    #[test]
+    fn strip_thinking_blocks_is_a_no_op_without_one() {
+        let reply = "just an answer";
+        assert_eq!(strip_thinking_blocks(reply), reply);
     }
 }
