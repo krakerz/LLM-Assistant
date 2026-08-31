@@ -4,14 +4,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// How many rotated chat logs to keep around, oldest deleted first. Hardcoded
-/// rather than configurable -- these are debug artifacts, not something
-/// worth a settings entry for.
+/// Oldest deleted first. Hardcoded: these are debug artifacts.
 const MAX_LOG_FILES: usize = 5;
 
-/// The path chosen for *this* run's log, fixed once at startup via `init()`
-/// so every `append()` call (each one a separate Tauri command invocation)
-/// keeps writing to the same file instead of fragmenting across several.
+/// Fixed at startup so every `append()` lands in the same file.
 static CURRENT_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 fn is_chat_log(path: &Path) -> bool {
@@ -21,13 +17,8 @@ fn is_chat_log(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Starts a fresh timestamped log for this session, pruning older ones down
-/// to `MAX_LOG_FILES - 1` first (so after adding the new one, at most
-/// `MAX_LOG_FILES` remain). Filenames are timestamp-prefixed, so a plain
-/// lexicographic sort is also chronological order -- no need to stat mtimes.
-/// Past sessions survive this (unlike the old single-file `last-chat.log`
-/// that got wiped on every launch), so a session that looped or misbehaved
-/// stays inspectable after relaunching to try again.
+/// Fresh timestamped log, pruning older ones first. Timestamp-prefixed, so
+/// lexicographic order is chronological.
 pub fn init() -> anyhow::Result<PathBuf> {
     let dir = app_log_dir();
     fs::create_dir_all(&dir)?;
@@ -70,12 +61,8 @@ pub fn append(text: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    // Simulates 6 prior sessions' logs already sitting in the log dir (named
-    // so they sort oldest-first, matching the real chat-<timestamp>.log
-    // shape) and then calls init() once, as a new launch would. Only
-    // directory state is asserted -- CURRENT_LOG_PATH is a process-global
-    // OnceLock that only accepts the very first init() call across the whole
-    // test binary, so it isn't a reliable thing to assert on here.
+    // Only directory state is asserted: CURRENT_LOG_PATH is a process-global
+    // OnceLock that only the first init() in the test binary can set.
     #[test]
     fn init_prunes_down_to_max_log_files() {
         let dir =
@@ -102,11 +89,8 @@ mod tests {
         remaining.sort();
 
         assert_eq!(remaining.len(), MAX_LOG_FILES, "{remaining:?}");
-        // The two oldest of the six pre-existing files must be gone.
         assert!(!remaining.contains(&names[0]));
         assert!(!remaining.contains(&names[1]));
-        // The four newest pre-existing ones, plus the freshly created one,
-        // must all still be present.
         for name in &names[2..] {
             assert!(
                 remaining.contains(name),

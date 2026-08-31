@@ -13,6 +13,7 @@ name: Autobuild
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -104,7 +105,8 @@ jobs:
             found { print }
           ' CHANGELOG.md)"
           if [ -z "${notes// }" ]; then
-            notes="No changelog entry found for $version."
+            echo "::error::CHANGELOG.md has no section for $version" >&2
+            exit 1
           fi
           {
             echo "notes<<CHANGELOG_EOF"
@@ -119,6 +121,7 @@ jobs:
         run: cargo build --release
 
       - name: Build bundle and create draft release
+        id: release
         if: steps.check_tag.outputs.should_release == 'true'
         uses: tauri-apps/tauri-action@v0
         env:
@@ -129,3 +132,12 @@ jobs:
           releaseBody: ${{ steps.changelog.outputs.notes }}
           releaseDraft: true
           prerelease: false
+
+      # The .deb declares bubblewrap so apt handles it, but an AppImage user
+      # gets no such hint -- and without bwrap every command fails. INSTALL.txt
+      # rides along as its own asset so the download is usable on its own.
+      - name: Attach INSTALL.txt to the draft release
+        if: steps.check_tag.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "v${{ steps.version.outputs.version }}" INSTALL.txt --clobber

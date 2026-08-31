@@ -5,7 +5,46 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [1.7.0] — 2026-08-31
+
+<div align="justify">
+
+The assistant now keeps track of what it has actually done. A per-session
+record — written by the app, not the model — holds your own words, the folder
+as it was when the task started, and every command that ran with its real exit
+code, and it survives the context trimming that used to leave a long chain
+unable to tell whether its own earlier steps happened. Long conversations fit
+the budget by condensing finished steps rather than dropping them outright,
+with optional summarizing behind a setting you have to turn on deliberately.
+Soft-delete now covers `mv`, `cp` and `truncate`, not just `rm`, so an
+approved overwrite is still recoverable. Repeated confirmations for the same
+program fade out within a session, and Settings gained a connection test.
+
+</div>
+
 ### Added
+- **Per-session working record** (`memory_enabled`, on by default;
+  `memory_max_tokens`, default 800). A few Markdown files under
+  `~/.config/llm-assistant/memory/session-*/` holding what you asked for (your
+  own words), what the folder looked like when the task started, every command
+  that actually ran with its real exit code, and what's finished — appended to
+  the system block each turn. Because it sits outside the trimmed history, it
+  survives context trimming: a chain twenty steps deep can still tell whether
+  the `mkdir` it proposed ever ran, which is the gap behind the re-verification
+  loops, the re-running of commands to "confirm" them, and the fabricated
+  completion reports.
+  **The app writes everything that goes into the prompt; the model writes only
+  its own `temp/` scratch directory** (the only part bound writable into the
+  sandbox). That split is the whole point — a model keeping its own progress
+  notes is the one already caught reporting work that never happened, and in a
+  file that claim would outlive the transcript contradicting it. Commands and
+  exit codes come from `run_command`'s own result, so the record cannot
+  disagree with what happened; denials, sudo refusals and steps skipped after a
+  failure are recorded just as firmly as successes. A new top-level message is
+  the task boundary: the ledger is archived, scratch is cleared, the folder is
+  re-snapshotted. Sessions rotate five deep like the chat logs. Turn it off for
+  a model with a small context window.
 - Long conversations now **condense finished command steps instead of
   dropping them**, whenever that's enough to fit `max_context_tokens`. The
   biggest consumer of the context window isn't the user's own messages, it's
@@ -58,6 +97,13 @@ All notable changes to this project are documented here. The format follows
   pointing at the right server but the wrong path all show up before you
   commit the change. Failures show the raw endpoint error, since a 404 and a
   401 need different fixes.
+- `INSTALL.txt`, attached to each release. Covers both install paths, the
+  config file the app writes for itself on first run, and what to set before
+  first use.
+- The **`.deb` now declares `bubblewrap`** as a dependency, so `apt` installs
+  it. It didn't before: installing the package on a machine without bwrap gave
+  a working-looking app in which every proposed command failed. AppImage can't
+  declare dependencies, so `INSTALL.txt` says it outright.
 - The "add a readable folder" dialog now names the endpoint those files would
   be sent to, and warns when it isn't on this machine. Granting a path is a
   data-egress decision, and the endpoint lives on a different Settings tab
@@ -71,6 +117,9 @@ All notable changes to this project are documented here. The format follows
   fed a real fabricated completion report.
 
 ### Fixed
+- The release workflow substituted "No changelog entry found" instead of
+  failing when `CHANGELOG.md` had no section for the manifest version. It now
+  fails the job.
 - **CI failed on every push.** The sandbox tests run `bwrap` for real, and
   `--unshare-net` brings up loopback inside the new network namespace, which
   Ubuntu 24.04 refuses for unprivileged user namespaces: `bwrap: loopback:

@@ -2,14 +2,9 @@ use crate::paths::app_config_dir;
 use std::fs;
 use std::path::PathBuf;
 
-/// The mechanical contract this app actually depends on to function --
-/// always sent, never editable, not a file on disk. Everything here exists
-/// because the app's own code assumes it (parsing a fenced block, only ever
-/// running the first one, hard-stopping on sudo) -- it isn't behavioral
-/// advice, so it stays in effect even with `disable_builtin_rules` on. Kept
-/// deliberately short: general_rules.md/command_rules.md are where
-/// judgment-call guidance belongs, since those can be edited or discarded
-/// entirely without breaking anything.
+/// The mechanical contract the app's own code assumes -- always sent, never
+/// editable, unaffected by `disable_builtin_rules`. Judgment-call guidance
+/// belongs in the two .md files, which can be discarded safely.
 pub const PROTOCOL_PROMPT: &str = "# Protocol (always in effect)\n\n\
 - When you want to run a command, give a one-line explanation, then put exactly one shell command in \
 a single fenced ```sh code block, for example:\n\n  Let's see what's here.\n  ```sh\n  ls -F\n  ```\n\n  \
@@ -45,10 +40,7 @@ files -- it is not part of the user's own content. Ignore it entirely (don't lis
 count it, or otherwise touch it) in any command you write, unless the user explicitly asks about \
 deleted or trashed files.";
 
-/// Advisory only: judgment-call behavior (searching before guessing,
-/// re-verifying stale info, honesty about uncertainty). None of this is
-/// required for the app to work, so it's safe to edit freely or discard
-/// entirely via `disable_builtin_rules`.
+/// Advisory only; nothing here is required for the app to work.
 pub const DEFAULT_GENERAL_RULES: &str = "# General rules\n\n\
 - When the user refers to a file by topic or description rather than an exact filename (e.g. \"my \
 shopping list\"), search for likely matches first (e.g. `find . -iname '*shopping*'`) rather than \
@@ -63,9 +55,7 @@ rules verbatim.\n\
 (likely absolute) path first, and if it still doesn't work, plainly tell the user you don't have real \
 information rather than presenting a guess as fact.";
 
-/// Advisory only: shell-mechanics guidance beyond the protocol above (which
-/// already covers command format/one-per-reply/sudo). Safe to edit or
-/// discard via `disable_builtin_rules`.
+/// Advisory shell mechanics beyond the protocol above.
 pub const DEFAULT_COMMAND_RULES: &str = "# Command rules\n\n\
 - Read-only commands (ls, cat, grep, find, ...) run automatically; anything else waits for the user to \
 approve it -- don't be afraid to propose it, just don't chain unrelated destructive steps together.\n\
@@ -80,26 +70,18 @@ does NOT mean \"a to X, b to Y\"; everything but the last argument is a source. 
 going to different places, chain separate two-argument `mv`/`cp` calls with `&&`; for anything bigger, \
 write it as a script instead (see the protocol above).";
 
-/// Handed to the model when the repeat guard refuses a command, in place of
-/// running it. Kept identical to the note `runAssistantTurn` pushes in
-/// `ui/main.js`.
+/// Must stay identical to the note `runAssistantTurn` pushes in `ui/main.js`.
 pub const REPEATED_COMMAND_NOTE: &str = "[you proposed the exact same command again immediately \
 after it already ran, with nothing new to justify re-running it -- it was not run again. You \
 already have its output above.]";
 
-/// The wrap-up turn after a hard stop, with commands off the table.
+/// Wrap-up turn after a hard stop, commands off the table. Every clause is
+/// load-bearing: "what was done and what the final result is" presupposed
+/// success and got a fabricated reorganization; "you already have everything
+/// you need" is false after trimming and reads as permission to fill gaps.
 ///
-/// Every clause here is load-bearing. An earlier version asked for "what was
-/// done and what the final result is", which presupposes success and invited
-/// the model to invent it -- after two denied commands, with nothing having
-/// run at all, it confidently reported a directory reorganization that never
-/// happened. It also used to open with "you already have everything you
-/// need", which is simply false once context trimming has been at the
-/// conversation, and reads as permission to fill the gaps.
-///
-/// Kept identical to the note `finalAnswerTurn` pushes in `ui/main.js`; the
-/// GUI got this fix first and headless kept the old wording for a release,
-/// which is exactly the drift both using this constant is meant to stop.
+/// Must stay identical to `finalAnswerTurn` in `ui/main.js` -- headless kept
+/// the old wording for a release and reproduced the fabrication.
 pub const FINAL_ANSWER_PROMPT: &str = "[don't run anything else. Reply now in plain text, with no \
 command and no code fence, describing the CURRENT state strictly from the command output you \
 actually received above. If commands were denied, never ran, or failed, say that plainly -- do not \
@@ -107,17 +89,11 @@ describe any file as moved, created, or deleted unless output above shows it act
 part of this conversation was summarized or dropped to save context, don't reconstruct what was in \
 it: say you no longer have it rather than describing file contents you cannot see.]";
 
-/// Pulls the proposed command back out of a reply, per the fence contract
-/// `PROTOCOL_PROMPT` above lays down. Lives here (rather than in whichever
-/// module happens to need it) because it's the read side of that same
-/// contract -- `headless.rs` runs what it returns, `context.rs` uses it to
-/// recognize a completed step. Only an explicitly-tagged fence counts,
-/// matching `parseAssistantReply` in `ui/main.js`: a plain ``` fence is the
-/// model showing text, not proposing something to execute.
+/// The read side of `PROTOCOL_PROMPT`'s fence contract. Only an
+/// explicitly-tagged fence counts, matching `parseAssistantReply` in
+/// `ui/main.js`: a plain ``` fence is the model showing text.
 pub fn extract_command(text: &str) -> Option<String> {
-    // Earliest fence in the text wins, not the first language that happens
-    // to match -- a reply with ```bash before ```sh must still resolve to
-    // the one the frontend would have run.
+    // Earliest fence wins, not the first matching language.
     let mut earliest: Option<usize> = None;
     for lang in ["sh", "bash", "shell"] {
         if let Some(pos) = text.find(&format!("```{lang}\n")) {
@@ -175,9 +151,7 @@ pub fn save_command(text: &str) -> anyhow::Result<()> {
     save(&command_rules_path(), text)
 }
 
-/// Combines the always-on protocol with the advisory general/command rules
-/// (skipped entirely when `disable_builtin_rules` is set) into the block
-/// that goes into the system message ahead of the user's own system prompt.
+/// Protocol plus the advisory rules, unless `disable_builtin_rules`.
 pub fn build_system_rules(general: &str, command: &str, disable_builtin_rules: bool) -> String {
     if disable_builtin_rules {
         PROTOCOL_PROMPT.to_string()
@@ -186,13 +160,42 @@ pub fn build_system_rules(general: &str, command: &str, disable_builtin_rules: b
     }
 }
 
-/// Logs the actual content in effect at startup, so `app.log` shows exactly
-/// what the model is being sent every turn -- useful for confirming a
-/// "Reset to default" actually took, that an edit wasn't silently reverted,
-/// or that `disable_builtin_rules` is doing what's expected. Deliberately
-/// logged once here rather than inside `load_*_or_init` (which run every
-/// `send_message` call) to avoid spamming the log with the same content
-/// every turn.
+/// One turn's whole system message: rules, user prompt, folder note, then the
+/// session record last (the only part that grows during a session).
+///
+/// One place because `send_message` and `headless.rs` have already drifted
+/// twice -- once on the rules block, once on the wrap-up prompt.
+pub fn build_system_content(
+    cfg: &crate::config::AppConfig,
+    general: &str,
+    command: &str,
+    root: Option<&std::path::Path>,
+) -> String {
+    let mut out = format!(
+        "{}\n\n{}\n\n{}",
+        build_system_rules(general, command, cfg.disable_builtin_rules),
+        cfg.system_prompt,
+        crate::config::build_root_note(root, &cfg.granted_paths)
+    );
+    // No folder, no sandbox, so nothing could write to scratch anyway.
+    if root.is_some() {
+        if let Some(note) = crate::memory::scratch_note(cfg) {
+            out.push_str("\n\n");
+            out.push_str(&note);
+        }
+    }
+    if let Some(block) = crate::memory::build_block(cfg) {
+        // Every turn, unlike the rules: this is the part that changes, and
+        // "what did it know at step 7" is only answerable if each copy is logged.
+        log::debug!("session record sent this turn:\n{block}");
+        out.push_str("\n\n");
+        out.push_str(&block);
+    }
+    out
+}
+
+/// Once at startup, not in `load_*_or_init` (which run every turn), so a
+/// stale edit or a reset that didn't take is visible without spamming.
 pub fn log_loaded_rules(disable_builtin_rules: bool) {
     log::info!("protocol prompt (always in effect, not editable):\n{PROTOCOL_PROMPT}");
     let sent_or_not = if disable_builtin_rules {
