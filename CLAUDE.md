@@ -180,13 +180,15 @@ into `config::build_root_note` so the model can proactively decide to read a
 granted path for a matching task instead of only when the user states the
 absolute path themselves.
 
-**CI** (`.github/workflows/autobuild.yml`) is a single workflow triggered by
-PRs into `main` and pushes to `main` (no manual tag pushes). On push to
-`main` it reads the version out of `Cargo.toml`, checks via `git ls-remote`
-whether that tag already exists remotely, and only then builds the full
-bundle and opens a **draft** GitHub release (tag created by
+**CI** (`.github/workflows/autobuild.yml`) is a single workflow triggered
+only by pushes to `main` (a PR by itself triggers nothing; no manual tag
+pushes either). It reads the version out of `Cargo.toml`, checks via
+`git ls-remote` whether that tag already exists remotely, and only then
+builds the full bundle and opens a **draft** GitHub release (tag created by
 `tauri-apps/tauri-action`, release body pulled from the matching
-`CHANGELOG.md` section). Every other trigger (PRs, or a push that didn't bump
-the version) just runs fmt/clippy/test/build as a sanity check. This means
-the version bump commit described above is what actually triggers a release
-once it reaches `main` — there's no separate tagging step.
+`CHANGELOG.md` section). A push that didn't bump the version just runs
+fmt/clippy/test/build as a sanity check. This means the version bump commit
+described above is what actually triggers a release once it reaches `main`
+— there's no separate tagging step. Rust build artifacts are cached via
+`Swatinem/rust-cache`, apt packages via `actions/cache` keyed on the
+workflow file itself.

@@ -1,19 +1,17 @@
 name: Autobuild
 
-# Runs on every PR into main and every push to main. Push-to-main additionally
-# reads the version straight out of Cargo.toml and, only if that
-# version hasn't been released yet, builds the full bundle and cuts a tag +
-# draft release (release notes pulled from the matching CHANGELOG.md
-# section). Everything else -- PRs, or a push to main that didn't bump the
-# version -- just gets fmt/clippy/test/build as a sanity check.
+# Runs only on pushes to main -- a PR being opened/updated does not trigger
+# this at all. Reads the version straight out of Cargo.toml and, only if
+# that version hasn't been released yet, builds the full bundle and cuts a
+# tag + draft release (release notes pulled from the matching CHANGELOG.md
+# section). A push that didn't bump the version just gets fmt/clippy/test/
+# build as a sanity check.
 #
 # To trigger an actual release: bump the version in Cargo.toml and
 # tauri.conf.json, promote CHANGELOG.md's "Unreleased" section to that
 # version, commit, and merge to main.
 on:
   push:
-    branches: [main]
-  pull_request:
     branches: [main]
 
 permissions:
@@ -24,6 +22,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-${{ hashFiles('.github/workflows/autobuild.yml') }}
+          restore-keys: |
+            apt-${{ runner.os }}-
 
       - name: Install system dependencies
         run: |
@@ -71,7 +77,7 @@ jobs:
           fi
 
       - name: Extract changelog section for this version
-        if: github.event_name == 'push' && steps.check_tag.outputs.should_release == 'true'
+        if: steps.check_tag.outputs.should_release == 'true'
         id: changelog
         run: |
           version="${{ steps.version.outputs.version }}"
@@ -90,14 +96,14 @@ jobs:
             echo "CHANGELOG_EOF"
           } >> "$GITHUB_OUTPUT"
 
-      # PRs, and any push to main that isn't a fresh version bump, just get a
-      # plain build to confirm nothing's broken -- no tag, no release.
+      # A push to main that isn't a fresh version bump just gets a plain
+      # build to confirm nothing's broken -- no tag, no release.
       - name: Build only
-        if: "!(github.event_name == 'push' && steps.check_tag.outputs.should_release == 'true')"
+        if: steps.check_tag.outputs.should_release != 'true'
         run: cargo build --release
 
       - name: Build bundle and create draft release
-        if: github.event_name == 'push' && steps.check_tag.outputs.should_release == 'true'
+        if: steps.check_tag.outputs.should_release == 'true'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

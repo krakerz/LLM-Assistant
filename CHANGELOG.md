@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-31
+### Fixed
+- A granted path that happens to be an *ancestor* of the working folder
+  (e.g. granting `~/src` while `~/src/playground` is the folder open) could
+  silently make the working folder read-only too. `bwrap` applies bind
+  mounts in argument order, and the granted (read-only) path was being
+  bound after the working folder, so its mount covered the working folder's
+  read-write one underneath it. Fixed by binding the working folder last,
+  so it always wins back its own subtree regardless of what else is
+  granted.
+
 ## [1.0.0] - 2026-08-31
 Initial release.
 

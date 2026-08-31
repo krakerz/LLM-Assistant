@@ -137,7 +137,6 @@ pub fn run_sandboxed(
         }
     }
 
-    c.arg("--bind").arg(root).arg(root);
     c.arg("--ro-bind").arg(shim_dir).arg(shim_dir);
 
     for g in granted {
@@ -163,6 +162,15 @@ pub fn run_sandboxed(
             }
         }
     }
+
+    // Bound last, deliberately: bwrap applies bind mounts in argument order,
+    // and a later mount on top of (or covering) an earlier one wins. If a
+    // granted path happens to be an ancestor of the working folder (e.g.
+    // granting ~/src while the folder open is ~/src/playground), binding it
+    // before root would silently make root read-only too. Binding root last
+    // means it always wins back its own subtree, regardless of what else
+    // was granted.
+    c.arg("--bind").arg(root).arg(root);
 
     let path_env = format!("{}:/usr/bin:/bin", shim_dir.display());
     let trash_root = root.join(".temp-trash");
