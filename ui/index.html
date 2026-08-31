@@ -63,11 +63,29 @@
       <label>API key (optional -- sent as an Authorization: Bearer header)
         <input id="cfgApiKey" type="password" placeholder="leave blank if the endpoint doesn't need one" autocomplete="off" />
       </label>
+      <div class="path-row">
+        <button id="testConnectionBtn" type="button">Test connection</button>
+        <span id="testConnectionResult" class="explain"></span>
+      </div>
       <label>Temperature
         <input id="cfgTemperature" type="number" step="0.1" min="0" max="2" />
       </label>
       <label>Max automatic steps (propose → run → respond cycles before it waits for you; 0 = no limit)
         <input id="cfgMaxAutoSteps" type="number" step="1" min="0" />
+      </label>
+      <label>Context budget in tokens (once a turn would exceed this, finished command steps are condensed to just the command and its output, and beyond that the oldest turns are dropped; 0 = never trim). Rough estimate, not a real tokenizer — leave headroom under your model's actual limit.
+        <input id="cfgMaxContextTokens" type="number" step="500" min="0" />
+      </label>
+
+      <label class="checkbox-row">
+        <input type="checkbox" id="cfgSummarizeBeforeDropping" />
+        Summarize old turns instead of dropping them, when condensing isn't enough. Off by default
+        on purpose: the summary is written by this same model and then becomes the record it works
+        from, so a wrong one is worse than an honest gap. It's shown in the chat and you can edit it
+        there — read it when it appears. Costs one extra request per turn while over budget.
+      </label>
+      <label>Stop asking about a program after this many approvals in one session (0 = always ask). Session-only — it resets when the app closes or you open a different folder, and one denial puts that program back to always-asking.
+        <input id="cfgConfirmFadeAfter" type="number" step="1" min="0" />
       </label>
       <label>System prompt (persona/focus -- behavior and command mechanics live in their own tabs)
         <textarea id="cfgSystemPrompt" rows="4"></textarea>
@@ -143,6 +161,7 @@
       <input type="checkbox" id="addPathRecursive" checked />
       Include subfolders (uncheck to grant only the files directly in this folder)
     </label>
+    <p id="addPathEndpointWarning" class="explain"></p>
     <div class="dialog-actions">
       <button id="addPathCancelBtn" type="button">Cancel</button>
       <button id="addPathConfirmBtn" type="button">Grant read access</button>

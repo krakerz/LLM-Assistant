@@ -49,6 +49,45 @@ pub struct AppConfig {
     /// Defaults to false (existing behavior: both files are sent).
     #[serde(default)]
     pub disable_builtin_rules: bool,
+    /// Rough token budget for everything sent in one turn (system block plus
+    /// the whole conversation). Older turns get dropped once it's exceeded,
+    /// see `context.rs`. 0 disables trimming entirely -- which is the old
+    /// behavior, and fine until a session gets long enough to overflow the
+    /// model's real context limit. The default leaves headroom because the
+    /// estimate is a cheap chars/4 approximation, not a real tokenizer.
+    #[serde(default = "default_max_context_tokens")]
+    pub max_context_tokens: u32,
+    /// Opt-in last resort before old turns are dropped outright: ask the
+    /// model to summarize them first (see `context::fit_to_budget`).
+    /// **Defaults to off, on purpose.** A small local model writing the
+    /// permanent record of what happened is genuinely risky -- this app has
+    /// already caught one fabricating a completed reorganization -- so
+    /// dropping a turn, which at least leaves an honest gap marker, is the
+    /// safer default. Worth turning on for long sessions where losing the
+    /// early context outright is the bigger problem; the summary is shown in
+    /// the chat and can be edited there precisely so a bad one is catchable.
+    #[serde(default)]
+    pub summarize_before_dropping: bool,
+    /// After this many approvals of the same program in one session, the app
+    /// stops asking about that program for the rest of the session. 0 turns
+    /// it off and every command keeps prompting.
+    ///
+    /// Distinct from `auto_approve` in the two ways that matter: it expires
+    /// when the app closes (or the folder changes), and the user never had to
+    /// decide anything up front -- it's inferred from what they already said
+    /// yes to. Confirmation fatigue is a real safety problem, not just an
+    /// annoyance: a dialog that always appears and is always approved stops
+    /// being read, which is worse than one that appears rarely.
+    #[serde(default = "default_confirm_fade_after")]
+    pub confirm_fade_after: u32,
+}
+
+fn default_confirm_fade_after() -> u32 {
+    3
+}
+
+fn default_max_context_tokens() -> u32 {
+    8000
 }
 
 fn default_max_auto_steps() -> u32 {
@@ -75,6 +114,9 @@ impl Default for AppConfig {
             auto_approve: vec![],
             max_auto_steps: default_max_auto_steps(),
             disable_builtin_rules: false,
+            max_context_tokens: default_max_context_tokens(),
+            summarize_before_dropping: false,
+            confirm_fade_after: default_confirm_fade_after(),
         }
     }
 }

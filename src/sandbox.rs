@@ -94,8 +94,15 @@ pub struct RunOutcome {
 // moves the whole thing to trash regardless of contents, trading that
 // specific signal for the same "nothing is ever truly gone" guarantee `rm`
 // already gets.
-const TRASH_SHIM_SCRIPT: &str = r#"#!/bin/sh
-trash_root="${TRASH_ROOT:-$PWD/.temp-trash}/$(date +%Y%m%d-%H%M%S-%N)"
+// Dropping the shim directory from PATH is the first thing every shim does.
+// Without it a shim's own internal `mv`/`cp`/`mkdir` would resolve straight
+// back into the shim directory -- harmless while only rm/rmdir were shimmed,
+// but an infinite loop the moment `mv` and `cp` are too. The reduced PATH is
+// inherited by the real tool we hand off to, which is fine: none of these
+// shell out to anything.
+const SHIM_PATH_RESET: &str = "PATH=/usr/bin:/bin:/usr/local/bin\nexport PATH\n";
+
+const TRASH_SHIM_SCRIPT: &str = r#"trash_root="${TRASH_ROOT:-$PWD/.temp-trash}/$(date +%Y%m%d-%H%M%S-%N)"
 for arg in "$@"; do
   case "$arg" in
     -*) continue ;;
@@ -110,12 +117,108 @@ for arg in "$@"; do
 done
 "#;
 
+/// The other half of the soft-delete guarantee: `rm` isn't the only way to
+/// destroy a file. `mv a b` and `cp a b` silently overwrite `b`, and
+/// `truncate -s 0 b` empties it in place -- all unrecoverable, and all
+/// previously gated only by the confirmation dialog. These shims copy
+/// whatever is about to be overwritten into `.temp-trash` first and then hand
+/// off to the real tool, so approving one of those still leaves a way back.
+///
+/// The operand scan is deliberately simple: skip anything starting with `-`
+/// (until a bare `--`), then treat the last remaining operand as the
+/// destination -- a directory means the victims are `dest/basename(src)`,
+/// otherwise the destination itself is the victim. `@ALL@` mode instead
+/// treats every operand as a victim, which is what `truncate` needs.
+///
+/// That scan gets option *arguments* wrong (`cp -t dir a b` puts the target
+/// in a place this doesn't understand), and that's an accepted limitation
+/// rather than an oversight: the consequence is copying a source file into
+/// the trash that didn't need saving. Wasted space, never a lost file, and
+/// never a changed command -- the real tool always receives `"$@"` untouched,
+/// so what the user approved is exactly what runs.
+const PRESERVE_SHIM_SCRIPT: &str = r#"tool="@TOOL@"
+real="$(command -v "$tool" 2>/dev/null)"
+if [ -z "$real" ]; then
+  echo "$tool: not available in this sandbox" >&2
+  exit 127
+fi
+
+trash_root="${TRASH_ROOT:-$PWD/.temp-trash}/$(date +%Y%m%d-%H%M%S-%N)"
+
+keep() {
+  [ -e "$1" ] || return 0
+  case "$1" in
+    /*) rel="${1#/}" ;;
+    *) rel="$1" ;;
+  esac
+  dest="$trash_root/$rel"
+  mkdir -p "$(dirname "$dest")" 2>/dev/null || return 0
+  cp -a -- "$1" "$dest" 2>/dev/null || :
+}
+
+last=""
+count=0
+opts_done=0
+for arg in "$@"; do
+  if [ "$opts_done" -eq 0 ]; then
+    case "$arg" in
+      --) opts_done=1; continue ;;
+      -?*) continue ;;
+    esac
+  fi
+  last="$arg"
+  count=$((count + 1))
+  if [ "@ALL@" = "yes" ]; then
+    keep "$arg"
+  fi
+done
+
+if [ "@ALL@" != "yes" ] && [ "$count" -ge 2 ]; then
+  if [ -d "$last" ]; then
+    # Destination is a directory, so each source lands inside it under its
+    # own basename -- those are what get overwritten, not the directory.
+    seen=0
+    opts_done=0
+    for arg in "$@"; do
+      if [ "$opts_done" -eq 0 ]; then
+        case "$arg" in
+          --) opts_done=1; continue ;;
+          -?*) continue ;;
+        esac
+      fi
+      seen=$((seen + 1))
+      [ "$seen" -eq "$count" ] && break
+      keep "$last/$(basename -- "$arg")"
+    done
+  else
+    keep "$last"
+  fi
+fi
+
+exec "$real" "$@"
+"#;
+
 pub fn ensure_shims(shim_dir: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(shim_dir)?;
-    for name in ["rm", "rmdir"] {
+    let write_shim = |name: &str, body: String| -> anyhow::Result<()> {
         let shim = shim_dir.join(name);
-        fs::write(&shim, TRASH_SHIM_SCRIPT)?;
+        fs::write(&shim, format!("#!/bin/sh\n{SHIM_PATH_RESET}{body}"))?;
         fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))?;
+        Ok(())
+    };
+
+    for name in ["rm", "rmdir"] {
+        write_shim(name, TRASH_SHIM_SCRIPT.to_string())?;
+    }
+    // `all` = every operand is a victim (truncate rewrites its arguments in
+    // place); otherwise only the destination is.
+    for (name, all) in [("mv", "no"), ("cp", "no"), ("truncate", "yes")] {
+        write_shim(
+            name,
+            PRESERVE_SHIM_SCRIPT
+                .replace("@TOOL@", name)
+                .replace("@ALL@", all),
+        )?;
     }
     Ok(())
 }
@@ -206,6 +309,34 @@ pub fn run_sandboxed(
     })
 }
 
+/// Only the files a trash batch actually holds, relative to the batch dir --
+/// used by the tests to say what was preserved without caring which
+/// timestamped subfolder it landed in.
+#[cfg(test)]
+fn trashed_files(trash_root: &Path) -> Vec<(PathBuf, String)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(PathBuf, String)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, base, out);
+            } else if let Ok(text) = fs::read_to_string(&path) {
+                out.push((path.strip_prefix(base).unwrap_or(&path).to_path_buf(), text));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for batch in fs::read_dir(trash_root).into_iter().flatten().flatten() {
+        let batch = batch.path();
+        if batch.is_dir() {
+            walk(&batch, &batch, &mut out);
+        }
+    }
+    out
+}
+
 pub fn default_shim_dir() -> PathBuf {
     std::env::temp_dir().join("llm-assistant-shims")
 }
@@ -215,6 +346,39 @@ mod tests {
     use super::*;
     use std::{thread::sleep, time::Duration};
 
+    /// Whether this machine will actually let `bwrap` build a sandbox right
+    /// now. Not every environment does: Ubuntu 24.04 restricts unprivileged
+    /// user namespaces through AppArmor, and container/CI environments often
+    /// refuse at the loopback-setup step that `--unshare-net` triggers
+    /// (`bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`).
+    ///
+    /// The tests below use this to skip rather than fail, because a red test
+    /// there says "this machine won't run bwrap", not "the shim is broken" --
+    /// and the second message is the one this suite exists to deliver. The
+    /// skip is printed loudly on purpose: a silent skip of the sandbox tests
+    /// is indistinguishable from them passing, so CI enables unprivileged
+    /// user namespaces up front (see `.github/workflows/autobuild.yml`) and
+    /// the skip line is how you find out that didn't work.
+    fn sandbox_available() -> bool {
+        match Command::new("bwrap")
+            .args(["--unshare-all", "--ro-bind", "/", "/", "/bin/true"])
+            .output()
+        {
+            Ok(out) if out.status.success() => true,
+            Ok(out) => {
+                eprintln!(
+                    "SKIPPING sandbox tests -- bwrap cannot create a sandbox here: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!("SKIPPING sandbox tests -- could not run bwrap at all: {e}");
+                false
+            }
+        }
+    }
+
     // Proves the timestamped-subfolder fix for real, inside the actual
     // bwrap sandbox: deleting the same relative path twice must land in two
     // distinct .temp-trash subfolders, not silently overwrite the first
@@ -222,6 +386,9 @@ mod tests {
     // the app itself does at runtime.
     #[test]
     fn repeated_rm_of_same_path_does_not_clobber_earlier_trash() {
+        if !sandbox_available() {
+            return;
+        }
         let root =
             std::env::temp_dir().join(format!("llm-assistant-sandbox-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -271,12 +438,164 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Fresh working folder + shims for one test, named after the test so
+    /// concurrent runs don't share a directory.
+    fn scratch(name: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "llm-assistant-sandbox-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let shim_dir = root.join("shims");
+        ensure_shims(&shim_dir).unwrap();
+        (root, shim_dir)
+    }
+
+    // `rm` was never the only way to lose a file: `mv` over an existing
+    // target destroys it just as permanently, and unlike `rm` it looks
+    // routine enough that it's a common thing to auto-approve.
+    #[test]
+    fn mv_over_an_existing_file_keeps_the_overwritten_copy() {
+        if !sandbox_available() {
+            return;
+        }
+        let (root, shim_dir) = scratch("mv-overwrite");
+        fs::write(root.join("new.txt"), "incoming").unwrap();
+        fs::write(root.join("old.txt"), "about to be destroyed").unwrap();
+
+        let outcome = run_sandboxed(&root, &shim_dir, &[], "mv new.txt old.txt").unwrap();
+        assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+        assert_eq!(
+            fs::read_to_string(root.join("old.txt")).unwrap(),
+            "incoming",
+            "the move itself must still happen exactly as asked"
+        );
+
+        let trashed = trashed_files(&root.join(".temp-trash"));
+        assert!(
+            trashed
+                .iter()
+                .any(|(_, text)| text == "about to be destroyed"),
+            "the overwritten file should be recoverable from .temp-trash: {trashed:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mv_into_a_directory_keeps_the_file_it_replaces() {
+        if !sandbox_available() {
+            return;
+        }
+        let (root, shim_dir) = scratch("mv-into-dir");
+        fs::create_dir_all(root.join("dest")).unwrap();
+        fs::write(root.join("note.txt"), "new version").unwrap();
+        fs::write(root.join("dest/note.txt"), "old version").unwrap();
+
+        let outcome = run_sandboxed(&root, &shim_dir, &[], "mv note.txt dest").unwrap();
+        assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+        assert_eq!(
+            fs::read_to_string(root.join("dest/note.txt")).unwrap(),
+            "new version"
+        );
+
+        let trashed = trashed_files(&root.join(".temp-trash"));
+        assert!(
+            trashed.iter().any(|(_, text)| text == "old version"),
+            "dest/note.txt should have been preserved before being replaced: {trashed:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cp_over_an_existing_file_keeps_the_overwritten_copy() {
+        if !sandbox_available() {
+            return;
+        }
+        let (root, shim_dir) = scratch("cp-overwrite");
+        fs::write(root.join("src.txt"), "incoming").unwrap();
+        fs::write(root.join("dst.txt"), "about to be destroyed").unwrap();
+
+        let outcome = run_sandboxed(&root, &shim_dir, &[], "cp src.txt dst.txt").unwrap();
+        assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+        assert_eq!(
+            fs::read_to_string(root.join("dst.txt")).unwrap(),
+            "incoming"
+        );
+
+        let trashed = trashed_files(&root.join(".temp-trash"));
+        assert!(
+            trashed
+                .iter()
+                .any(|(_, text)| text == "about to be destroyed"),
+            "expected the clobbered destination in .temp-trash: {trashed:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // truncate destroys content without deleting or replacing anything, so
+    // neither the rm shim nor the destination logic above would catch it.
+    #[test]
+    fn truncate_keeps_the_contents_it_discards() {
+        if !sandbox_available() {
+            return;
+        }
+        let (root, shim_dir) = scratch("truncate");
+        fs::write(root.join("log.txt"), "important history").unwrap();
+
+        let outcome = run_sandboxed(&root, &shim_dir, &[], "truncate -s 0 log.txt").unwrap();
+        assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+        assert_eq!(fs::read_to_string(root.join("log.txt")).unwrap(), "");
+
+        let trashed = trashed_files(&root.join(".temp-trash"));
+        assert!(
+            trashed.iter().any(|(_, text)| text == "important history"),
+            "expected the pre-truncation contents in .temp-trash: {trashed:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // The shims call mv/cp/mkdir internally. Now that mv and cp are
+    // themselves shimmed, an unqualified call would re-enter the shim
+    // directory -- this is the regression test for the PATH reset that stops
+    // that, and it fails by hanging or blowing the stack rather than
+    // returning a wrong answer.
+    #[test]
+    fn shims_do_not_recurse_into_each_other() {
+        if !sandbox_available() {
+            return;
+        }
+        let (root, shim_dir) = scratch("shim-recursion");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/a.txt"), "content").unwrap();
+
+        // rm's internal `mv`, then mv's internal `cp`, then cp's internal
+        // `cp` -- each one a chance to land back in the shim directory.
+        let outcome = run_sandboxed(&root, &shim_dir, &[], "rm sub/a.txt").unwrap();
+        assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+
+        fs::write(root.join("x.txt"), "x").unwrap();
+        fs::write(root.join("y.txt"), "y").unwrap();
+        let outcome = run_sandboxed(&root, &shim_dir, &[], "mv x.txt y.txt").unwrap();
+        assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+        assert_eq!(fs::read_to_string(root.join("y.txt")).unwrap(), "x");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     // rmdir isn't just gated behind confirmation like an unshimmed
     // destructive command -- it needs to be structurally redirected the
     // same way rm is, since a real rmdir permanently (if harmlessly, for an
     // empty dir) removes its target with no recovery path.
     #[test]
     fn rmdir_moves_target_to_trash_instead_of_removing_it() {
+        if !sandbox_available() {
+            return;
+        }
         let root = std::env::temp_dir().join(format!(
             "llm-assistant-sandbox-rmdir-test-{}",
             std::process::id()

@@ -164,6 +164,46 @@ details.bubble.output pre {
   font-size: 12.5px;
 }
 
+/* Deliberately styled like the sudo callout rather than like a quiet system
+   note: a model-written summary silently replacing part of the record is the
+   one context event the user really should read. */
+details.bubble.summary {
+  align-self: stretch;
+  background: #241c10;
+  border: 1px solid #6b4a1a;
+}
+
+details.bubble.summary > summary {
+  color: #e0b35c;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.summary-note {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 6px 0;
+}
+
+details.bubble.summary pre {
+  margin: 0 0 6px;
+  white-space: pre-wrap;
+  font-size: 12.5px;
+}
+
+.summary-edit {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 6px;
+  font: inherit;
+  font-size: 12.5px;
+  background: var(--panel);
+  color: inherit;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px;
+}
+
 details.bubble.thinking {
   align-self: stretch;
   background: none;
@@ -274,6 +314,12 @@ dialog h3 {
 dialog .explain {
   color: var(--muted);
   font-size: 13px;
+}
+
+/* Same amber as the sudo callout: the two places where the app tells the user
+   something it cannot fix for them. */
+dialog .explain.warn {
+  color: #e0b35c;
 }
 
 .confirm-context {

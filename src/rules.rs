@@ -34,6 +34,10 @@ command the user denied did NOT run and changed nothing -- say exactly that, and
 moved, created, or deleted based on what you intended rather than what you saw happen. If you aren't \
 sure a change actually landed, run one listing to check and go by that output; if it only partly worked, \
 say which parts succeeded and which didn't.\n\
+- The explanation line above a command describes something that has NOT happened yet, so write it that \
+way: \"this will move the files into folders\", not \"the files have been organized\". The command runs \
+after you finish writing, and it can still be refused or fail. Past tense there is how a report of work \
+that never happened gets written one line at a time.\n\
 - `sudo`, `su`, `doas`, and `pkexec` will always fail in this sandbox no matter what, even if approved \
 -- never propose them as a command to run; tell the user to run it themselves in their own terminal.\n\
 - `.temp-trash/` in the working folder is created and managed by this app itself, holding soft-deleted \
@@ -75,6 +79,59 @@ looked up inside the working folder instead and fail.\n\
 does NOT mean \"a to X, b to Y\"; everything but the last argument is a source. For a couple of files \
 going to different places, chain separate two-argument `mv`/`cp` calls with `&&`; for anything bigger, \
 write it as a script instead (see the protocol above).";
+
+/// Handed to the model when the repeat guard refuses a command, in place of
+/// running it. Kept identical to the note `runAssistantTurn` pushes in
+/// `ui/main.js`.
+pub const REPEATED_COMMAND_NOTE: &str = "[you proposed the exact same command again immediately \
+after it already ran, with nothing new to justify re-running it -- it was not run again. You \
+already have its output above.]";
+
+/// The wrap-up turn after a hard stop, with commands off the table.
+///
+/// Every clause here is load-bearing. An earlier version asked for "what was
+/// done and what the final result is", which presupposes success and invited
+/// the model to invent it -- after two denied commands, with nothing having
+/// run at all, it confidently reported a directory reorganization that never
+/// happened. It also used to open with "you already have everything you
+/// need", which is simply false once context trimming has been at the
+/// conversation, and reads as permission to fill the gaps.
+///
+/// Kept identical to the note `finalAnswerTurn` pushes in `ui/main.js`; the
+/// GUI got this fix first and headless kept the old wording for a release,
+/// which is exactly the drift both using this constant is meant to stop.
+pub const FINAL_ANSWER_PROMPT: &str = "[don't run anything else. Reply now in plain text, with no \
+command and no code fence, describing the CURRENT state strictly from the command output you \
+actually received above. If commands were denied, never ran, or failed, say that plainly -- do not \
+describe any file as moved, created, or deleted unless output above shows it actually happened. If \
+part of this conversation was summarized or dropped to save context, don't reconstruct what was in \
+it: say you no longer have it rather than describing file contents you cannot see.]";
+
+/// Pulls the proposed command back out of a reply, per the fence contract
+/// `PROTOCOL_PROMPT` above lays down. Lives here (rather than in whichever
+/// module happens to need it) because it's the read side of that same
+/// contract -- `headless.rs` runs what it returns, `context.rs` uses it to
+/// recognize a completed step. Only an explicitly-tagged fence counts,
+/// matching `parseAssistantReply` in `ui/main.js`: a plain ``` fence is the
+/// model showing text, not proposing something to execute.
+pub fn extract_command(text: &str) -> Option<String> {
+    // Earliest fence in the text wins, not the first language that happens
+    // to match -- a reply with ```bash before ```sh must still resolve to
+    // the one the frontend would have run.
+    let mut earliest: Option<usize> = None;
+    for lang in ["sh", "bash", "shell"] {
+        if let Some(pos) = text.find(&format!("```{lang}\n")) {
+            let start = pos + lang.len() + 4; // ``` + lang + \n
+            earliest = Some(match earliest {
+                Some(e) if e <= start => e,
+                _ => start,
+            });
+        }
+    }
+    let start = earliest?;
+    let end = text[start..].find("```")?;
+    Some(text[start..start + end].trim().to_string())
+}
 
 fn general_rules_path() -> PathBuf {
     app_config_dir().join("rules.md")
@@ -171,5 +228,23 @@ mod tests {
         assert_eq!(combined, PROTOCOL_PROMPT);
         assert!(!combined.contains("GENERAL"));
         assert!(!combined.contains("COMMAND"));
+    }
+
+    #[test]
+    fn extract_command_reads_a_tagged_fence() {
+        let reply = "Let's look.\n```sh\nls -F\n```\n";
+        assert_eq!(extract_command(reply).as_deref(), Some("ls -F"));
+    }
+
+    #[test]
+    fn extract_command_ignores_an_untagged_fence() {
+        let reply = "Here's the file:\n```\nnot a command\n```\n";
+        assert_eq!(extract_command(reply), None);
+    }
+
+    #[test]
+    fn extract_command_takes_the_earliest_fence_not_the_first_language() {
+        let reply = "```bash\nfirst\n```\nand\n```sh\nsecond\n```";
+        assert_eq!(extract_command(reply).as_deref(), Some("first"));
     }
 }
