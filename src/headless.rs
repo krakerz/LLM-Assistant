@@ -64,16 +64,26 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
             return 1;
         }
     };
-    let rules = match rules::load_or_init() {
+    let general_rules = match rules::load_general_or_init() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("error loading rules: {e}");
+            eprintln!("error loading general rules: {e}");
+            return 1;
+        }
+    };
+    let command_rules = match rules::load_command_or_init() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error loading command rules: {e}");
             return 1;
         }
     };
 
     let root_note = config::build_root_note(Some(root.as_path()), &cfg.granted_paths);
-    let system_content = format!("{}\n\n{}\n\n{}", rules, cfg.system_prompt, root_note);
+    let system_content = format!(
+        "{}\n\n{}\n\n{}\n\n{}",
+        general_rules, command_rules, cfg.system_prompt, root_note
+    );
 
     let mut history = vec![ChatMessage {
         role: "user".into(),
@@ -85,6 +95,13 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
     } else {
         cfg.max_auto_steps
     };
+
+    // Mirrors main.js's isImmediateRepeat guard: if the model proposes the
+    // exact same command again right after it ran, with nothing else having
+    // run in between, stop instead of letting it spin -- seen in practice as
+    // an ls -F / "organization is complete" loop that ran until max_steps
+    // (which is unbounded when configured to 0).
+    let mut last_executed: Option<String> = None;
 
     for step in 0..=max_steps {
         let mut messages = vec![ChatMessage {
@@ -120,6 +137,14 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
             break; // final answer, no more commands proposed
         };
 
+        if last_executed.as_deref() == Some(cmd.as_str()) {
+            println!(
+                "\n[stopping -- that exact command was just run and nothing happened in between, \
+                 repeating it won't produce new information]"
+            );
+            break;
+        }
+
         if is_privilege_escalation(&cmd) {
             println!("\n[needs sudo/root -- this sandbox can never grant that; run it yourself]");
             break;
@@ -134,6 +159,7 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
 
         match sandbox::run_sandboxed(&root, &shims, &cfg.granted_paths, &cmd) {
             Ok(outcome) => {
+                last_executed = Some(cmd.clone());
                 println!("\n$ {cmd}  (exit {})", outcome.exit_code);
                 if !outcome.stdout.is_empty() {
                     print!("{}", outcome.stdout);

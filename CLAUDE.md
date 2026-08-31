@@ -78,10 +78,15 @@ enough edit to do by hand or ask Claude to do directly.
   only the selected root directory (read-write) plus any user-granted paths;
   everything else is invisible to the command regardless of what it tries to
   do. `ensure_shims` writes a fake `rm` onto a `PATH` that's prepended inside
-  the jail, which moves targets into `.temp-trash/<original relative path>`
-  instead of deleting them — this runs unconditionally, independent of the
-  read-only/confirmation split, so even a user-approved destructive command
-  stays recoverable. Only `rm` is shimmed today (see `TODO.md`).
+  the jail, which moves targets into
+  `.temp-trash/<timestamp>/<original relative path>` instead of deleting
+  them — this runs unconditionally, independent of the read-only/confirmation
+  split, so even a user-approved destructive command stays recoverable. The
+  shim computes its own `date +%Y%m%d-%H%M%S-%N` timestamp per invocation
+  (all targets of one `rm` call land in the same batch); without it, `mv -f`
+  deleting the same path a second time would silently overwrite the first
+  trashed copy with no way to get it back. Only `rm` is shimmed today (see
+  `TODO.md`).
 - `paths.rs` — resolves `$XDG_CONFIG_HOME/llm-assistant` (falls back to
   `~/.config/llm-assistant`) for both config and logs. Deliberately not tied
   to the selected folder, since both need to exist before any folder is
@@ -92,14 +97,32 @@ enough edit to do by hand or ask Claude to do directly.
   `build_root_note` is the shared per-turn note builder (folder-open state,
   plus each granted path and *why* it was granted) used by both the GUI's
   `send_message` and `headless.rs`, so they can't drift apart.
-- `rules.rs` — `rules.md`, read *before* the system prompt every turn (see
-  `send_message`): the mechanical/protocol stuff (command format, quoting,
-  confirmation behavior, sudo handling, etc.) that a user customizing
-  `system_prompt` shouldn't have to also carry or risk breaking.
+- `rules.rs` — two files, both read *before* the system prompt every turn
+  (see `send_message`/`headless.rs`): `rules.md` (general behavior --
+  identity, honesty about uncertainty, re-verifying stale info) and
+  `command-rules.md` (shell mechanics -- command format, quoting,
+  confirmation behavior, sudo handling, `mv`/`cp` argument syntax), split so
+  a user customizing `system_prompt` shouldn't have to also carry or risk
+  breaking either. `load_general_or_init`/`load_command_or_init` only write
+  the default the *first* time a file doesn't exist -- editing
+  `DEFAULT_GENERAL_RULES`/`DEFAULT_COMMAND_RULES` in code has no effect on
+  an install that already has the file on disk; the user has to hit
+  Settings -> Rules -> "Reset to default" to pick it up. `log_loaded_rules`
+  logs the full text of both files to `app.log`, called once at startup
+  (`main()`, before the headless dispatch so headless gets it too, not
+  inside the load functions themselves since those run every turn and would
+  spam the log) so a stale edit or a reset that didn't take is visible
+  directly in the log.
 - `chat_log.rs` — appends a flat, human-readable mirror of the GUI
-  conversation (including collapsed "thinking" steps) to
-  `<app-config-dir>/last-chat.log`, cleared at the start of every GUI launch.
-  For inspecting a session without driving the actual window.
+  conversation (including collapsed "thinking" steps) to a session-scoped
+  `<app-config-dir>/logs/chat-<timestamp>.log`, started fresh by `init()` at
+  the beginning of every GUI launch (`main()`, before `.run()`). Up to 5 are
+  kept, oldest deleted first (hardcoded `MAX_LOG_FILES`) -- unlike the old
+  single `last-chat.log` that got wiped on every launch, a session from a
+  previous run is still there to check after relaunching. `append()` writes
+  to whichever path `init()` picked, held in a `OnceLock` so every
+  `append_chat_log` Tauri command call (each its own invocation) lands in
+  the same file instead of fragmenting.
 - `headless.rs` — `llm-assistant <folder> <message>` runs one turn (and any
   commands it leads to) without the GUI, printing to stdout and exiting.
   Mirrors `ui/main.js`'s orchestration logic; anything that would need a
@@ -154,6 +177,19 @@ just flip a UI flag; `stopRequested` additionally keeps the chain from
 starting a new step if Stop is clicked while a command is executing rather
 than while generating.
 
+`createThinkingTracker()` also tracks the last command that actually ran in
+the chain (`recordExecuted`, set in `executeCommand`/`executeSequence` after
+a successful `run_command`); `runAssistantTurn` checks a newly-proposed
+command against it (`isImmediateRepeat`) and hard-stops, same shape as the
+sudo case below, if the model proposes the exact same command again right
+after it ran with nothing else having run in between. This is what actually
+caught a model getting stuck re-verifying a finished task forever (`ls -F` /
+"organization is complete" repeated 20+ times, since `max_auto_steps = 0`
+means nothing else would stop it) — a real re-check after an actual change
+(`ls -F` again after an `mv`) isn't flagged, since a different command sits
+between the two occurrences. `headless.rs` has the same guard
+(`last_executed`), for parity.
+
 `needsElevatedPrivileges` (checked in `runAssistantTurn` *before* the
 thinking-routing decision, using every word in the command, not just the
 first — a compound command can have `sudo` as its second word) short-circuits
@@ -168,7 +204,7 @@ pipe/redirect shape. `renderMarkdown` is a small dependency-free Markdown
 renderer (fenced code blocks, inline code, bold, italic) applied to assistant
 bubbles only. Every `appendBubble`/`appendOutput`/`appendManualCommand` call
 also fires `logToFile`, mirroring exactly what's shown (thinking included) to
-`append_chat_log` / `last-chat.log`.
+`append_chat_log` / this session's `logs/chat-<timestamp>.log`.
 
 Settings (gear icon) work with no folder open, since config is global, and
 has two tabs: General (endpoint/model/temperature/`max_auto_steps`/system
@@ -180,13 +216,15 @@ into `config::build_root_note` so the model can proactively decide to read a
 granted path for a matching task instead of only when the user states the
 absolute path themselves.
 
-**CI** (`.github/workflows/autobuild.yml`) is a single workflow triggered by
-PRs into `main` and pushes to `main` (no manual tag pushes). On push to
-`main` it reads the version out of `Cargo.toml`, checks via `git ls-remote`
-whether that tag already exists remotely, and only then builds the full
-bundle and opens a **draft** GitHub release (tag created by
+**CI** (`.github/workflows/autobuild.yml`) is a single workflow triggered
+only by pushes to `main` (a PR by itself triggers nothing; no manual tag
+pushes either). It reads the version out of `Cargo.toml`, checks via
+`git ls-remote` whether that tag already exists remotely, and only then
+builds the full bundle and opens a **draft** GitHub release (tag created by
 `tauri-apps/tauri-action`, release body pulled from the matching
-`CHANGELOG.md` section). Every other trigger (PRs, or a push that didn't bump
-the version) just runs fmt/clippy/test/build as a sanity check. This means
-the version bump commit described above is what actually triggers a release
-once it reaches `main` — there's no separate tagging step.
+`CHANGELOG.md` section). A push that didn't bump the version just runs
+fmt/clippy/test/build as a sanity check. This means the version bump commit
+described above is what actually triggers a release once it reaches `main`
+— there's no separate tagging step. Rust build artifacts are cached via
+`Swatinem/rust-cache`, apt packages via `actions/cache` keyed on the
+workflow file itself.

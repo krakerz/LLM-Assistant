@@ -30,10 +30,11 @@
     <p class="explain">
       It writes, deletes, or otherwise changes something — or uses pipes/redirects the sandbox can't
       pre-check. Deletes inside the folder are soft: they land in <code>.temp-trash/</code>, not gone
-      for good. Review the raw command below.
+      for good. Review the command(s) below.
     </p>
     <pre id="confirmCmd" class="cmd"></pre>
-    <label class="checkbox-row">
+    <ul id="confirmSteps" class="confirm-steps" hidden></ul>
+    <label class="checkbox-row" id="alwaysAllowRow">
       <input type="checkbox" id="alwaysAllow" />
       Always allow this program without asking (only applies while the command has no pipes/redirects)
     </label>
@@ -49,6 +50,7 @@
     <div class="tabs">
       <button type="button" class="tab-btn active" data-tab="general">General</button>
       <button type="button" class="tab-btn" data-tab="rules">Rules</button>
+      <button type="button" class="tab-btn" data-tab="commands">Commands</button>
     </div>
 
     <div class="tab-panel" data-panel="general">
@@ -67,7 +69,7 @@
       <label>Max automatic steps (propose → run → respond cycles before it waits for you; 0 = no limit)
         <input id="cfgMaxAutoSteps" type="number" step="1" min="0" />
       </label>
-      <label>System prompt (persona/focus -- the mechanical rules live in the Rules tab)
+      <label>System prompt (persona/focus -- behavior and command mechanics live in their own tabs)
         <textarea id="cfgSystemPrompt" rows="4"></textarea>
       </label>
       <button id="resetPromptBtn" type="button" class="link-btn">Reset to default</button>
@@ -80,20 +82,32 @@
 
       <fieldset>
         <legend>Always-allowed programs</legend>
-        <p id="autoApproveList" class="auto-approve-list"></p>
+        <ul id="autoApproveList" class="auto-approve-list"></ul>
       </fieldset>
     </div>
 
     <div class="tab-panel" data-panel="rules" hidden>
       <p class="explain">
-        Read by the assistant before your system prompt, on every turn. This is the command format,
-        quoting, confirmation, and safety guidance -- edit it if you know what you're changing, or use
-        the system prompt tab for persona/focus instead.
+        General behavior: identity, honesty about uncertainty, re-verifying stale info, searching
+        before guessing. Read before your system prompt, on every turn. Shell mechanics (command
+        format, quoting, sudo handling, etc.) live in the Commands tab instead.
       </p>
-      <label>Working rules
-        <textarea id="cfgRules" rows="16"></textarea>
+      <label>General rules
+        <textarea id="cfgGeneralRules" rows="14"></textarea>
       </label>
-      <button id="resetRulesBtn" type="button" class="link-btn">Reset to default</button>
+      <button id="resetGeneralRulesBtn" type="button" class="link-btn">Reset to default</button>
+    </div>
+
+    <div class="tab-panel" data-panel="commands" hidden>
+      <p class="explain">
+        The shell-mechanics half: command format, quoting, confirmation behavior, sudo handling,
+        mv/cp argument syntax. Edit it if you know what you're changing -- most customization belongs
+        in the system prompt or General rules instead.
+      </p>
+      <label>Command rules
+        <textarea id="cfgCommandRules" rows="14"></textarea>
+      </label>
+      <button id="resetCommandRulesBtn" type="button" class="link-btn">Reset to default</button>
     </div>
 
     <div class="dialog-actions">
