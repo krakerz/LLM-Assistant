@@ -1,0 +1,109 @@
+name: Autobuild
+
+# Runs on every PR into main and every push to main. Push-to-main additionally
+# reads the version straight out of src-tauri/Cargo.toml and, only if that
+# version hasn't been released yet, builds the full bundle and cuts a tag +
+# draft release (release notes pulled from the matching CHANGELOG.md
+# section). Everything else -- PRs, or a push to main that didn't bump the
+# version -- just gets fmt/clippy/test/build as a sanity check.
+#
+# Bump the version with scripts/release.sh (which also promotes
+# CHANGELOG.md's "Unreleased" section) before merging to main to trigger an
+# actual release.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            bubblewrap
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Read version from Cargo.toml
+        id: version
+        run: |
+          version="$(grep -m1 '^version' src-tauri/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether this version has already been released
+        id: check_tag
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract changelog section for this version
+        if: github.event_name == 'push' && steps.check_tag.outputs.should_release == 'true'
+        id: changelog
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          notes="$(awk -v ver="$version" '
+            BEGIN { found=0 }
+            $0 ~ "^## \\[" ver "\\]" { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md)"
+          if [ -z "${notes// }" ]; then
+            notes="No changelog entry found for $version."
+          fi
+          {
+            echo "notes<<CHANGELOG_EOF"
+            echo "$notes"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # PRs, and any push to main that isn't a fresh version bump, just get a
+      # plain build to confirm nothing's broken -- no tag, no release.
+      - name: Build only
+        if: "!(github.event_name == 'push' && steps.check_tag.outputs.should_release == 'true')"
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release
+
+      - name: Build bundle and create draft release
+        if: github.event_name == 'push' && steps.check_tag.outputs.should_release == 'true'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v${{ steps.version.outputs.version }}
+          releaseName: "v${{ steps.version.outputs.version }}"
+          releaseBody: ${{ steps.changelog.outputs.notes }}
+          releaseDraft: true
+          prerelease: false

@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LLM Assistant</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <button id="pickBtn">Select Folder…</button>
+    <span id="rootPath" class="root-path">No folder selected</span>
+    <button id="settingsBtn" title="Settings" class="icon-btn">⚙</button>
+  </header>
+
+  <main id="chatLog" class="chat-log"></main>
+
+  <form id="chatForm" class="chat-form">
+    <textarea id="chatInput" placeholder="Ask the assistant to do something in this folder…" rows="2" disabled></textarea>
+    <button type="submit" id="sendBtn" disabled>Send</button>
+  </form>
+
+  <dialog id="confirmDialog">
+    <h3>This command needs your approval</h3>
+    <p class="explain">
+      It writes, deletes, or otherwise changes something — or uses pipes/redirects the sandbox can't
+      pre-check. Deletes inside the folder are soft: they land in <code>.temp-trash/</code>, not gone
+      for good. Review the raw command below.
+    </p>
+    <pre id="confirmCmd" class="cmd"></pre>
+    <label class="checkbox-row">
+      <input type="checkbox" id="alwaysAllow" />
+      Always allow this program without asking (only applies while the command has no pipes/redirects)
+    </label>
+    <div class="dialog-actions">
+      <button id="denyBtn" type="button">Deny</button>
+      <button id="approveBtn" type="button">Run it</button>
+    </div>
+  </dialog>
+
+  <dialog id="settingsDialog">
+    <h3>Settings</h3>
+    <label>Endpoint
+      <input id="cfgEndpoint" type="text" placeholder="http://localhost:11434/v1/chat/completions" />
+    </label>
+    <label>Model
+      <input id="cfgModel" type="text" placeholder="llama3.1" />
+    </label>
+    <label>Temperature
+      <input id="cfgTemperature" type="number" step="0.1" min="0" max="2" />
+    </label>
+    <label>System prompt
+      <textarea id="cfgSystemPrompt" rows="6"></textarea>
+    </label>
+
+    <fieldset>
+      <legend>Granted paths (readable outside the folder)</legend>
+      <ul id="grantedList" class="granted-list"></ul>
+      <div class="granted-add">
+        <input id="grantPathInput" type="text" placeholder="/absolute/path" />
+        <input id="grantNoteInput" type="text" placeholder="why" />
+        <button id="grantAddBtn" type="button">Grant read access</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Always-allowed programs</legend>
+      <p id="autoApproveList" class="auto-approve-list"></p>
+    </fieldset>
+
+    <div class="dialog-actions">
+      <button id="settingsCloseBtn" type="button">Close</button>
+      <button id="settingsSaveBtn" type="button">Save</button>
+    </div>
+  </dialog>
+
+  <script src="main.js"></script>
+</body>
+</html>
