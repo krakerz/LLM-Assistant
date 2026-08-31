@@ -229,6 +229,35 @@ means nothing else would stop it) — a real re-check after an actual change
 between the two occurrences. `headless.rs` has the same guard
 (`last_executed`), for parity.
 
+The guard doesn't just stop dead, though: in practice it fires precisely
+when the work is already *finished* and the model is re-running a listing to
+display output it already has, usually having written "here is the current
+structure:" first — so bailing out there left the user with a dangling
+half-sentence inside a collapsed Thinking box and no answer at all, which
+reads as the app cutting off mid-task. So it refuses the command and then
+calls `finalAnswerTurn()`, one more `send_message` with a "no command, plain
+text only" note appended; whatever comes back is shown as a normal bubble
+*outside* `thinking` (the whole point — it's the closing answer), with any
+command still in it stripped and never run, so it can't start a new chain.
+Deliberately *not* wired into the Stop-button or `maxSteps` paths: Stop means
+the user wants it to stop now, not to spend another request, and the cap
+already tells them to send another message. Its prompt is also carefully
+worded *not* to presuppose success — an earlier version asked for "what was
+done and what the final result is", and after two denied commands (nothing
+having run at all) the model duly invented a completed reorganization,
+naming files and folders that didn't exist. It now asks for the current
+state strictly from output actually received.
+
+Denying a command likewise ends the chain rather than auto-continuing — a
+denial is a deliberate "no", and continuing let the model keep flailing and
+was one of the ingredients in that fabricated report. The note it gets is
+emphatic that the command did not run and changed nothing, since a milder
+"[the user denied that command]" left it speculating that the command may
+have "partially executed". The root cause is addressed in
+`PROTOCOL_PROMPT` too (every command's output is already shown to the user
+and handed back, so never re-run one just to display/confirm it) — that's
+what actually stops the loop; `finalAnswerTurn` is the backstop.
+
 `needsElevatedPrivileges` (checked in `runAssistantTurn` *before* the
 thinking-routing decision, using every word in the command, not just the
 first — a compound command can have `sudo` as its second word) short-circuits

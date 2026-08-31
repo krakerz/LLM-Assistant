@@ -6,6 +6,48 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-08-31
+### Fixed
+- **The assistant could report work it never did.** After the user denied a
+  command twice (so nothing ran at all), it produced a confident, fully
+  fabricated summary of a directory reorganization -- listing which files
+  had gone into which new folders, none of which existed. Three causes,
+  all fixed:
+  - Denying a command auto-continued the chain, letting the model keep
+    flailing after a deliberate "no". A denial now ends the chain outright
+    (same as the sudo case) and says so, and the note the model gets is
+    explicit that the command did NOT run and changed nothing.
+  - The 1.5.0 wrap-up turn asked the model to say "what was done and what
+    the final result is" -- which presupposes success and directly invited
+    the fabrication. It now asks for the current state strictly from
+    command output actually received, and to plainly say so when commands
+    were denied, never ran, or failed.
+  - The protocol now forbids reporting any action as done unless a command
+    actually ran and its output shows it worked, requires saying plainly
+    when something was denied or failed, and asks for a single verifying
+    listing (plus which parts succeeded) when a change may have only
+    partly landed.
+
+## [1.5.0] - 2026-08-31
+### Fixed
+- Conversations appeared to cut off mid-task. The model habitually ended a
+  reply with "here is the current structure:" and then proposed the *same*
+  listing it had just run, purely to display output it already had. The
+  repeat guard correctly refused to run it -- but then stopped dead, leaving
+  that dangling half-sentence inside a collapsed Thinking box with no answer
+  anywhere. Two fixes: the protocol now tells the model that every command's
+  output is already shown to it and to the user, so it must never re-run a
+  command just to display or confirm something (quote the output you already
+  have; when the work is done, say so in plain text). And when the guard does
+  fire, the app now takes one final no-command turn so the user always gets a
+  real closing answer outside the Thinking group instead of nothing. Verified
+  against the real model: it now writes the structure out from the output it
+  already had rather than re-running `ls`.
+- Same protocol rule also addresses replies that proposed several listing
+  commands at once (seen as "That reply included 5 commands; only the first
+  one ran") -- it had just run `ls -F A/ D/ N/ S/ T/`, received all of it,
+  then proposed five more listings to show each folder separately.
+
 ## [1.4.1] - 2026-08-31
 ### Fixed
 - A model asked to move files "to root folder" targeted a granted path
