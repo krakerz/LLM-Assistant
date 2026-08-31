@@ -8,6 +8,7 @@
   --accent: #7dd3fc;
   --danger: #f87171;
   --ok: #4ade80;
+  --ui-font-size: 14px;
 }
 
 * {
@@ -25,7 +26,9 @@ body {
   flex-direction: column;
   background: var(--bg);
   color: var(--text);
-  font: 14px/1.45 -apple-system, "Segoe UI", Inter, sans-serif;
+  font-family: -apple-system, "Segoe UI", Inter, sans-serif;
+  font-size: var(--ui-font-size);
+  line-height: 1.45;
 }
 
 .topbar {
@@ -105,7 +108,7 @@ button:disabled {
   background: none;
 }
 
-.bubble.output {
+details.bubble.output {
   align-self: stretch;
   background: #0f1116;
   border: 1px solid var(--border);
@@ -113,14 +116,57 @@ button:disabled {
   font-size: 12.5px;
 }
 
-.output-cmd {
+details.bubble.output summary {
   color: var(--accent);
-  margin-bottom: 4px;
+  cursor: pointer;
+  list-style: revert;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+details.bubble.output summary::marker {
+  color: var(--muted);
+}
+
+details.bubble.output pre {
+  margin: 8px 0 0;
 }
 
 .badge {
   color: var(--muted);
   font-size: 11px;
+}
+
+.copy-btn {
+  margin-left: auto;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-family: inherit;
+}
+
+.bubble.assistant code {
+  background: #0f1116;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: ui-monospace, monospace;
+  font-size: 0.9em;
+}
+
+.bubble.assistant pre.md-code {
+  background: #0f1116;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+
+.bubble.assistant pre.md-code code {
+  background: none;
+  border: none;
+  padding: 0;
 }
 
 .chat-form {
@@ -149,6 +195,7 @@ dialog {
   border-radius: 10px;
   padding: 18px;
   width: min(560px, 90vw);
+  font-size: var(--ui-font-size);
 }
 
 dialog::backdrop {
@@ -250,10 +297,32 @@ legend {
   font-family: ui-monospace, monospace;
 }
 
+.quick-add-btn {
+  margin-top: 8px;
+  width: 100%;
+  border-style: dashed;
+  color: var(--accent);
+}
+
 .granted-add {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
-  margin-top: 8px;
+  margin-top: 10px;
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--accent);
+  padding: 4px 0;
+  font-size: 12px;
+  text-decoration: underline;
+}
+
+.link-btn:hover {
+  background: none;
+  color: var(--text);
 }
 
 .granted-add input {

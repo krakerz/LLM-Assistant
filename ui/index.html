@@ -10,14 +10,17 @@
   <header class="topbar">
     <button id="pickBtn">Select Folder…</button>
     <span id="rootPath" class="root-path">No folder selected</span>
+    <button id="unmountBtn" title="Stop file access, go back to chat-only">Unmount</button>
+    <button id="fontDecBtn" title="Decrease font size" class="icon-btn">A−</button>
+    <button id="fontIncBtn" title="Increase font size" class="icon-btn">A+</button>
     <button id="settingsBtn" title="Settings" class="icon-btn">⚙</button>
   </header>
 
   <main id="chatLog" class="chat-log"></main>
 
   <form id="chatForm" class="chat-form">
-    <textarea id="chatInput" placeholder="Ask the assistant to do something in this folder…" rows="2" disabled></textarea>
-    <button type="submit" id="sendBtn" disabled>Send</button>
+    <textarea id="chatInput" placeholder="Chat, or select a folder above to let it act on files… (Enter for newline, Ctrl+Enter to send)" rows="2"></textarea>
+    <button type="submit" id="sendBtn">Send</button>
   </form>
 
   <dialog id="confirmDialog">
@@ -46,19 +49,25 @@
     <label>Model
       <input id="cfgModel" type="text" placeholder="llama3.1" />
     </label>
+    <label>API key (optional -- sent as an Authorization: Bearer header)
+      <input id="cfgApiKey" type="password" placeholder="leave blank if the endpoint doesn't need one" autocomplete="off" />
+    </label>
     <label>Temperature
       <input id="cfgTemperature" type="number" step="0.1" min="0" max="2" />
     </label>
     <label>System prompt
       <textarea id="cfgSystemPrompt" rows="6"></textarea>
     </label>
+    <button id="resetPromptBtn" type="button" class="link-btn">Reset to default</button>
 
     <fieldset>
       <legend>Granted paths (readable outside the folder)</legend>
       <ul id="grantedList" class="granted-list"></ul>
+      <button id="grantQuickAddBtn" type="button" class="quick-add-btn">+ Add another folder…</button>
       <div class="granted-add">
         <input id="grantPathInput" type="text" placeholder="/absolute/path" />
-        <input id="grantNoteInput" type="text" placeholder="why" />
+        <input id="grantNoteInput" type="text" placeholder="why (optional)" />
+        <button id="grantBrowseBtn" type="button">Browse…</button>
         <button id="grantAddBtn" type="button">Grant read access</button>
       </div>
     </fieldset>
