@@ -293,11 +293,13 @@ fn run_command(
     log::info!("run_command: root={} cmd={:?}", root.display(), cmd);
     let shims = shim_dir(&app);
     sandbox::ensure_shims(&shims).map_err(|e| e.to_string())?;
-    let outcome = sandbox::run_sandboxed(&root, &shims, &cfg.granted_paths, &cmd)
-        .map_err(|e| e.to_string())?;
+    let scratch = cfg.memory_enabled.then(memory::temp_dir);
+    let outcome =
+        sandbox::run_sandboxed(&root, &shims, &cfg.granted_paths, scratch.as_deref(), &cmd)
+            .map_err(|e| e.to_string())?;
     // Here, not the frontend: the only place with both the command and its
     // real exit code.
-    memory::record_command(&cmd, outcome.exit_code);
+    memory::record_command(&cfg, &cmd, outcome.exit_code);
     log::debug!(
         "run_command: exit={} stdout={} bytes stderr={} bytes",
         outcome.exit_code,
@@ -495,15 +497,19 @@ async fn send_message(
 
 /// A new top-level user message is this app's task boundary.
 #[tauri::command]
-fn start_memory_task(state: State<AppState>, message: String) {
+fn start_memory_task(state: State<AppState>, message: String) -> Result<(), String> {
+    let cfg = config::load_or_init().map_err(|e| e.to_string())?;
     let root = state.root.lock().unwrap().clone();
-    memory::start_task(root.as_deref(), &message);
+    memory::start_task(&cfg, root.as_deref(), &message);
+    Ok(())
 }
 
 /// Separate from `run_command` because these have no exit code or output.
 #[tauri::command]
-fn record_blocked_command(cmd: String, why: String) {
-    memory::record_blocked(&cmd, &why);
+fn record_blocked_command(cmd: String, why: String) -> Result<(), String> {
+    let cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    memory::record_blocked(&cfg, &cmd, &why);
+    Ok(())
 }
 
 #[tauri::command]
@@ -576,7 +582,10 @@ fn main() {
     let startup_cfg = config::load_or_init().unwrap_or_default();
     rules::log_loaded_rules(startup_cfg.disable_builtin_rules);
 
-    // Before the headless dispatch: a headless run is a session too.
+    // Before the headless dispatch: a headless run is a session too. Not
+    // gated on `memory_enabled` -- config is hot-reloaded, so the setting can
+    // come on mid-session, and without a session dir the writes would fall
+    // back to a shared one. Costs an empty directory when it stays off.
     match memory::init() {
         Ok(path) => log::info!("session memory: {}", path.display()),
         Err(e) => log::warn!("failed to start session memory: {e}"),

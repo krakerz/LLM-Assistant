@@ -23,6 +23,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history and tags: the changelog fallback below reads commit
+          # subjects since the previous tag, and a shallow clone has neither.
+          fetch-depth: 0
 
       - name: Cache apt packages
         uses: actions/cache@v4
@@ -104,9 +108,16 @@ jobs:
             found && /^## \[/ { exit }
             found { print }
           ' CHANGELOG.md)"
+          # No changelog section is not fatal -- rough notes beat no release.
+          # Fall back to commit subjects since the previous tag.
           if [ -z "${notes// }" ]; then
-            echo "::error::CHANGELOG.md has no section for $version" >&2
-            exit 1
+            echo "::warning::no CHANGELOG.md section for $version, using commit history"
+            prev="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+            [ -n "$prev" ] && range="$prev..HEAD" || range="HEAD"
+            log="$(git log --no-merges --pretty=format:'- %s' "$range" | head -50)"
+            [ -n "$log" ] || log="- (no commits found)"
+            header="_No changelog entry for $version; notes generated from commit history._"
+            notes="$(printf '%s\n\n%s' "$header" "$log")"
           fi
           {
             echo "notes<<CHANGELOG_EOF"
@@ -136,8 +147,31 @@ jobs:
       # The .deb declares bubblewrap so apt handles it, but an AppImage user
       # gets no such hint -- and without bwrap every command fails. INSTALL.txt
       # rides along as its own asset so the download is usable on its own.
-      - name: Attach INSTALL.txt to the draft release
+      # SHA256SUMS covers every asset, computed from the files this job
+      # actually built.
+      - name: Attach INSTALL.txt and checksums to the draft release
         if: steps.check_tag.outputs.should_release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "v${{ steps.version.outputs.version }}" INSTALL.txt --clobber
+          TAG: v${{ steps.version.outputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
+          ARTIFACTS: ${{ steps.release.outputs.artifactPaths }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # tauri-action reports what it uploaded as a JSON array; fall back to
+          # the bundle tree if that output is ever missing or empty.
+          if [ -n "${ARTIFACTS:-}" ] && [ "$(printf '%s' "$ARTIFACTS" | jq 'length')" -gt 0 ]; then
+            printf '%s' "$ARTIFACTS" | jq -r '.[]' | while IFS= read -r f; do
+              [ -f "$f" ] && cp -- "$f" dist/
+            done
+          else
+            # Version-matched: a dirty tree can hold bundles from older builds,
+            # and a checksum over one of those would be a lie about this release.
+            find target/release/bundle -type f -name "*${VERSION}*" \
+              \( -name '*.deb' -o -name '*.AppImage' -o -name '*.rpm' \) \
+              -exec cp -- {} dist/ \;
+          fi
+          cp INSTALL.txt dist/
+          ( cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS )
+          gh release upload "$TAG" INSTALL.txt dist/SHA256SUMS --clobber

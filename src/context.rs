@@ -22,6 +22,10 @@ const CONDENSED_MARKER: &str = "[earlier step, condensed to its command and resu
 
 const CONDENSED_COMMAND_CHARS: usize = 300;
 const CONDENSED_OUTPUT_CHARS: usize = 400;
+/// Floor on each step's share in a multi-step batch, so a long sequence
+/// doesn't shrink every step to nothing. Can push a batch over the cap;
+/// `trim_to_budget` re-measures after each step and keeps going.
+const CONDENSED_MIN_BLOCK_CHARS: usize = 60;
 
 fn truncate_with_note(text: &str, max: usize, what: &str) -> String {
     let total = text.chars().count();
@@ -69,29 +73,51 @@ fn next_condensable(messages: &[ChatMessage]) -> Option<usize> {
     (0..messages.len().saturating_sub(2)).find(|&i| is_finished_step(messages, i))
 }
 
-/// Command + result, narration discarded. The result's own first line is
-/// reused verbatim so a sequence that failed partway keeps its real per-step
-/// exit codes.
+/// Keeps every `[command output, exit N]` line and truncates only the output
+/// between them. `executeSequence` reports a whole batch in one message, so
+/// treating it as a single string let a long first output push a later step's
+/// failure past the cap -- exactly the "it must have worked" gap this module
+/// exists to close.
+fn condense_result(content: &str, budget: usize) -> String {
+    let mut blocks: Vec<(&str, Vec<&str>)> = Vec::new();
+    for line in content.lines() {
+        if line.starts_with(COMMAND_OUTPUT_PREFIX) {
+            blocks.push((line, Vec::new()));
+        } else if let Some((_, body)) = blocks.last_mut() {
+            body.push(line);
+        }
+    }
+    if blocks.is_empty() {
+        return truncate_with_note(content.trim_end(), budget, "output");
+    }
+
+    let share = (budget / blocks.len()).max(CONDENSED_MIN_BLOCK_CHARS);
+    let mut out = String::new();
+    for (header, body) in blocks {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(header);
+        let body = truncate_with_note(body.join("\n").trim_end(), share, "output");
+        if !body.is_empty() {
+            out.push('\n');
+            out.push_str(&body);
+        }
+    }
+    out
+}
+
+/// Command + result, narration discarded.
 fn condense_step(proposal: &ChatMessage, result: &ChatMessage) -> ChatMessage {
     let cmd = rules::extract_command(&proposal.content)
         .unwrap_or_else(|| "(command could not be re-read)".to_string());
-    let (header, body) = result
-        .content
-        .split_once('\n')
-        .unwrap_or((result.content.as_str(), ""));
-
-    let mut content = format!(
-        "{CONDENSED_MARKER} $ {}\n{header}",
-        truncate_with_note(&cmd, CONDENSED_COMMAND_CHARS, "command")
-    );
-    let body = truncate_with_note(body.trim_end(), CONDENSED_OUTPUT_CHARS, "output");
-    if !body.is_empty() {
-        content.push('\n');
-        content.push_str(&body);
-    }
     ChatMessage {
         role: "user".into(),
-        content,
+        content: format!(
+            "{CONDENSED_MARKER} $ {}\n{}",
+            truncate_with_note(&cmd, CONDENSED_COMMAND_CHARS, "command"),
+            condense_result(&result.content, CONDENSED_OUTPUT_CHARS)
+        ),
     }
 }
 
@@ -469,6 +495,40 @@ mod tests {
         assert!(condensed.content.contains("exit 0"), "{condensed:?}");
         assert!(condensed.content.contains("a\nb"), "{condensed:?}");
         assert!(!condensed.content.contains("narration"), "{condensed:?}");
+    }
+
+    // `executeSequence` reports a whole batch in one message. Truncating that
+    // as a single string let a long first output push a later step's failure
+    // past the cap, leaving the model to conclude it had worked.
+    #[test]
+    fn condensing_keeps_every_step_exit_code() {
+        let batch = format!(
+            "{COMMAND_OUTPUT_PREFIX}0] $ mkdir -p A\n{}\n\n\
+             {COMMAND_OUTPUT_PREFIX}1] $ mv x A/\nmv: cannot stat 'x'",
+            "created a directory and said a great deal about it\n".repeat(40)
+        );
+        let mut h = vec![msg("user", "organize this")];
+        h.push(msg(
+            "assistant",
+            "doing it\n```sh\nmkdir -p A\nmv x A/\n```",
+        ));
+        h.push(msg("user", &batch));
+        h.push(msg("user", "did that work?"));
+
+        let out = trim_to_budget(20, h, 300);
+        let condensed = out
+            .messages
+            .iter()
+            .find(|m| m.content.starts_with(CONDENSED_MARKER))
+            .expect("expected a condensed step");
+        assert!(
+            condensed.content.contains("exit 1] $ mv x A/"),
+            "the failing step must survive truncation: {condensed:?}"
+        );
+        assert!(
+            condensed.content.contains("cannot stat"),
+            "and enough of its output to say why: {condensed:?}"
+        );
     }
 
     #[test]

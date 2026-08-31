@@ -7,14 +7,15 @@ build.
 
 1. INSTALL
 
-   .deb (recommended - pulls in bubblewrap for you):
+   .deb (recommended - pulls in bubblewrap for you). Note the space in the
+   filename, so keep the quotes:
 
-       sudo apt install ./llm-assistant_*_amd64.deb
+       sudo apt install "./LLM Assistant_1.7.0_amd64.deb"
 
    AppImage:
 
-       chmod +x LLM_Assistant_*.AppImage
-       ./LLM_Assistant_*.AppImage
+       chmod +x "LLM Assistant_1.7.0_amd64.AppImage"
+       "./LLM Assistant_1.7.0_amd64.AppImage"
 
    The AppImage does NOT bring its own bubblewrap. Install it first, or every
    command the assistant proposes will fail:
@@ -23,7 +24,14 @@ build.
        sudo pacman -S bubblewrap          # Arch
 
 
-2. CONFIG
+2. VERIFY (optional)
+
+   SHA256SUMS is published with the release. From the download folder:
+
+       sha256sum -c SHA256SUMS
+
+
+3. CONFIG
 
    No config file ships with this build and none is required. On first launch
    the app writes defaults to:
@@ -38,7 +46,7 @@ build.
        memory/             per-session working record
 
 
-3. BEFORE FIRST USE
+4. BEFORE FIRST USE
 
    The defaults point at Ollama on http://localhost:11434. If you use LM Studio
    or a different port, open Settings (gear icon) and set:
@@ -55,6 +63,6 @@ build.
    .temp-trash inside that folder rather than being removed.
 
 
-4. FULL DOCUMENTATION
+5. FULL DOCUMENTATION
 
    https://github.com/krakerz/LLM-Assistant

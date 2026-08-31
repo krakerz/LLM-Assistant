@@ -59,7 +59,7 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
     };
 
     // One invocation is one task.
-    memory::start_task(Some(root.as_path()), &message);
+    memory::start_task(&cfg, Some(root.as_path()), &message);
 
     let mut history = vec![ChatMessage {
         role: "user".into(),
@@ -198,7 +198,11 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
         // directly, so it records them here.
         if is_privilege_escalation(&cmd) {
             println!("\n[needs sudo/root -- this sandbox can never grant that; run it yourself]");
-            memory::record_blocked(&cmd, "needs sudo/root, which this sandbox can never grant");
+            memory::record_blocked(
+                &cfg,
+                &cmd,
+                "needs sudo/root, which this sandbox can never grant",
+            );
             break;
         }
 
@@ -206,14 +210,19 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
             || sandbox::is_auto_approved(&cmd, &cfg.auto_approve);
         if !auto_ok {
             println!("\n[needs confirmation -- not run automatically in headless mode]: {cmd}");
-            memory::record_blocked(&cmd, "needs confirmation, which headless mode cannot give");
+            memory::record_blocked(
+                &cfg,
+                &cmd,
+                "needs confirmation, which headless mode cannot give",
+            );
             break;
         }
 
-        match sandbox::run_sandboxed(&root, &shims, &cfg.granted_paths, &cmd) {
+        let scratch = cfg.memory_enabled.then(memory::temp_dir);
+        match sandbox::run_sandboxed(&root, &shims, &cfg.granted_paths, scratch.as_deref(), &cmd) {
             Ok(outcome) => {
                 last_executed = Some(cmd.clone());
-                memory::record_command(&cmd, outcome.exit_code);
+                memory::record_command(&cfg, &cmd, outcome.exit_code);
                 println!("\n$ {cmd}  (exit {})", outcome.exit_code);
                 if !outcome.stdout.is_empty() {
                     print!("{}", outcome.stdout);
