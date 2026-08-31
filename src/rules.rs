@@ -232,6 +232,91 @@ pub fn strip_state_blocks(text: &str) -> String {
     collapse_blank_runs(&out).trim().to_string()
 }
 
+/// The two tags reasoning-capable models are actually seen using in the
+/// wild for their own chain-of-thought, wrapped around it in the plain
+/// `content` string rather than in some separate API field -- which is the
+/// only place this app, talking to an arbitrary OpenAI-compatible endpoint,
+/// can look. Not something the app teaches the model to do (unlike
+/// ` ```state ``` `/` ```sh ``` `) -- this only reads what a model already
+/// produces unprompted, so there's no protocol text for it.
+const THINKING_TAGS: &[&str] = &["think", "thinking"];
+
+/// The model's own reasoning, if it wrapped any in a recognized tag --
+/// `None` either because the model didn't, or because it's a plain
+/// non-reasoning model. Only the first block is read, matching every other
+/// fence/tag convention in this file.
+pub fn extract_thinking_block(text: &str) -> Option<String> {
+    for tag in THINKING_TAGS {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        if let Some(start) = text.find(&open) {
+            let body_start = start + open.len();
+            if let Some(end_rel) = text[body_start..].find(&close) {
+                return Some(text[body_start..body_start + end_rel].trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Removes every recognized thinking tag from `text` for display -- shown
+/// separately (or not at all, per `chat_show_thinking`), never left inline
+/// where it would read as part of the answer itself.
+pub fn strip_thinking_blocks(text: &str) -> String {
+    let mut out = text.to_string();
+    loop {
+        let mut removed_any = false;
+        for tag in THINKING_TAGS {
+            let open = format!("<{tag}>");
+            let close = format!("</{tag}>");
+            let Some(start) = out.find(&open) else {
+                continue;
+            };
+            let body_start = start + open.len();
+            let Some(end_rel) = out[body_start..].find(&close) else {
+                continue;
+            };
+            out.replace_range(start..body_start + end_rel + close.len(), "");
+            removed_any = true;
+        }
+        if !removed_any {
+            break;
+        }
+    }
+    collapse_blank_runs(&out).trim().to_string()
+}
+
+/// Cosmetic, for terminal display only (both CLI entry points use this --
+/// `headless.rs` and `chat_cli.rs`) -- stored/re-sent history always keeps
+/// the raw reply, markup included, since that's what the model itself
+/// wrote and re-reads. Strips `**bold**` and `` `code` `` markers so prose
+/// reads as plain text instead of raw Markdown source; newlines are left
+/// alone.
+pub fn to_plain_text(text: &str) -> String {
+    strip_paired_marker(&strip_paired_marker(text, "**"), "`")
+}
+
+fn strip_paired_marker(text: &str, marker: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let Some(start) = rest.find(marker) else {
+            out.push_str(rest);
+            break;
+        };
+        let after = &rest[start + marker.len()..];
+        let Some(end) = after.find(marker) else {
+            // Unmatched marker -- leave the rest verbatim rather than guess.
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        out.push_str(&after[..end]);
+        rest = &after[end + marker.len()..];
+    }
+    out
+}
+
 fn general_rules_path() -> PathBuf {
     app_config_dir().join("rules.md")
 }
@@ -495,5 +580,40 @@ mod tests {
             out.contains("condensed away"),
             "truncation must be stated, not silent: {out}"
         );
+    }
+
+    #[test]
+    fn extract_thinking_block_reads_a_think_tag() {
+        let reply = "<think>The user wants the weather.</think>It's sunny.";
+        assert_eq!(
+            extract_thinking_block(reply).as_deref(),
+            Some("The user wants the weather.")
+        );
+    }
+
+    #[test]
+    fn extract_thinking_block_reads_a_thinking_tag_too() {
+        let reply = "<thinking>hmm</thinking>ok then";
+        assert_eq!(extract_thinking_block(reply).as_deref(), Some("hmm"));
+    }
+
+    #[test]
+    fn extract_thinking_block_is_none_for_a_plain_reply() {
+        assert_eq!(extract_thinking_block("just an answer"), None);
+    }
+
+    #[test]
+    fn strip_thinking_blocks_removes_it_from_display() {
+        let reply = "<think>secret reasoning</think>The answer is 4.";
+        let display = strip_thinking_blocks(reply);
+        assert!(!display.contains("secret reasoning"), "{display}");
+        assert!(!display.contains("<think>"), "{display}");
+        assert_eq!(display, "The answer is 4.");
+    }
+
+    #[test]
+    fn strip_thinking_blocks_is_a_no_op_without_one() {
+        let reply = "just an answer";
+        assert_eq!(strip_thinking_blocks(reply), reply);
     }
 }

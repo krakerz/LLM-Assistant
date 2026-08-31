@@ -73,6 +73,16 @@ pub struct AppConfig {
     /// the only thing keeping it in check. 0 = no cap.
     #[serde(default = "default_chat_state_max_tokens")]
     pub chat_state_max_tokens: u32,
+    /// Some models emit their own reasoning wrapped in `<think>...</think>`
+    /// (or `<thinking>`) before the actual answer. Chat mode has no
+    /// multi-step chain to show a "Thinking…" disclosure for the way
+    /// operation mode does, so this repurposes the same UI pattern for that
+    /// instead: shown collapsed while the request is in flight, filled in
+    /// and relabeled once the reply arrives -- see `rules::extract_thinking_block`.
+    /// On by default; off just means the reasoning (if any) gets stripped
+    /// and never shown, not that the model stops producing it.
+    #[serde(default = "default_chat_show_thinking")]
+    pub chat_show_thinking: bool,
 }
 
 fn default_confirm_fade_after() -> u32 {
@@ -89,6 +99,10 @@ fn default_memory_max_tokens() -> u32 {
 
 fn default_chat_state_max_tokens() -> u32 {
     500
+}
+
+fn default_chat_show_thinking() -> bool {
+    true
 }
 
 fn default_max_context_tokens() -> u32 {
@@ -123,6 +137,7 @@ impl Default for AppConfig {
             memory_enabled: default_memory_enabled(),
             memory_max_tokens: default_memory_max_tokens(),
             chat_state_max_tokens: default_chat_state_max_tokens(),
+            chat_show_thinking: default_chat_show_thinking(),
         }
     }
 }

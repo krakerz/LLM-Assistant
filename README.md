@@ -43,6 +43,16 @@ see [`bwrap(1)`](https://github.com/containers/bubblewrap)), this app makes
   needs to persist for the whole conversation -- RPG-style stats are the
   motivating example, but it's really just "whatever the character sheet
   says to remember."
+- **Image and document attachment in chat mode** -- attach an image for a
+  vision-capable model to look at, or a plain-text/code file to fold
+  straight into the message. A "Test vision support" button in Settings
+  sends a real test image and reports whether the model actually describes
+  it, since not every server exposes vision-capability metadata to check
+  ahead of time.
+- **See a model's own reasoning** -- if a model wraps chain-of-thought in a
+  `<think>` tag, chat mode shows it collapsed under a "Thinking" disclosure
+  (off by default hides it, some models emit it regardless of the setting;
+  it never changes whether the model reasons, just whether you see it).
 - **Works with or without a folder open** -- chat as a plain assistant, or
   select a folder to enable file/command access.
 - **Automatic follow-through** -- after a command runs, the assistant
@@ -62,7 +72,9 @@ see [`bwrap(1)`](https://github.com/containers/bubblewrap)), this app makes
 - **CLI modes** -- preload a folder (`llm-assistant <folder>`), skip the GUI
   entirely for one scripted turn (`llm-assistant <folder> <message>`), or
   chat in the terminal instead of the GUI (`llm-assistant <folder> --chat`),
-  styled like `ollama run`.
+  styled like `ollama run`. Chat mode has its own, separate terminal entry
+  point too -- `llm-assistant --persona-chat`, with the same personas and
+  persistent sessions as the GUI's chat mode, no folder or sandbox involved.
 - **Debug logging** -- `logs/app.log` plus a plain-text mirror of each GUI
   conversation (`last-chat.log`, cleared every launch, thinking steps
   included) for troubleshooting without having to expand anything in the
@@ -109,6 +121,11 @@ llm-assistant                              # launch the GUI
 llm-assistant /path/to/folder              # launch the GUI with a folder preloaded
 llm-assistant /path/to/folder "message"    # headless: run one turn, print the result, exit
 llm-assistant /path/to/folder --chat       # interactive terminal chat, Ctrl+D/Ctrl+C to exit
+llm-assistant --persona-chat                            # persona chat mode's own REPL, no folder/sandbox
+llm-assistant --persona-chat --persona <name>           # start a new session with that persona
+llm-assistant --persona-chat --session <id>             # resume an existing session
+llm-assistant --list-personas                           # list available personas
+llm-assistant --list-sessions                            # list existing chat sessions with their IDs
 llm-assistant --help
 ```
 

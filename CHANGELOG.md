@@ -4,7 +4,25 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
-## [1.7.0] — 2026-08-31
+## [1.8.0] — 2026-09-01
+
+<div align="justify">
+
+Chat mode's basic pass gets the rest of what its design called for: images and documents a persona can actually look at, a way to tell whether the model behind the configured endpoint can see at all, its own separate terminal entry point so it doesn't need the GUI, and a view into a model's own reasoning when it emits one. `ChatMessage` gained an `images` field used only at the point messages are sent to the endpoint, so every existing text-only call site in the app -- operation mode included -- is untouched.
+
+</div>
+
+### Added
+- **Image and document attachment in chat mode.** Attach an image (📎 button on the input row) and a vision-capable model gets it as part of the message, rendered as a thumbnail in the sent bubble; attach a plain-text or code file and its content is folded straight into the message text, no vision model needed for that half. `ChatMessage.content` stays a plain `String` everywhere else in the app; a new `images: Vec<String>` field (base64 data URLs) is populated only when there's something attached, and only `llm.rs`'s wire-serialization layer ever builds the OpenAI multi-part content shape from it.
+- **Vision-capability detection**, both passive and active, since no generic `/v1/chat/completions` endpoint exposes this and guessing wrong either hides a working feature or promises one that isn't there:
+  - A best-effort passive probe against two backend-specific extensions researched directly against their docs -- Ollama's `POST /api/show` (`capabilities` array) and LM Studio's `GET /api/v0/models` (`type: "vlm"`) -- tried in that order, silently ignored on failure. Never authoritative: a miss just means neither API answered, not "no vision."
+  - **"Test vision support"** in Settings, next to "Test connection" -- sends a small embedded test image and a one-word question, and reports the model's real reply. This is the one that actually answers "will this work," independent of what either backend's metadata claims.
+  - Fixed the one numeric trap this created before it could bite: `context.rs`'s token-budget estimate used to be `chars/4` of a message's content, and a base64-encoded image runs to hundreds of thousands of characters -- which would have made attaching a single image look like tens of thousands of tokens and trigger unwarranted aggressive trimming. Images are now estimated at a flat ~1000 tokens each instead.
+- **`llm-assistant --persona-chat [--persona <name>] [--session <id>]`** -- chat mode's own terminal REPL, entirely separate from operation mode's `--chat`: no folder, no sandbox, no shell commands, ever. Resuming a `--session` that doesn't exist is an error rather than a silent fresh start. Shares its turn logic (`chat_turn::run_chat_turn`) with the GUI's chat mode, same drift-prevention reasoning as `headless.rs`'s shared `run_turn`. `--list-personas` and `--list-sessions` list what's available to pass to `--persona`/`--session`.
+- **Chat mode can show a model's own reasoning.** If a reply wraps chain-of-thought in a `<think>` (or `<thinking>`) tag, it's extracted and shown collapsed under the same "Thinking → Completed" disclosure operation mode already uses for multi-step chains, then stripped from the stored/displayed reply either way. New setting `chat_show_thinking` (default on) hides it if you'd rather not see it -- it never stops a model from reasoning, only from showing you.
+
+### Changed
+- `ChatMessage` construction across the codebase goes through a new `ChatMessage::text(role, content)` constructor rather than a bare struct literal, now that the struct also carries `images`.
 
 <div align="justify">
 

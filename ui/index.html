@@ -53,7 +53,16 @@
 
         <div class="chat-mode-main">
           <main id="chatModeLog" class="chat-log"></main>
+          <div id="chatAttachmentsPreview" class="chat-attachments" hidden></div>
           <form id="chatModeForm" class="chat-form">
+            <input
+              type="file"
+              id="chatAttachInput"
+              accept="image/*,.txt,.md,.csv,.json,.log,.js,.py,.rs,.html,.css,.yaml,.yml,.toml"
+              multiple
+              hidden
+            />
+            <button type="button" id="chatAttachBtn" class="icon-btn" title="Attach an image or text file">📎</button>
             <textarea id="chatModeInput" placeholder="Message… (Enter to send, Shift+Enter for newline)" rows="2"></textarea>
             <button type="submit" id="chatModeSendBtn">Send</button>
           </form>
@@ -130,6 +139,15 @@
         <button id="testConnectionBtn" type="button">Test connection</button>
         <span id="testConnectionResult" class="explain"></span>
       </div>
+      <div class="path-row">
+        <button id="testVisionBtn" type="button">Test vision support</button>
+        <span id="testVisionResult" class="explain"></span>
+      </div>
+      <p class="explain">
+        Sends a small real test image and checks the model actually describes it — the only
+        reliable way to know, since not every server exposes vision-capability metadata (used in
+        chat mode's image attachment).
+      </p>
       <label>Temperature
         <input id="cfgTemperature" type="number" step="0.1" min="0" max="2" />
       </label>
@@ -153,6 +171,13 @@
       </label>
       <label>Chat mode's persistent-state budget (same reasoning, different feature — a chat session's saved state also sits in the system block every turn; 0 = no cap).
         <input id="cfgChatStateMaxTokens" type="number" step="100" min="0" />
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="cfgChatShowThinking" />
+        In chat mode, show a model's own reasoning if it wraps any in a
+        <code>&lt;think&gt;</code> tag, collapsed under a "Thinking" disclosure. Off just hides it
+        (some models emit it regardless) — it never stops the model from thinking, just from
+        showing you.
       </label>
 
       <label class="checkbox-row">

@@ -15,6 +15,7 @@
 
 use crate::config::AppConfig;
 use crate::llm::{self, ChatMessage};
+use crate::rules::to_plain_text;
 use crate::sandbox::Classification;
 use crate::{activate_root, config, context, memory, rules, sandbox};
 use std::io::{self, BufRead, Write};
@@ -26,35 +27,6 @@ const PRIVILEGE_ESCALATION_BINARIES: &[&str] = &["sudo", "su", "doas", "pkexec"]
 /// the stand-in shown when a reply is nothing but a fenced command, so the
 /// terminal isn't left printing a blank line for that step.
 const COMMAND_ONLY_PLACEHOLDER: &str = "(proposed a command, shown below)";
-
-/// Cosmetic, for terminal display only -- `history` always keeps the raw
-/// reply, markup included, since that's what gets re-sent to the model.
-/// Strips `**bold**` and `` `code` `` markers so a prose reply reads as
-/// plain text instead of raw Markdown source; newlines are left alone.
-fn to_plain_text(text: &str) -> String {
-    strip_paired_marker(&strip_paired_marker(text, "**"), "`")
-}
-
-fn strip_paired_marker(text: &str, marker: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    loop {
-        let Some(start) = rest.find(marker) else {
-            out.push_str(rest);
-            break;
-        };
-        let after = &rest[start + marker.len()..];
-        let Some(end) = after.find(marker) else {
-            // Unmatched marker -- leave the rest verbatim rather than guess.
-            out.push_str(rest);
-            break;
-        };
-        out.push_str(&rest[..start]);
-        out.push_str(&after[..end]);
-        rest = &after[end + marker.len()..];
-    }
-    out
-}
 
 /// Every word, not just the first: `cd /x && sudo ...` has it second.
 fn is_privilege_escalation(cmd: &str) -> bool {
@@ -150,10 +122,7 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
     // One invocation is one task.
     memory::start_task(&setup.cfg, Some(root.as_path()), &message);
 
-    let mut history = vec![ChatMessage {
-        role: "user".into(),
-        content: message,
-    }];
+    let mut history = vec![ChatMessage::text("user", message)];
     run_turn(&setup, &root, &mut history).await;
     0
 }
@@ -197,34 +166,19 @@ async fn run_chat_async(root: PathBuf) -> i32 {
 
         setup.reload();
         memory::start_task(&setup.cfg, Some(root.as_path()), message);
-        history.push(ChatMessage {
-            role: "user".into(),
-            content: message.to_string(),
-        });
+        history.push(ChatMessage::text("user", message));
         run_turn(&setup, &root, &mut history).await;
     }
     0
 }
 
-/// One auto-continue chain against `history`, printing as it goes: repeated
-/// turns until the model answers with no command, hits the repeat guard,
-/// proposes sudo, needs confirmation, or the step cap is reached. Doesn't
-/// call `memory::start_task` itself -- the caller owns the task boundary,
-/// since chat mode fires it once per user message while sharing the same
-/// `history` across the whole session.
 /// The final no-command turn after a loop guard fires: appends `note` (the
 /// specific reason) plus `rules::FINAL_ANSWER_PROMPT`, then asks once more
 /// for a plain-text answer with nothing left to run. Shared by both loop
 /// guards in `run_turn` below -- they differ only in which note applies.
 async fn wrap_up(setup: &Setup, history: &mut Vec<ChatMessage>, system_content: &str, note: &str) {
-    history.push(ChatMessage {
-        role: "user".into(),
-        content: note.into(),
-    });
-    history.push(ChatMessage {
-        role: "user".into(),
-        content: rules::FINAL_ANSWER_PROMPT.into(),
-    });
+    history.push(ChatMessage::text("user", note));
+    history.push(ChatMessage::text("user", rules::FINAL_ANSWER_PROMPT));
     // Same budget as every other turn: this used to send the whole
     // untrimmed history.
     let trimmed = context::fit_to_budget(
@@ -234,10 +188,7 @@ async fn wrap_up(setup: &Setup, history: &mut Vec<ChatMessage>, system_content: 
         None,
     )
     .await;
-    let mut messages = vec![ChatMessage {
-        role: "system".into(),
-        content: system_content.to_string(),
-    }];
+    let mut messages = vec![ChatMessage::text("system", system_content.to_string())];
     messages.extend(trimmed.messages);
     match llm::send_chat(
         &setup.cfg.endpoint,
@@ -251,15 +202,18 @@ async fn wrap_up(setup: &Setup, history: &mut Vec<ChatMessage>, system_content: 
         Ok(final_reply) => {
             let (stripped, _) = rules::strip_command_fences(&final_reply);
             println!("\n{}", to_plain_text(&stripped));
-            history.push(ChatMessage {
-                role: "assistant".into(),
-                content: final_reply,
-            });
+            history.push(ChatMessage::text("assistant", final_reply));
         }
         Err(e) => eprintln!("error on final summary: {e}"),
     }
 }
 
+/// One auto-continue chain against `history`, printing as it goes: repeated
+/// turns until the model answers with no command, hits the repeat guard,
+/// proposes sudo, needs confirmation, or the step cap is reached. Doesn't
+/// call `memory::start_task` itself -- the caller owns the task boundary,
+/// since chat mode fires it once per user message while sharing the same
+/// `history` across the whole session.
 async fn run_turn(setup: &Setup, root: &Path, history: &mut Vec<ChatMessage>) {
     let Setup {
         cfg,
@@ -328,10 +282,7 @@ async fn run_turn(setup: &Setup, root: &Path, history: &mut Vec<ChatMessage>) {
                 trimmed.dropped, cfg.max_context_tokens
             );
         }
-        let mut messages = vec![ChatMessage {
-            role: "system".into(),
-            content: system_content.clone(),
-        }];
+        let mut messages = vec![ChatMessage::text("system", system_content.clone())];
         messages.extend(trimmed.messages);
 
         let reply = match llm::send_chat(
@@ -349,10 +300,7 @@ async fn run_turn(setup: &Setup, root: &Path, history: &mut Vec<ChatMessage>) {
                 return;
             }
         };
-        history.push(ChatMessage {
-            role: "assistant".into(),
-            content: reply.clone(),
-        });
+        history.push(ChatMessage::text("assistant", reply.clone()));
 
         let extracted_cmd = rules::extract_command(&reply);
         let (stripped, extra_commands) = rules::strip_command_fences(&reply);
@@ -372,16 +320,16 @@ async fn run_turn(setup: &Setup, root: &Path, history: &mut Vec<ChatMessage>) {
                 "\n[that reply included {} commands; only the first one ran]",
                 extra_commands + 1
             );
-            history.push(ChatMessage {
-                role: "user".into(),
-                content: format!(
+            history.push(ChatMessage::text(
+                "user",
+                format!(
                     "[you included {} commands in fenced blocks in that reply -- only the first \
                      one ran, since only one command runs per reply. Don't assume the others \
                      happened; if they're still needed, propose the next one now that you have \
                      the first one's result.]",
                     extra_commands + 1
                 ),
-            });
+            ));
         }
 
         let Some(cmd) = extracted_cmd else {
@@ -476,10 +424,7 @@ async fn run_turn(setup: &Setup, root: &Path, history: &mut Vec<ChatMessage>) {
                          never a granted path.)",
                     );
                 }
-                history.push(ChatMessage {
-                    role: "user".into(),
-                    content: feedback,
-                });
+                history.push(ChatMessage::text("user", feedback));
             }
             Err(e) => {
                 println!("\n[execution error]: {e}");
