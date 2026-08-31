@@ -22,6 +22,17 @@ pub struct AppConfig {
     pub granted_paths: Vec<GrantedPath>,
     #[serde(default)]
     pub auto_approve: Vec<String>,
+    /// How many propose-command -> run -> respond cycles the assistant can
+    /// chain automatically (without the user sending another message)
+    /// before it stops and waits. 0 means no limit. Kept fairly generous by
+    /// default since intermediate steps are hidden behind a collapsed
+    /// "Thinking" section in the UI, not shown inline.
+    #[serde(default = "default_max_auto_steps")]
+    pub max_auto_steps: u32,
+}
+
+fn default_max_auto_steps() -> u32 {
+    12
 }
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a local file assistant working inside a single \
@@ -57,6 +68,7 @@ impl Default for AppConfig {
             temperature: 0.2,
             granted_paths: vec![],
             auto_approve: vec![],
+            max_auto_steps: default_max_auto_steps(),
         }
     }
 }

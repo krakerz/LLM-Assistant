@@ -133,6 +133,40 @@ details.bubble.output pre {
   margin: 8px 0 0;
 }
 
+details.bubble.thinking {
+  align-self: stretch;
+  background: none;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  padding: 8px 12px;
+}
+
+details.bubble.thinking summary {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  list-style: revert;
+}
+
+details.bubble.thinking summary::marker {
+  color: var(--muted);
+}
+
+details.bubble.thinking[open] summary {
+  margin-bottom: 8px;
+}
+
+details.bubble.thinking > .bubble,
+details.bubble.thinking > details.bubble.output {
+  max-width: 100%;
+  margin-top: 8px;
+}
+
+details.bubble.thinking > .bubble.assistant {
+  background: #191c24;
+  font-size: 0.95em;
+}
+
 .badge {
   color: var(--muted);
   font-size: 11px;
