@@ -80,10 +80,9 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
     };
 
     let root_note = config::build_root_note(Some(root.as_path()), &cfg.granted_paths);
-    let system_content = format!(
-        "{}\n\n{}\n\n{}\n\n{}",
-        general_rules, command_rules, cfg.system_prompt, root_note
-    );
+    let rules_block =
+        rules::build_system_rules(&general_rules, &command_rules, cfg.disable_builtin_rules);
+    let system_content = format!("{}\n\n{}\n\n{}", rules_block, cfg.system_prompt, root_note);
 
     let mut history = vec![ChatMessage {
         role: "user".into(),
@@ -139,9 +138,44 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
 
         if last_executed.as_deref() == Some(cmd.as_str()) {
             println!(
-                "\n[stopping -- that exact command was just run and nothing happened in between, \
-                 repeating it won't produce new information]"
+                "\n[skipped a repeat of that command -- it was just run with nothing in between; \
+                 wrapping up instead]"
             );
+            // Mirrors main.js: this fires when the work is already done and
+            // the model is only re-running a listing to show output it
+            // already has, usually mid-sentence ("here is the structure:").
+            // One final no-command turn so the run ends on a real answer.
+            history.push(ChatMessage {
+                role: "user".into(),
+                content: "[you proposed the exact same command again immediately after it already \
+                          ran, with nothing new to justify re-running it -- it was not run again. \
+                          You already have its output above.]"
+                    .into(),
+            });
+            let mut messages = vec![ChatMessage {
+                role: "system".into(),
+                content: system_content.clone(),
+            }];
+            messages.extend(history.clone());
+            messages.push(ChatMessage {
+                role: "user".into(),
+                content: "[don't run anything else -- you already have everything you need. Reply \
+                          now in plain text, with no command and no code fence, telling the user \
+                          what was done and what the final result is.]"
+                    .into(),
+            });
+            match llm::send_chat(
+                &cfg.endpoint,
+                &cfg.model,
+                &cfg.api_key,
+                cfg.temperature,
+                &messages,
+            )
+            .await
+            {
+                Ok(final_reply) => println!("\n--- final ---\n{final_reply}"),
+                Err(e) => eprintln!("error on final summary: {e}"),
+            }
             break;
         }
 

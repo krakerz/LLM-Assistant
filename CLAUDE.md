@@ -77,42 +77,75 @@ enough edit to do by hand or ask Claude to do directly.
   `bwrap` with `--unshare-all` (no network, no PID/IPC visibility) and binds
   only the selected root directory (read-write) plus any user-granted paths;
   everything else is invisible to the command regardless of what it tries to
-  do. `ensure_shims` writes a fake `rm` onto a `PATH` that's prepended inside
-  the jail, which moves targets into
+  do. `ensure_shims` writes fake `rm` and `rmdir` binaries onto a `PATH`
+  that's prepended inside the jail, both moving targets into
   `.temp-trash/<timestamp>/<original relative path>` instead of deleting
   them — this runs unconditionally, independent of the read-only/confirmation
   split, so even a user-approved destructive command stays recoverable. The
   shim computes its own `date +%Y%m%d-%H%M%S-%N` timestamp per invocation
-  (all targets of one `rm` call land in the same batch); without it, `mv -f`
+  (all targets of one call land in the same batch); without it, `mv -f`
   deleting the same path a second time would silently overwrite the first
-  trashed copy with no way to get it back. Only `rm` is shimmed today (see
-  `TODO.md`).
+  trashed copy with no way to get it back. `rmdir` sharing the same script
+  means it no longer fails on a non-empty directory the way real `rmdir`
+  would -- it always succeeds and moves the whole thing to trash regardless
+  of contents, trading that one signal for the same "nothing is ever truly
+  gone" guarantee `rm` already gets. Beyond these two, see `TODO.md` for
+  what's still unshimmed (e.g. `mv` overwriting an existing target).
 - `paths.rs` — resolves `$XDG_CONFIG_HOME/llm-assistant` (falls back to
   `~/.config/llm-assistant`) for both config and logs. Deliberately not tied
   to the selected folder, since both need to exist before any folder is
   picked.
 - `config.rs` — loads/saves `<app-config-dir>/config.toml`. This is one
   global config (endpoint, model, `api_key`, system prompt, temperature,
-  `granted_paths`, `auto_approve`, `max_auto_steps`), not scoped per-project.
-  `build_root_note` is the shared per-turn note builder (folder-open state,
-  plus each granted path and *why* it was granted) used by both the GUI's
-  `send_message` and `headless.rs`, so they can't drift apart.
-- `rules.rs` — two files, both read *before* the system prompt every turn
-  (see `send_message`/`headless.rs`): `rules.md` (general behavior --
-  identity, honesty about uncertainty, re-verifying stale info) and
-  `command-rules.md` (shell mechanics -- command format, quoting,
-  confirmation behavior, sudo handling, `mv`/`cp` argument syntax), split so
-  a user customizing `system_prompt` shouldn't have to also carry or risk
-  breaking either. `load_general_or_init`/`load_command_or_init` only write
-  the default the *first* time a file doesn't exist -- editing
+  `granted_paths`, `auto_approve`, `max_auto_steps`, `disable_builtin_rules`),
+  not scoped per-project. `load_or_init` has no in-memory caching -- every
+  Tauri command that needs it (`send_message`, `classify_command`, ...)
+  calls it fresh, so config and rules are hot-reloaded on the very next turn
+  after any edit (Settings, or directly to the file), no restart needed;
+  `main.js`'s own `currentConfig` is a separate JS-side display cache that
+  needs its own refresh before each new turn to stay in sync (see
+  `chatForm`'s submit handler). `build_root_note` is the shared per-turn
+  note builder (folder-open state, plus each granted path and *why* it was
+  granted) used by both the GUI's `send_message` and `headless.rs`, so they
+  can't drift apart. It explicitly states the open working folder is the
+  "root"/home context for the session and a granted path is not "root"
+  unless named specifically -- added after a real case where a model asked
+  to move files "to root folder" targeted a granted path instead (whose own
+  note happened to say "source code"), since nothing previously said which
+  one "root" meant. The sandbox itself blocked the write regardless (the
+  granted path was read-only), so this was a prompt-clarity gap, not a
+  sandbox one.
+- `rules.rs` — three tiers feeding the system message, in order, built by
+  `build_system_rules` (used by both `send_message` and `headless.rs` so
+  they can't drift apart): `PROTOCOL_PROMPT` (hardcoded, not a file, not
+  user-editable -- the mechanical contract the app's own parsing/execution
+  code actually depends on: the fenced-```sh-block format (with a worked
+  example -- an early version without one saw a real regression where a
+  small local model replied with a bare command as plain text for a simple
+  query, which never ran since there was no fence to parse), only the first
+  one per reply ever runs, sudo always fails here, `.temp-trash/` is the
+  app's own soft-delete area and should be ignored like it's not there, and
+  -- prefer writing a multi-step task as one self-contained script in that
+  single block and running it once rather than many small commands that can
+  leave things half-done if something fails partway), then `rules.md` (general behavior
+  -- searching before guessing, re-verifying stale info, honesty about
+  uncertainty) and `command-rules.md` (remaining shell mechanics -- quoting,
+  confirmation behavior, granted-path absolute paths, `mv`/`cp` argument
+  syntax) *unless* `AppConfig.disable_builtin_rules` is set, in which case
+  only the protocol goes out -- deliberately kept minimal so the general/
+  command files stay purely advisory and safe to discard entirely, whereas
+  the protocol can't be turned off since the app's own code assumes it.
+  `load_general_or_init`/`load_command_or_init` only write the default the
+  *first* time a file doesn't exist -- editing
   `DEFAULT_GENERAL_RULES`/`DEFAULT_COMMAND_RULES` in code has no effect on
   an install that already has the file on disk; the user has to hit
   Settings -> Rules -> "Reset to default" to pick it up. `log_loaded_rules`
-  logs the full text of both files to `app.log`, called once at startup
-  (`main()`, before the headless dispatch so headless gets it too, not
-  inside the load functions themselves since those run every turn and would
-  spam the log) so a stale edit or a reset that didn't take is visible
-  directly in the log.
+  logs the protocol plus the full text of both files (and whether they're
+  actually being sent) to `app.log`, called once at startup (`main()`,
+  before the headless dispatch so headless gets it too, not inside the load
+  functions themselves since those run every turn and would spam the log)
+  so a stale edit, a reset that didn't take, or the disable toggle doing the
+  wrong thing is visible directly in the log.
 - `chat_log.rs` — appends a flat, human-readable mirror of the GUI
   conversation (including collapsed "thinking" steps) to a session-scoped
   `<app-config-dir>/logs/chat-<timestamp>.log`, started fresh by `init()` at
@@ -175,7 +208,13 @@ in flight the Send button becomes a real Stop button (`setProcessing`),
 calling `stop_generation` to abort the in-flight request server-side, not
 just flip a UI flag; `stopRequested` additionally keeps the chain from
 starting a new step if Stop is clicked while a command is executing rather
-than while generating.
+than while generating. Every place a chain stops short of a real answer --
+`stopRequested`, the `maxSteps` cap, or an aborted/failed `send_message`
+call in the `catch` block -- also pushes a `[the user stopped this...]`/
+`[automatic continuation paused...]`-shaped note into `history`, not just a
+UI bubble; without it the model has no idea its last action was cut off and
+will otherwise assume on the next turn that whatever it last proposed either
+finished or never happened.
 
 `createThinkingTracker()` also tracks the last command that actually ran in
 the chain (`recordExecuted`, set in `executeCommand`/`executeSequence` after
@@ -190,6 +229,35 @@ means nothing else would stop it) — a real re-check after an actual change
 between the two occurrences. `headless.rs` has the same guard
 (`last_executed`), for parity.
 
+The guard doesn't just stop dead, though: in practice it fires precisely
+when the work is already *finished* and the model is re-running a listing to
+display output it already has, usually having written "here is the current
+structure:" first — so bailing out there left the user with a dangling
+half-sentence inside a collapsed Thinking box and no answer at all, which
+reads as the app cutting off mid-task. So it refuses the command and then
+calls `finalAnswerTurn()`, one more `send_message` with a "no command, plain
+text only" note appended; whatever comes back is shown as a normal bubble
+*outside* `thinking` (the whole point — it's the closing answer), with any
+command still in it stripped and never run, so it can't start a new chain.
+Deliberately *not* wired into the Stop-button or `maxSteps` paths: Stop means
+the user wants it to stop now, not to spend another request, and the cap
+already tells them to send another message. Its prompt is also carefully
+worded *not* to presuppose success — an earlier version asked for "what was
+done and what the final result is", and after two denied commands (nothing
+having run at all) the model duly invented a completed reorganization,
+naming files and folders that didn't exist. It now asks for the current
+state strictly from output actually received.
+
+Denying a command likewise ends the chain rather than auto-continuing — a
+denial is a deliberate "no", and continuing let the model keep flailing and
+was one of the ingredients in that fabricated report. The note it gets is
+emphatic that the command did not run and changed nothing, since a milder
+"[the user denied that command]" left it speculating that the command may
+have "partially executed". The root cause is addressed in
+`PROTOCOL_PROMPT` too (every command's output is already shown to the user
+and handed back, so never re-run one just to display/confirm it) — that's
+what actually stops the loop; `finalAnswerTurn` is the backstop.
+
 `needsElevatedPrivileges` (checked in `runAssistantTurn` *before* the
 thinking-routing decision, using every word in the command, not just the
 first — a compound command can have `sudo` as its second word) short-circuits
@@ -200,7 +268,18 @@ exactly what caused it to loop re-proposing the same sudo command. The
 "always allow" checkbox in the confirm dialog calls `add_auto_approve`, which
 is still gated by the same no-shell-metacharacters check inside
 `sandbox::is_auto_approved` — a user can whitelist a program, never a
-pipe/redirect shape. `renderMarkdown` is a small dependency-free Markdown
+pipe/redirect shape. `splitCommandSequence` (used by `requestApproval` to
+decide whether the confirm dialog shows a checklist or one opaque block)
+splits on bare newlines as well as `&&`/`;`, not just `&&`/`;` -- a model
+asked to do several things in sequence often just writes one command per
+line with no `&&`. Left as one atomic `sh -c` block, a failure partway
+through gets masked, since `sh -c` reports the exit code of the *last* line,
+not the first failure; splitting it into a checklist runs each line as its
+own step via `executeSequence`, which already stops at the first real
+failure and reports it accurately. It still refuses to split (returns
+`null`, stays one atomic block) if any line is a shell control-flow keyword
+(`for`/`while`/`if`/`do`/`done`/...) or a comment/shebang, since a real
+script's lines aren't independently valid commands on their own. `renderMarkdown` is a small dependency-free Markdown
 renderer (fenced code blocks, inline code, bold, italic) applied to assistant
 bubbles only. Every `appendBubble`/`appendOutput`/`appendManualCommand` call
 also fires `logToFile`, mirroring exactly what's shown (thinking included) to

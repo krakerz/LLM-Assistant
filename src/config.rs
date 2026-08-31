@@ -40,6 +40,15 @@ pub struct AppConfig {
     /// "Thinking" section in the UI, not shown inline.
     #[serde(default = "default_max_auto_steps")]
     pub max_auto_steps: u32,
+    /// When true, `rules.md`/`command-rules.md` (the editable, "additional"
+    /// advisory rules) are not sent at all -- only the hardcoded protocol
+    /// prompt (command format, one-command-per-reply, sudo handling, see
+    /// `rules::PROTOCOL_PROMPT`) plus the user's own system prompt. Lets
+    /// someone who wants full control over behavior discard the app's
+    /// baked-in advice without it competing with their own instructions.
+    /// Defaults to false (existing behavior: both files are sent).
+    #[serde(default)]
+    pub disable_builtin_rules: bool,
 }
 
 fn default_max_auto_steps() -> u32 {
@@ -65,6 +74,7 @@ impl Default for AppConfig {
             granted_paths: vec![],
             auto_approve: vec![],
             max_auto_steps: default_max_auto_steps(),
+            disable_builtin_rules: false,
         }
     }
 }
@@ -112,12 +122,16 @@ pub fn build_root_note(root: Option<&Path>, granted_paths: &[GrantedPath]) -> St
     };
 
     let mut note = format!(
-        "You currently have this folder open and can propose shell commands confined to it: {}",
+        "You currently have this folder open and can propose shell commands confined to it: {}. \
+         This folder is the \"root\"/home context for this session -- if the user says \"root\", \
+         \"root folder\", or similar without naming one of the granted paths below, they mean the \
+         top level of THIS folder, not a granted path.",
         root.display()
     );
     if !granted_paths.is_empty() {
         note.push_str(
-            "\n\nYou also have access to these additional paths outside the working folder:",
+            "\n\nYou also have access to these additional paths outside the working folder \
+             (these are not the \"root\" unless the user names one specifically):",
         );
         for g in granted_paths {
             let access = if g.read_write {

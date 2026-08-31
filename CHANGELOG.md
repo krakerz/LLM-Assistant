@@ -6,6 +6,157 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-08-31
+### Fixed
+- **The assistant could report work it never did.** After the user denied a
+  command twice (so nothing ran at all), it produced a confident, fully
+  fabricated summary of a directory reorganization -- listing which files
+  had gone into which new folders, none of which existed. Three causes,
+  all fixed:
+  - Denying a command auto-continued the chain, letting the model keep
+    flailing after a deliberate "no". A denial now ends the chain outright
+    (same as the sudo case) and says so, and the note the model gets is
+    explicit that the command did NOT run and changed nothing.
+  - The 1.5.0 wrap-up turn asked the model to say "what was done and what
+    the final result is" -- which presupposes success and directly invited
+    the fabrication. It now asks for the current state strictly from
+    command output actually received, and to plainly say so when commands
+    were denied, never ran, or failed.
+  - The protocol now forbids reporting any action as done unless a command
+    actually ran and its output shows it worked, requires saying plainly
+    when something was denied or failed, and asks for a single verifying
+    listing (plus which parts succeeded) when a change may have only
+    partly landed.
+
+## [1.5.0] - 2026-08-31
+### Fixed
+- Conversations appeared to cut off mid-task. The model habitually ended a
+  reply with "here is the current structure:" and then proposed the *same*
+  listing it had just run, purely to display output it already had. The
+  repeat guard correctly refused to run it -- but then stopped dead, leaving
+  that dangling half-sentence inside a collapsed Thinking box with no answer
+  anywhere. Two fixes: the protocol now tells the model that every command's
+  output is already shown to it and to the user, so it must never re-run a
+  command just to display or confirm something (quote the output you already
+  have; when the work is done, say so in plain text). And when the guard does
+  fire, the app now takes one final no-command turn so the user always gets a
+  real closing answer outside the Thinking group instead of nothing. Verified
+  against the real model: it now writes the structure out from the output it
+  already had rather than re-running `ls`.
+- Same protocol rule also addresses replies that proposed several listing
+  commands at once (seen as "That reply included 5 commands; only the first
+  one ran") -- it had just run `ls -F A/ D/ N/ S/ T/`, received all of it,
+  then proposed five more listings to show each folder separately.
+
+## [1.4.1] - 2026-08-31
+### Fixed
+- A model asked to move files "to root folder" targeted a granted path
+  instead of the working folder itself -- the granted path's own note said
+  "source code" and the user's phrasing said "root", and nothing in the
+  per-turn prompt said which one "root" actually meant. The sandbox
+  correctly blocked the write either way (the granted path was read-only,
+  so nothing was at risk), but the model still picked the wrong
+  destination. `build_root_note` now explicitly states the open working
+  folder is the "root"/home context for the session, and that a granted
+  path isn't "root" unless the user names it specifically.
+
+## [1.4.0] - 2026-08-31
+### Fixed
+- A command output block's badge/Copy button centered vertically across the
+  whole block when the command text wrapped onto multiple lines, instead of
+  sitting next to the first line -- `align-items: center` on the flex
+  summary row.
+- The confirmation checklist only split a compound command on `&&`/`;`, not
+  bare newlines -- a model writing one command per line (common for a
+  sequence of `mkdir`/`mv` steps) got it run as one atomic `sh -c` block
+  instead, and a failure partway through could be masked by a later line's
+  success (`sh -c` reports the last command's exit code, not the first
+  failure). This caused a real ~10-turn confused recovery in one session: a
+  `mv` into a not-yet-created folder failed, but the block still reported
+  exit 0. Now newlines split into checklist steps too, run one at a time
+  with accurate per-step feedback -- unless a line is a shell control-flow
+  keyword or comment/shebang, in which case it's kept as one atomic block
+  as before, since a real script's lines aren't valid commands on their own.
+- When a chain of automatic steps stopped short (Stop button, the
+  `max_auto_steps` cap, or an aborted/failed request) only a UI message was
+  shown -- the model itself had no record that anything was interrupted, so
+  its next reply could wrongly assume the last action either finished or
+  never happened. All three cases now also push a note into the actual
+  conversation history sent to the model.
+
+### Added
+- `rmdir` is now soft-delete shimmed the same way `rm` already was --
+  previously it bypassed `.temp-trash` entirely and really removed its
+  target (low risk in practice since `rmdir` only ever touches already-empty
+  directories, but inconsistent with the rest of the app's "nothing is ever
+  truly gone" guarantee). It now always redirects to trash regardless of
+  contents, same as `rm`, which does mean it no longer fails on a non-empty
+  directory the way real `rmdir` would.
+
+## [1.3.1] - 2026-08-31
+### Fixed
+- The new hardcoded protocol prompt (1.3.0) dropped the worked example that
+  used to show the one-line-explanation-plus-fenced-block format -- a real
+  log showed the model regress to replying with a bare command as plain
+  text (e.g. just "ls -F") for simple queries, which never actually ran
+  since there was no fence to parse. Restored a compact example and an
+  explicit "this applies even to a one-off `ls`" note. Verified via headless
+  mode across all three rules configurations (protocol only, blank
+  general/command files, default) -- every reply now correctly fences its
+  command.
+- The protocol now explicitly tells the model to ignore `.temp-trash/`
+  entirely (it's the app's own soft-delete area, not user content) --
+  a real log showed an alphabetize script trying to move it into a lettered
+  folder and failing with a "same file" error, adding confusing noise to
+  an already-struggling multi-attempt task.
+- `max_auto_steps` (and other config) is re-read from disk right before
+  every new user-initiated turn in the GUI, not just at startup/after a
+  Settings save -- the Rust side already reloaded config and rules fresh on
+  every `send_message` call, but the frontend's own cached copy (used for
+  the auto-continue step cap) could still be stale after an external edit
+  to `config.toml`.
+
+### Verified
+- Compared "what is inside?" and a multi-step organize task across
+  disable_builtin_rules=true, blank rules.md/command-rules.md, and the
+  shipped defaults via headless mode against the real model. Without the
+  advisory general/command rules, the model reliably over-explored well
+  past what was asked (in one run, proposing an unrequested
+  `mv junk.txt .temp-trash/`); with the defaults, it gave one clean answer
+  and stopped. The organize task's script -- now written as one
+  self-contained unit per the protocol's script guidance -- correctly
+  skipped both a subdirectory and `.temp-trash` and ran clean in a single
+  confirmation, verified by executing it directly against a copy of the
+  test folder.
+
+## [1.3.0] - 2026-08-31
+### Added
+- A minimal, hardcoded "protocol" is now always sent regardless of any other
+  setting: the fenced-```sh-block command format, one command per reply,
+  sudo/root always failing here -- and new guidance to write a multi-step
+  task as one self-contained script in a single block and run it once,
+  rather than proposing many small commands that can leave things half-done
+  if something fails partway (this already worked well when a model did it
+  on its own; now it's actually suggested). This is the mechanical contract
+  the app's own parsing/execution code depends on, so it can't be edited
+  away by accident.
+- New "Disable built-in General/Command rules" checkbox in Settings ->
+  General (`disable_builtin_rules` in config, default off). When on, only
+  the hardcoded protocol above plus your own system prompt are sent --
+  `rules.md`/`command-rules.md` are skipped entirely (still saved on disk,
+  just not sent) for full manual control over behavior.
+
+### Changed
+- `rules.md`/`command-rules.md` are trimmed to roughly half their previous
+  length. Everything the app itself depends on (command format, one command
+  per reply, sudo handling) moved into the new hardcoded protocol above;
+  what's left is purely advisory judgment-call guidance (search before
+  guessing, re-verify stale listings, quoting, absolute paths for granted
+  locations, `mv`/`cp` argument semantics) -- safe to edit or discard
+  entirely via the new toggle without breaking the app. Dropped a few
+  narrow bullets (OS-detection guidance, "use the user's exact flags") that
+  duplicated more general ones already covered elsewhere.
+
 ## [1.2.1] - 2026-08-31
 ### Fixed
 - The `rm` soft-delete shim used `mv -f` into a fixed `.temp-trash/<relative

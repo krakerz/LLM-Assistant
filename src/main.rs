@@ -343,15 +343,14 @@ async fn send_message(
 
     let root_note = config::build_root_note(root.as_deref(), &cfg.granted_paths);
 
-    // General rules, then command rules (mechanical/protocol, rarely
-    // edited), then the user's own customizable system prompt, then the
+    // Hardcoded protocol, then the advisory general/command rules (unless
+    // disabled), then the user's own customizable system prompt, then the
     // per-turn folder-state note.
+    let rules_block =
+        rules::build_system_rules(&general_rules, &command_rules, cfg.disable_builtin_rules);
     let mut messages = vec![ChatMessage {
         role: "system".into(),
-        content: format!(
-            "{}\n\n{}\n\n{}\n\n{}",
-            general_rules, command_rules, cfg.system_prompt, root_note
-        ),
+        content: format!("{}\n\n{}\n\n{}", rules_block, cfg.system_prompt, root_note),
     }];
     messages.extend(history);
 
@@ -462,7 +461,8 @@ fn main() {
     // shows exactly what's in effect for this session -- useful for
     // confirming a Reset-to-default actually took, or that an edit wasn't
     // silently reverted.
-    rules::log_loaded_rules();
+    let startup_cfg = config::load_or_init().unwrap_or_default();
+    rules::log_loaded_rules(startup_cfg.disable_builtin_rules);
 
     // `llm-assistant <folder> <message...>` runs headless: one turn (plus
     // any commands it leads to) printed to stdout, no GUI. `llm-assistant

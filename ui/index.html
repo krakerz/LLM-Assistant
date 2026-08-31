@@ -74,6 +74,13 @@
       </label>
       <button id="resetPromptBtn" type="button" class="link-btn">Reset to default</button>
 
+      <label class="checkbox-row">
+        <input type="checkbox" id="cfgDisableBuiltinRules" />
+        Disable built-in General/Command rules -- send only my system prompt, plus the minimal
+        command-format protocol the app needs to work (the Rules/Commands tabs below are still saved,
+        just not sent while this is checked)
+      </label>
+
       <fieldset>
         <legend>Granted paths (readable outside the folder)</legend>
         <ul id="grantedList" class="granted-list"></ul>
