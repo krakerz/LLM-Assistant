@@ -84,20 +84,38 @@ const SHIM_PATH_RESET: &str = "PATH=/usr/bin:/bin:/usr/local/bin\nexport PATH\n"
 // rm/rmdir: move the target into .temp-trash keeping its relative path, so a
 // restore is just moving it back. Each invocation gets its own timestamped
 // subfolder, or deleting the same path twice would have `mv -f` clobber the
-// first copy. Side effect: `rmdir` no longer fails on a non-empty directory.
-const TRASH_SHIM_SCRIPT: &str = r#"trash_root="${TRASH_ROOT:-$PWD/.temp-trash}/$(date +%Y%m%d-%H%M%S-%N)"
+// first copy.
+//
+// `rmdir` still refuses a non-empty directory, exactly as the real one does.
+// That refusal is a signal the model actively relies on -- observed: asked to
+// "clean up the leftover folders", it passed a directory full of the user's
+// files alongside five empty ones, and a shim that silently trashed the lot
+// turned a command that would have failed safely into one that reported
+// success. Recoverable from the trash is not the same as not having happened.
+const TRASH_SHIM_SCRIPT: &str = r#"tool="@TOOL@"
+status=0
+trash_root="${TRASH_ROOT:-$PWD/.temp-trash}/$(date +%Y%m%d-%H%M%S-%N)"
 for arg in "$@"; do
   case "$arg" in
     -*) continue ;;
   esac
+  if [ "$tool" = "rmdir" ] && [ -d "$arg" ] && [ -n "$(ls -A -- "$arg" 2>/dev/null)" ]; then
+    echo "rmdir: failed to remove '$arg': Directory not empty" >&2
+    status=1
+    continue
+  fi
   case "$arg" in
     /*) rel="${arg#/}" ;;
     *) rel="$arg" ;;
   esac
   dest="$trash_root/$rel"
   mkdir -p "$(dirname "$dest")"
-  mv -f -- "$arg" "$dest" 2>/dev/null
+  if ! mv -f -- "$arg" "$dest" 2>/dev/null; then
+    echo "$tool: cannot remove '$arg'" >&2
+    status=1
+  fi
 done
+exit $status
 "#;
 
 /// mv/cp/truncate: copy what's about to be overwritten into `.temp-trash`,
@@ -181,7 +199,7 @@ pub fn ensure_shims(shim_dir: &Path) -> anyhow::Result<()> {
     };
 
     for name in ["rm", "rmdir"] {
-        write_shim(name, TRASH_SHIM_SCRIPT.to_string())?;
+        write_shim(name, TRASH_SHIM_SCRIPT.replace("@TOOL@", name))?;
     }
     // `all` = every operand is a victim (truncate rewrites its arguments in
     // place); otherwise only the destination is.
@@ -538,6 +556,40 @@ mod tests {
         let outcome = run_sandboxed(&root, &shim_dir, &[], None, "mv x.txt y.txt").unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
         assert_eq!(fs::read_to_string(root.join("y.txt")).unwrap(), "x");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Observed in a real session: asked to clean up leftover folders, the
+    // model passed a directory full of the user's files alongside five empty
+    // ones. Real rmdir refuses that; a shim that trashes it anyway turns a
+    // command that would have failed safely into one that reports success.
+    #[test]
+    fn rmdir_refuses_a_non_empty_directory() {
+        if !sandbox_available() {
+            return;
+        }
+        let (root, shim_dir) = scratch("rmdir-non-empty");
+        fs::create_dir_all(root.join("empty_one")).unwrap();
+        fs::create_dir_all(root.join("archive")).unwrap();
+        fs::write(root.join("archive/keep.txt"), "the user's file").unwrap();
+
+        let outcome =
+            run_sandboxed(&root, &shim_dir, &[], None, "rmdir empty_one archive").unwrap();
+        assert_ne!(outcome.exit_code, 0, "must fail like the real rmdir");
+        assert!(
+            outcome.stderr.contains("Directory not empty"),
+            "stderr: {}",
+            outcome.stderr
+        );
+        assert!(
+            root.join("archive/keep.txt").exists(),
+            "a non-empty directory must be left completely alone"
+        );
+        assert!(
+            !root.join("empty_one").exists(),
+            "the empty one should still have been trashed"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

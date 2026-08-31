@@ -366,8 +366,6 @@ dialog .explain.warn {
   margin: 0;
   color: var(--text);
   font-size: 13px;
-  text-transform: none;
-  letter-spacing: normal;
 }
 
 .confirm-steps input[type="checkbox"] {
@@ -472,14 +470,16 @@ dialog .cmd {
   background: #7a2f2f;
 }
 
+/* Sentence case, not uppercase: these labels grew from field names into
+   explanatory sentences, and a shouted paragraph is unreadable. Hierarchy
+   comes from colour and size instead. */
 #settingsDialog label,
 #addPathDialog label {
   display: block;
-  margin: 10px 0 4px;
+  margin: 12px 0 4px;
   color: var(--muted);
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 #settingsDialog input[type="text"],
@@ -504,10 +504,9 @@ fieldset {
 }
 
 legend {
-  color: var(--muted);
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .granted-list {

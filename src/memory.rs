@@ -177,35 +177,76 @@ fn clear_temp() {
     let _ = fs::create_dir_all(&temp);
 }
 
+/// Directories never worth snapshotting: huge, machine-generated, and not
+/// what "what did this folder look like" means to anyone.
+const SNAPSHOT_SKIP: &[&str] = &[
+    ".temp-trash",
+    ".git",
+    "node_modules",
+    "target",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".cache",
+];
+
+/// Bounds on the walk. Depth and count together keep it fast enough to stay
+/// on the calling thread -- a background thread would only add a race where
+/// the first turn reads a snapshot that isn't written yet.
+const SNAPSHOT_MAX_DEPTH: usize = 3;
+const SNAPSHOT_MAX_ENTRIES: usize = 150;
+
+fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<String>) {
+    if depth > SNAPSHOT_MAX_DEPTH || out.len() >= SNAPSHOT_MAX_ENTRIES {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut rows: Vec<(String, bool, PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if SNAPSHOT_SKIP.contains(&name.as_str()) {
+                return None;
+            }
+            let path = e.path();
+            let is_dir = path.is_dir();
+            Some((name, is_dir, path))
+        })
+        .collect();
+    // Directories first, then alphabetical: the shape is what's being read.
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+    for (name, is_dir, path) in rows {
+        if out.len() >= SNAPSHOT_MAX_ENTRIES {
+            out.push("- [...truncated, folder is larger than this snapshot]".into());
+            return;
+        }
+        let rel = format!("{prefix}{name}");
+        out.push(format!("- {rel}{}", if is_dir { "/" } else { "" }));
+        if is_dir {
+            walk(&path, &format!("{rel}/"), depth + 1, out);
+        }
+    }
+}
+
 /// Read directly, not through the sandbox: a fact about the folder rather
-/// than the result of a command the model could have shaped, and it costs no turn.
+/// than the result of a command the model could have shaped, and it costs no
+/// turn. Recursive, because the top level alone doesn't answer "put it back
+/// how it was" -- observed: asked to revert a reorganization, the model had
+/// to grope for the original layout one failed `mv` at a time.
 fn snapshot_state(root: Option<&Path>) {
     let path = session_dir().join(ORIGINAL_STATE);
     let Some(root) = root else {
         let _ = fs::write(path, "");
         return;
     };
-    let Ok(entries) = fs::read_dir(root) else {
-        let _ = fs::write(path, "");
-        return;
-    };
-    let mut names: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            // The protocol tells the model to ignore this; listing it would undo that.
-            if name == ".temp-trash" {
-                return None;
-            }
-            let suffix = if e.path().is_dir() { "/" } else { "" };
-            Some(format!("{name}{suffix}"))
-        })
-        .collect();
-    names.sort();
-    let _ = fs::write(
-        path,
-        format!("- when this task started: {}\n", names.join("  ")),
-    );
+    let mut out = Vec::new();
+    walk(root, "", 1, &mut out);
+    let _ = fs::write(path, format!("{}\n", out.join("\n")));
 }
 
 /// Called with `run_command`'s own result, so it cannot disagree with it.
@@ -234,7 +275,7 @@ pub fn build_block(cfg: &AppConfig) -> Option<String> {
         return None;
     }
     let mut intent = read_entries(INTENT);
-    let state = read_entries(ORIGINAL_STATE);
+    let mut state = read_entries(ORIGINAL_STATE);
     let mut progress = read_entries(PROGRESS);
     let mut completed = read_entries(COMPLETED);
     if intent.is_empty() && progress.is_empty() && completed.is_empty() {
@@ -248,14 +289,20 @@ pub fn build_block(cfg: &AppConfig) -> Option<String> {
         if budget == 0 || estimate_tokens(&block) <= budget {
             return Some(block);
         }
-        // Shed most-reproducible first. The snapshot and latest request are
-        // the floor -- nothing else in the prompt can supply them.
+        // Shed most-reproducible first. The top of the snapshot and the
+        // latest request are the floor -- nothing else in the prompt can
+        // supply them.
         if !completed.is_empty() {
             completed.remove(0);
             cut.completed += 1;
         } else if progress.len() > 1 {
             progress.remove(0);
             cut.progress += 1;
+        } else if state.len() > 1 {
+            // From the end: the walk is breadth-first-ish, so the deepest
+            // paths go before the top-level shape.
+            state.pop();
+            cut.state += 1;
         } else if intent.len() > 1 {
             intent.remove(0);
             cut.intent += 1;
@@ -273,6 +320,7 @@ pub fn build_block(cfg: &AppConfig) -> Option<String> {
 struct Cut {
     completed: usize,
     progress: usize,
+    state: usize,
     intent: usize,
     over_budget: bool,
 }
@@ -316,6 +364,12 @@ fn render(
         for line in state {
             out.push_str(line);
             out.push('\n');
+        }
+        if cut.state > 0 {
+            out.push_str(&format!(
+                "- [{} deeper path(s) dropped from this listing to save space]\n",
+                cut.state
+            ));
         }
     }
 
@@ -556,6 +610,55 @@ mod tests {
         assert!(
             !block.contains(".temp-trash"),
             "the app's own trash is not the user's content: {block}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // The top level alone doesn't answer "put it back how it was" -- observed
+    // a model groping for the original layout one failed `mv` at a time.
+    #[test]
+    fn the_snapshot_records_nested_structure_and_skips_build_dirs() {
+        let dir = scratch("snapshot-nested");
+        let root = dir.join("work");
+        fs::create_dir_all(root.join("archive/2024")).unwrap();
+        fs::create_dir_all(root.join("node_modules/junk")).unwrap();
+        fs::write(root.join("archive/2024/old.txt"), "x").unwrap();
+        fs::write(root.join("top.txt"), "x").unwrap();
+
+        start_task(&cfg(0), Some(&root), "reorganize");
+        let block = build_block(&cfg(0)).unwrap();
+        assert!(block.contains("archive/"), "{block}");
+        assert!(block.contains("archive/2024/old.txt"), "{block}");
+        assert!(block.contains("top.txt"), "{block}");
+        assert!(
+            !block.contains("node_modules"),
+            "generated trees are not the folder's shape: {block}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // A deep tree must not pin the block permanently over its cap.
+    #[test]
+    fn a_large_snapshot_is_shed_to_fit_the_cap() {
+        let dir = scratch("snapshot-cap");
+        let root = dir.join("work");
+        for i in 0..60 {
+            fs::create_dir_all(root.join(format!("folder-number-{i}"))).unwrap();
+            fs::write(root.join(format!("folder-number-{i}/file.txt")), "x").unwrap();
+        }
+        start_task(&cfg(0), Some(&root), "look at this");
+
+        let capped = build_block(&cfg(400)).unwrap();
+        assert!(
+            estimate_tokens(&capped) <= 400,
+            "still over budget: {} tokens",
+            estimate_tokens(&capped)
+        );
+        assert!(
+            capped.contains("dropped from this listing"),
+            "shedding must be stated: {capped}"
         );
 
         let _ = fs::remove_dir_all(&dir);

@@ -567,6 +567,14 @@ fn print_help() {
 }
 
 fn main() {
+    // WebKitGTK's DMABUF renderer draws a blank white window on many
+    // driver/compositor combinations. It bites the AppImage hardest, which
+    // ships its own WebKitGTK, so a working host copy doesn't save it. Set
+    // before any GTK/WebKit init; an explicit value from the environment wins.
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     let args: Vec<String> = std::env::args().collect();
     if args.iter().skip(1).any(|a| a == "--help" || a == "-h") {
         print_help();
