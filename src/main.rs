@@ -529,7 +529,7 @@ fn print_help() {
         env!("CARGO_PKG_VERSION")
     );
     println!("\nUSAGE:");
-    let usage: [(&str, &str); 4] = [
+    let usage: [(&str, &str); 5] = [
         ("llm-assistant", "Launch the GUI, no folder preloaded"),
         (
             "llm-assistant <folder>",
@@ -538,6 +538,10 @@ fn print_help() {
         (
             "llm-assistant <folder> <message>",
             "Headless: run one turn against <folder>, print the result, and exit -- no GUI",
+        ),
+        (
+            "llm-assistant <folder> --chat",
+            "Interactive terminal chat against <folder> -- no GUI, Ctrl+D or Ctrl+C to exit",
         ),
         ("llm-assistant --help | -h", "Show this help"),
     ];
@@ -599,10 +603,15 @@ fn main() {
         Err(e) => log::warn!("failed to start session memory: {e}"),
     }
 
-    // `<folder> <message...>` runs headless; `<folder>` alone preloads the GUI.
+    // `<folder> <message...>` runs headless; `<folder> --chat` starts an
+    // interactive terminal session; `<folder>` alone preloads the GUI.
     if args.len() >= 3 {
         let root = PathBuf::from(&args[1]);
         if root.is_dir() {
+            if args.len() == 3 && args[2] == "--chat" {
+                log::info!("interactive chat mode: root={}", root.display());
+                headless::run_chat(root);
+            }
             let message = args[2..].join(" ");
             log::info!("headless mode: root={} message={message:?}", root.display());
             headless::run(root, message);

@@ -379,7 +379,10 @@ dialog .explain.warn {
   white-space: pre-wrap;
 }
 
+/* Wider than the base dialog: labels here grew into full explanatory
+   sentences, and at 560px nearly every one wraps across nine or ten lines. */
 #settingsDialog {
+  width: min(760px, 92vw);
   max-height: 85vh;
   overflow-y: auto;
 }

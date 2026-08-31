@@ -50,9 +50,10 @@ see [`bwrap(1)`](https://github.com/containers/bubblewrap)), this app makes
   full "working rules" (command format, confirmation behavior, etc.) are
   all editable in Settings, kept separate from your customizable system
   prompt so tweaking one can't silently break the other.
-- **CLI modes** -- preload a folder (`llm-assistant <folder>`) or skip the
-  GUI entirely (`llm-assistant <folder> <message>`) for scripting and quick
-  testing.
+- **CLI modes** -- preload a folder (`llm-assistant <folder>`), skip the GUI
+  entirely for one scripted turn (`llm-assistant <folder> <message>`), or
+  chat in the terminal instead of the GUI (`llm-assistant <folder> --chat`),
+  styled like `ollama run`.
 - **Debug logging** -- `logs/app.log` plus a plain-text mirror of each GUI
   conversation (`last-chat.log`, cleared every launch, thinking steps
   included) for troubleshooting without having to expand anything in the
@@ -98,6 +99,7 @@ new/rolling-release distros.
 llm-assistant                              # launch the GUI
 llm-assistant /path/to/folder              # launch the GUI with a folder preloaded
 llm-assistant /path/to/folder "message"    # headless: run one turn, print the result, exit
+llm-assistant /path/to/folder --chat       # interactive terminal chat, Ctrl+D/Ctrl+C to exit
 llm-assistant --help
 ```
 

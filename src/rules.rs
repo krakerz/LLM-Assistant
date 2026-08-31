@@ -75,6 +75,21 @@ pub const REPEATED_COMMAND_NOTE: &str = "[you proposed the exact same command ag
 after it already ran, with nothing new to justify re-running it -- it was not run again. You \
 already have its output above.]";
 
+/// The immediate-repeat check above only catches a command run twice *in a
+/// row* -- an alternating loop (`ls -F`, `cat notes.txt`, `ls -F`, `cat
+/// notes.txt`, ...) walks straight past it, and with `max_auto_steps = 0`
+/// (unlimited) that reproduced as a genuinely endless chain during testing.
+/// This is the second guard: once one exact command string has been run
+/// this many times in a single auto-continue chain, regardless of what ran
+/// in between, treat it as stuck. Must stay identical to the constant of
+/// the same name in `ui/main.js`.
+pub const STUCK_LOOP_REPEAT_THRESHOLD: u32 = 4;
+
+/// Must stay identical to the note pushed in `ui/main.js` for the same guard.
+pub const STUCK_LOOP_NOTE: &str = "[that exact command has come up too many times in this \
+conversation without moving anything forward -- it was not run again. You already have its \
+output from earlier -- work from that, or try something genuinely different.]";
+
 /// Wrap-up turn after a hard stop, commands off the table. Every clause is
 /// load-bearing: "what was done and what the final result is" presupposed
 /// success and got a fabricated reorganization; "you already have everything
@@ -107,6 +122,68 @@ pub fn extract_command(text: &str) -> Option<String> {
     let start = earliest?;
     let end = text[start..].find("```")?;
     Some(text[start..start + end].trim().to_string())
+}
+
+/// Strips every ```sh/```bash/```shell fence out of `text`, mirroring
+/// `parseAssistantReply` in `ui/main.js`: only the first fence in a reply
+/// ever runs (see `extract_command` above), so a plain terminal client that
+/// echoed the rest back would show commands that look pending but never run.
+/// Returns the cleaned prose (blank-line runs collapsed, trimmed) plus how
+/// many *extra* fences were found beyond the first -- the caller decides
+/// whether that's worth telling the model about, same as the GUI does.
+pub fn strip_command_fences(text: &str) -> (String, usize) {
+    let mut out = text.to_string();
+    let mut found: usize = 0;
+    loop {
+        let mut earliest: Option<(usize, usize)> = None;
+        for lang in ["sh", "bash", "shell"] {
+            let marker = format!("```{lang}\n");
+            if let Some(pos) = out.find(&marker) {
+                let body_start = pos + marker.len();
+                let is_earlier = match earliest {
+                    Some((e, _)) => pos < e,
+                    None => true,
+                };
+                if is_earlier {
+                    earliest = Some((pos, body_start));
+                }
+            }
+        }
+        let Some((marker_start, body_start)) = earliest else {
+            break;
+        };
+        // An unterminated fence (a truncated reply) is left in place rather
+        // than guessed at.
+        let Some(end_rel) = out[body_start..].find("```") else {
+            break;
+        };
+        out.replace_range(marker_start..body_start + end_rel + 3, "");
+        found += 1;
+    }
+    (
+        collapse_blank_runs(&out).trim().to_string(),
+        found.saturating_sub(1),
+    )
+}
+
+/// `\n{3,}` -> `\n\n`, same as the JS regex `parseAssistantReply` uses --
+/// otherwise the gap a removed fence leaves behind reads as several empty
+/// paragraphs.
+fn collapse_blank_runs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut newline_run = 0;
+    for ch in text.chars() {
+        if ch == '\n' {
+            newline_run += 1;
+            if newline_run <= 2 {
+                out.push(ch);
+            }
+        } else {
+            newline_run = 0;
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn general_rules_path() -> PathBuf {
@@ -249,5 +326,40 @@ mod tests {
     fn extract_command_takes_the_earliest_fence_not_the_first_language() {
         let reply = "```bash\nfirst\n```\nand\n```sh\nsecond\n```";
         assert_eq!(extract_command(reply).as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn strip_command_fences_removes_the_fence_and_reports_no_extras() {
+        let reply = "Let's look.\n```sh\nls -F\n```";
+        let (display, extra) = strip_command_fences(reply);
+        assert_eq!(display, "Let's look.");
+        assert_eq!(extra, 0);
+    }
+
+    #[test]
+    fn strip_command_fences_counts_every_extra_fence() {
+        let reply = "one\n```sh\ncmd1\n```\ntwo\n```bash\ncmd2\n```\nthree";
+        let (display, extra) = strip_command_fences(reply);
+        assert_eq!(display, "one\n\ntwo\n\nthree");
+        assert_eq!(extra, 1, "two fences means one extra beyond the first");
+    }
+
+    #[test]
+    fn strip_command_fences_leaves_an_untagged_fence_alone() {
+        let reply = "Here's the file:\n```\nnot a command\n```";
+        let (display, extra) = strip_command_fences(reply);
+        assert_eq!(display, reply, "no tagged fence means nothing to strip");
+        assert_eq!(extra, 0);
+    }
+
+    #[test]
+    fn strip_command_fences_leaves_an_unterminated_fence_in_place() {
+        let reply = "starting a command\n```sh\nls -F";
+        let (display, extra) = strip_command_fences(reply);
+        assert!(
+            display.contains("```sh"),
+            "a truncated reply should not have its only fence silently eaten: {display:?}"
+        );
+        assert_eq!(extra, 0);
     }
 }
