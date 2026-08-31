@@ -331,9 +331,16 @@ dialog .cmd {
 
 .dialog-actions {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
   gap: 8px;
   margin-top: 14px;
+}
+
+.app-version {
+  margin-right: auto;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 #approveBtn {

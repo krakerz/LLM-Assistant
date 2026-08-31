@@ -191,6 +191,11 @@ fn default_system_prompt() -> &'static str {
 }
 
 #[tauri::command]
+fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+#[tauri::command]
 fn load_rules() -> Result<String, String> {
     rules::load_or_init().map_err(|e| e.to_string())
 }
@@ -366,7 +371,56 @@ fn stop_generation(state: State<AppState>) -> bool {
     }
 }
 
+fn print_help() {
+    println!(
+        "llm-assistant {} -- chat-driven local file assistant, sandboxed to a chosen folder",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!("\nUSAGE:");
+    let usage: [(&str, &str); 4] = [
+        ("llm-assistant", "Launch the GUI, no folder preloaded"),
+        (
+            "llm-assistant <folder>",
+            "Launch the GUI with <folder> already open",
+        ),
+        (
+            "llm-assistant <folder> <message>",
+            "Headless: run one turn against <folder>, print the result, and exit -- no GUI",
+        ),
+        ("llm-assistant --help | -h", "Show this help"),
+    ];
+    for (cmd, desc) in usage {
+        println!("    {cmd:<34} {desc}");
+    }
+    println!("\nConfig, rules, and logs live under $XDG_CONFIG_HOME/llm-assistant");
+    println!("(usually ~/.config/llm-assistant):");
+    let files: [(&str, &str); 4] = [
+        (
+            "config.toml",
+            "endpoint, model, temperature, granted paths, ...",
+        ),
+        (
+            "rules.md",
+            "the working rules read before your system prompt",
+        ),
+        ("logs/app.log", "internal debug log"),
+        (
+            "last-chat.log",
+            "mirror of the GUI conversation, cleared each launch",
+        ),
+    ];
+    for (name, desc) in files {
+        println!("    {name:<18} {desc}");
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().skip(1).any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return;
+    }
+
     init_logging();
     log::info!(
         "LLM Assistant starting, config dir = {}",
@@ -376,7 +430,6 @@ fn main() {
     // `llm-assistant <folder> <message...>` runs headless: one turn (plus
     // any commands it leads to) printed to stdout, no GUI. `llm-assistant
     // <folder>` alone (no message) is the existing GUI-preload behavior.
-    let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 {
         let root = PathBuf::from(&args[1]);
         if root.is_dir() {
@@ -417,6 +470,7 @@ fn main() {
             load_config,
             save_config,
             default_system_prompt,
+            app_version,
             load_rules,
             save_rules,
             default_rules,

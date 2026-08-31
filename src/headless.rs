@@ -142,13 +142,29 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
                     eprint!("{}", outcome.stderr);
                 }
                 let combined = format!("{}{}", outcome.stdout, outcome.stderr);
+                let mut feedback = format!(
+                    "[command output, exit {}]\n{}",
+                    outcome.exit_code,
+                    combined.trim()
+                );
+                // See main.js's identical hint -- reinforcing the
+                // absolute-path rule right at the point of failure works
+                // better than a rule stated once at the top of the prompt.
+                let lower = combined.to_lowercase();
+                if outcome.exit_code != 0
+                    && (lower.contains("no such file or directory")
+                        || lower.contains("cannot access"))
+                    && !cfg.granted_paths.is_empty()
+                {
+                    feedback.push_str(
+                        "\n\n(hint: if you were trying to reach a granted path, use its full \
+                         absolute path -- your current directory is always the working folder, \
+                         never a granted path.)",
+                    );
+                }
                 history.push(ChatMessage {
                     role: "user".into(),
-                    content: format!(
-                        "[command output, exit {}]\n{}",
-                        outcome.exit_code,
-                        combined.trim()
-                    ),
+                    content: feedback,
                 });
             }
             Err(e) => {

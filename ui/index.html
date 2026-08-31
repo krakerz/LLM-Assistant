@@ -10,9 +10,10 @@
   <header class="topbar">
     <button id="pickBtn">Select Folder…</button>
     <span id="rootPath" class="root-path">No folder selected</span>
-    <button id="unmountBtn" title="Stop file access, go back to chat-only">Unmount</button>
     <button id="fontDecBtn" title="Decrease font size" class="icon-btn">A−</button>
     <button id="fontIncBtn" title="Increase font size" class="icon-btn">A+</button>
+    <button id="clearChatBtn" title="Clear the chat">Clear</button>
+    <button id="unmountBtn" title="Stop file access, go back to chat-only">Unmount</button>
     <button id="settingsBtn" title="Settings" class="icon-btn">⚙</button>
   </header>
 
@@ -96,6 +97,7 @@
     </div>
 
     <div class="dialog-actions">
+      <span id="appVersion" class="app-version"></span>
       <button id="settingsCloseBtn" type="button">Close</button>
       <button id="settingsSaveBtn" type="button">Save</button>
     </div>

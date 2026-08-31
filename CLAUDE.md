@@ -50,6 +50,10 @@ need a confirmation dialog in the GUI (prints `[needs confirmation ...]` and
 stops instead) -- headless mode isn't a way to bypass the safety model, just
 a way to exercise it without clicking through it.
 
+`--help`/`-h` prints usage and exits before `init_logging()` runs, so the
+output stays clean (see `print_help` in `main.rs`) -- keep it that way if
+touching argv handling.
+
 `cargo tauri build --bundles appimage` can fail on very new/rolling-release
 toolchains: the bundled `linuxdeploy`'s `strip` binary doesn't understand
 `.relr.dyn` ELF sections emitted by newer binutils. Not an issue on the
