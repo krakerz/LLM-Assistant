@@ -1,13 +1,24 @@
 use crate::paths::app_config_dir;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantedPath {
     pub path: String,
     pub note: String,
     pub read_write: bool,
+    /// Whether subfolders are included. A bind mount is inherently
+    /// recursive, so `false` is handled specially in `sandbox.rs` by
+    /// binding only the top-level files instead of the whole directory.
+    /// Defaults to `true` for configs written before this field existed,
+    /// matching their actual (always-recursive) behavior at the time.
+    #[serde(default = "default_recursive")]
+    pub recursive: bool,
+}
+
+fn default_recursive() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,28 +46,13 @@ fn default_max_auto_steps() -> u32 {
     12
 }
 
-pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a local file assistant working inside a single \
-folder that the user opened for you. You cannot see or change anything outside that folder unless \
-the user has explicitly granted you a path.\n\nWhen you want to take an action (list, search, move, \
-copy, rename, edit, or delete files), first give a one-line explanation of what it will do, then put \
-exactly one shell command in a single fenced code block, for example:\n\nMove all PNGs into an images \
-folder.\n```sh\nmkdir -p images && mv -- *.png images/\n```\n\nOnly one command per reply. A command's \
-output is automatically given back to you as the next message, so after that happens, actually use it: \
-answer the user's original question, summarize the content, or explain what you found, in plain text \
-with no code block. Only propose another command if a further action is genuinely needed -- don't run \
-a command just to immediately run another one.\n\nWhen the user refers to a file by topic or description \
-rather than an exact filename (e.g. \"my shopping list\"), don't guess a name or extension -- first \
-search for likely matches (e.g. `find . -iname '*shopping*'`). If more than one file could reasonably \
-match, list the candidates in plain text and ask the user which one they mean before reading any of \
-them.\n\nRead-only commands (ls, cat, grep, find, ...) run immediately; anything else waits for the user \
-to approve it, so don't be afraid to propose it -- just don't chain unrelated destructive steps together. \
-Deletions are not permanent: anything removed is moved into a `.temp-trash` folder that mirrors the \
-original layout, so proposing a delete when it's genuinely the right step is fine.\n\nOnly ever put text \
-inside a ```sh fence when it is a literal command to run -- never use a ```sh (or ```bash/```shell) fence \
-to show file contents, a list, or any other text; use a plain fence with no language tag (or no fence at \
-all) for that. The folder's contents can also change between turns, including from outside this app -- \
-don't assume an earlier `ls`/`find` output in this conversation is still accurate; if it matters, \
-re-check with a fresh listing rather than answering from memory.";
+/// Deliberately short -- this is the part meant to be customized per-user
+/// (persona, focus, tone). The mechanical/protocol rules (command format,
+/// quoting, confirmation behavior, etc.) live separately in `rules.rs` /
+/// `rules.md`, read first, so editing this can't accidentally break them.
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a local file assistant. The user has opened a \
+single folder for you to work in; you cannot see or change anything outside it unless they've \
+explicitly granted you another path. Follow the working rules provided separately from this prompt.";
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -99,4 +95,48 @@ pub fn save(cfg: &AppConfig) -> anyhow::Result<()> {
     }
     fs::write(path, toml::to_string_pretty(cfg)?)?;
     Ok(())
+}
+
+/// Per-turn note appended after the rules/system prompt telling the model
+/// whether a folder is open and, if so, what it can propose commands
+/// against and what else it's been granted read (or read-write) access to
+/// -- and why, so it can actually use a granted path proactively instead of
+/// only when the user spells out the absolute path themselves. Shared by
+/// the GUI's `send_message` and headless mode so both stay consistent.
+pub fn build_root_note(root: Option<&Path>, granted_paths: &[GrantedPath]) -> String {
+    let Some(root) = root else {
+        return "No folder is open right now, so don't propose shell commands -- just chat \
+                normally, and if the user wants file operations, tell them to select a folder \
+                first."
+            .to_string();
+    };
+
+    let mut note = format!(
+        "You currently have this folder open and can propose shell commands confined to it: {}",
+        root.display()
+    );
+    if !granted_paths.is_empty() {
+        note.push_str(
+            "\n\nYou also have access to these additional paths outside the working folder:",
+        );
+        for g in granted_paths {
+            let access = if g.read_write {
+                "read-write"
+            } else {
+                "read-only"
+            };
+            let scope = if g.recursive {
+                "includes subfolders"
+            } else {
+                "top-level files only, no subfolders"
+            };
+            let why = if g.note.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" -- {}", g.note.trim())
+            };
+            note.push_str(&format!("\n- {} ({access}, {scope}){why}", g.path));
+        }
+    }
+    note
 }

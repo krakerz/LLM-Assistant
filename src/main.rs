@@ -1,8 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod chat_log;
 mod config;
+mod headless;
 mod llm;
 mod paths;
+mod rules;
 mod sandbox;
 
 use config::{AppConfig, GrantedPath};
@@ -19,6 +22,11 @@ use tauri_plugin_dialog::DialogExt;
 
 struct AppState {
     root: Mutex<Option<PathBuf>>,
+    /// Handle to whatever `send_chat` task is currently in flight, if any,
+    /// so `stop_generation` can actually cancel it (not just stop the UI
+    /// from proposing further steps) -- this is what makes the Stop button
+    /// a real emergency stop for a model stuck repeating itself.
+    current_send: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 fn require_root(state: &State<AppState>) -> Result<PathBuf, String> {
@@ -65,10 +73,12 @@ fn init_logging() {
         .append(true)
         .open(log_dir.join("app.log"));
 
+    // Stderr, not Mixed: headless mode prints its actual result to stdout,
+    // which needs to stay clean of log noise.
     let term = TermLogger::new(
         LevelFilter::Info,
         LogConfig::default(),
-        TerminalMode::Mixed,
+        TerminalMode::Stderr,
         ColorChoice::Auto,
     );
 
@@ -181,6 +191,31 @@ fn default_system_prompt() -> &'static str {
 }
 
 #[tauri::command]
+fn load_rules() -> Result<String, String> {
+    rules::load_or_init().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_rules(rules: String) -> Result<(), String> {
+    log::info!("save_rules: {} bytes", rules.len());
+    rules::save(&rules).map_err(|e| e.to_string())
+}
+
+/// Appends one entry to `<app-config-dir>/last-chat.log`, mirroring exactly
+/// what the GUI shows (including collapsed "thinking" steps, since a flat
+/// log file has no collapse concept) -- for debugging without driving the
+/// window. Cleared at the start of every GUI launch, see `main()`.
+#[tauri::command]
+fn append_chat_log(text: String) -> Result<(), String> {
+    chat_log::append(&text).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn default_rules() -> &'static str {
+    rules::DEFAULT_RULES
+}
+
+#[tauri::command]
 fn classify_command(cmd: String) -> Result<serde_json::Value, String> {
     let cfg = config::load_or_init().map_err(|e| e.to_string())?;
     Ok(serde_json::json!({
@@ -216,13 +251,19 @@ fn run_command(
 }
 
 #[tauri::command]
-fn add_granted_path(path: String, note: String, read_write: bool) -> Result<AppConfig, String> {
+fn add_granted_path(
+    path: String,
+    note: String,
+    read_write: bool,
+    recursive: bool,
+) -> Result<AppConfig, String> {
     let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
-    log::info!("add_granted_path: {path} (rw={read_write}) -- {note}");
+    log::info!("add_granted_path: {path} (rw={read_write}, recursive={recursive}) -- {note}");
     cfg.granted_paths.push(GrantedPath {
         path,
         note,
         read_write,
+        recursive,
     });
     config::save(&cfg).map_err(|e| e.to_string())?;
     Ok(cfg)
@@ -257,6 +298,7 @@ async fn send_message(
     history: Vec<ChatMessage>,
 ) -> Result<String, String> {
     let cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let rules = rules::load_or_init().map_err(|e| e.to_string())?;
     let root = state.root.lock().unwrap().clone();
     log::info!(
         "send_message: endpoint={} model={} root={:?} history_len={}",
@@ -266,39 +308,61 @@ async fn send_message(
         history.len()
     );
 
-    let root_note = match &root {
-        Some(r) => format!(
-            "You currently have this folder open and can propose shell commands confined to it: {}",
-            r.display()
-        ),
-        None => "No folder is open right now, so don't propose shell commands -- just chat \
-                 normally, and if the user wants file operations, tell them to select a folder \
-                 first."
-            .to_string(),
-    };
+    let root_note = config::build_root_note(root.as_deref(), &cfg.granted_paths);
 
+    // Rules first (mechanical/protocol, rarely edited), then the user's own
+    // customizable system prompt, then the per-turn folder-state note.
     let mut messages = vec![ChatMessage {
         role: "system".into(),
-        content: format!("{}\n\n{}", cfg.system_prompt, root_note),
+        content: format!("{}\n\n{}\n\n{}", rules, cfg.system_prompt, root_note),
     }];
     messages.extend(history);
-    match llm::send_chat(
-        &cfg.endpoint,
-        &cfg.model,
-        &cfg.api_key,
-        cfg.temperature,
-        &messages,
-    )
-    .await
-    {
-        Ok(reply) => {
+
+    // Spawned (rather than just awaited) so `stop_generation` has something
+    // to abort -- an emergency stop needs to actually cancel the in-flight
+    // request, not just stop the UI from proposing another one afterward.
+    let handle = tokio::spawn(async move {
+        llm::send_chat(
+            &cfg.endpoint,
+            &cfg.model,
+            &cfg.api_key,
+            cfg.temperature,
+            &messages,
+        )
+        .await
+    });
+    *state.current_send.lock().unwrap() = Some(handle.abort_handle());
+    let result = handle.await;
+    *state.current_send.lock().unwrap() = None;
+
+    match result {
+        Ok(Ok(reply)) => {
             log::debug!("send_message: reply {} bytes", reply.len());
             Ok(reply)
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             log::error!("send_message failed: {e}");
             Err(e.to_string())
         }
+        Err(join_err) if join_err.is_cancelled() => {
+            log::info!("send_message: cancelled by user");
+            Err("Cancelled".to_string())
+        }
+        Err(join_err) => {
+            log::error!("send_message task panicked: {join_err}");
+            Err(join_err.to_string())
+        }
+    }
+}
+
+#[tauri::command]
+fn stop_generation(state: State<AppState>) -> bool {
+    if let Some(handle) = state.current_send.lock().unwrap().take() {
+        handle.abort();
+        log::info!("stop_generation: aborted in-flight request");
+        true
+    } else {
+        false
     }
 }
 
@@ -308,6 +372,24 @@ fn main() {
         "LLM Assistant starting, config dir = {}",
         paths::app_config_dir().display()
     );
+
+    // `llm-assistant <folder> <message...>` runs headless: one turn (plus
+    // any commands it leads to) printed to stdout, no GUI. `llm-assistant
+    // <folder>` alone (no message) is the existing GUI-preload behavior.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 {
+        let root = PathBuf::from(&args[1]);
+        if root.is_dir() {
+            let message = args[2..].join(" ");
+            log::info!("headless mode: root={} message={message:?}", root.display());
+            headless::run(root, message);
+        }
+        log::warn!("ignoring CLI arguments: {:?} is not a directory", args[1]);
+    }
+
+    if let Err(e) = chat_log::clear() {
+        log::warn!("failed to clear last-chat.log: {e}");
+    }
 
     let cli_root = resolve_cli_root();
     if let Some(root) = &cli_root {
@@ -325,6 +407,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             root: Mutex::new(cli_root),
+            current_send: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             pick_and_set_root,
@@ -334,12 +417,17 @@ fn main() {
             load_config,
             save_config,
             default_system_prompt,
+            load_rules,
+            save_rules,
+            default_rules,
             classify_command,
             run_command,
             add_granted_path,
             remove_granted_path,
             add_auto_approve,
             send_message,
+            stop_generation,
+            append_chat_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

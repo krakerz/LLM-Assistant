@@ -133,6 +133,27 @@ details.bubble.output pre {
   margin: 8px 0 0;
 }
 
+.bubble.manual-cmd {
+  align-self: stretch;
+  background: #241c10;
+  border: 1px solid #6b4a1a;
+}
+
+.manual-cmd-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #e0b35c;
+  font-size: 13px;
+}
+
+.bubble.manual-cmd pre {
+  margin: 8px 0 0;
+  font-family: ui-monospace, monospace;
+  font-size: 12.5px;
+}
+
 details.bubble.thinking {
   align-self: stretch;
   background: none;
@@ -245,6 +266,51 @@ dialog .explain {
   font-size: 13px;
 }
 
+.confirm-context {
+  background: #191c24;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13.5px;
+  white-space: pre-wrap;
+}
+
+.confirm-context:empty {
+  display: none;
+}
+
+#settingsDialog {
+  max-height: 85vh;
+  overflow-y: auto;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+
+.tab-btn {
+  background: none;
+  border: none;
+  border-radius: 0;
+  border-bottom: 2px solid transparent;
+  padding: 6px 4px;
+  color: var(--muted);
+}
+
+.tab-btn:hover {
+  background: none;
+  color: var(--text);
+}
+
+.tab-btn.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
 dialog .cmd {
   background: #0f1116;
   border: 1px solid var(--border);
@@ -280,7 +346,17 @@ dialog .cmd {
   border-color: #7a2f2f;
 }
 
-#settingsDialog label {
+.stop-btn {
+  background: #5c2424;
+  border-color: #7a2f2f;
+}
+
+.stop-btn:hover {
+  background: #7a2f2f;
+}
+
+#settingsDialog label,
+#addPathDialog label {
   display: block;
   margin: 10px 0 4px;
   color: var(--muted);
@@ -291,7 +367,9 @@ dialog .cmd {
 
 #settingsDialog input[type="text"],
 #settingsDialog input[type="number"],
-#settingsDialog textarea {
+#settingsDialog textarea,
+#addPathDialog input[type="text"],
+#addPathDialog textarea {
   width: 100%;
   background: #0f1116;
   color: var(--text);
@@ -326,9 +404,40 @@ legend {
 .granted-list li {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
+  padding: 8px 10px;
+  background: #0f1116;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.granted-empty {
+  color: var(--muted);
   font-size: 13px;
+  justify-content: flex-start !important;
+  background: none !important;
+  border-style: dashed !important;
+}
+
+.granted-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.granted-path-line {
   font-family: ui-monospace, monospace;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.granted-note-line {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .quick-add-btn {
@@ -336,13 +445,6 @@ legend {
   width: 100%;
   border-style: dashed;
   color: var(--accent);
-}
-
-.granted-add {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 10px;
 }
 
 .link-btn {
@@ -359,20 +461,12 @@ legend {
   color: var(--text);
 }
 
-.granted-add input {
-  background: #0f1116;
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 6px 8px;
-  font: inherit;
+.path-row {
+  display: flex;
+  gap: 6px;
 }
 
-.granted-add input:first-child {
-  flex: 2;
-}
-
-.granted-add input:nth-child(2) {
+.path-row input {
   flex: 1;
 }
 
