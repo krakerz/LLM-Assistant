@@ -142,7 +142,10 @@ fn write_entries(name: &str, entries: &[String]) {
 /// Archives the last task, clears scratch, re-snapshots the folder. Triggered
 /// by the user speaking, not by the model declaring itself done -- that
 /// judgment is the one this record exists to not depend on.
-pub fn start_task(root: Option<&Path>, message: &str) {
+pub fn start_task(cfg: &AppConfig, root: Option<&Path>, message: &str) {
+    if !cfg.memory_enabled {
+        return;
+    }
     archive_progress();
     clear_temp();
     append_entry(INTENT, &format!("- {message}"));
@@ -206,13 +209,19 @@ fn snapshot_state(root: Option<&Path>) {
 }
 
 /// Called with `run_command`'s own result, so it cannot disagree with it.
-pub fn record_command(cmd: &str, exit_code: i32) {
+pub fn record_command(cfg: &AppConfig, cmd: &str, exit_code: i32) {
+    if !cfg.memory_enabled {
+        return;
+    }
     append_entry(PROGRESS, &format!("- ran: {cmd} -> exit {exit_code}"));
 }
 
 /// A denial, stop, or skipped step. Recorded as firmly as a success --
 /// "nothing happened" is what this app is worst at holding on to.
-pub fn record_blocked(cmd: &str, why: &str) {
+pub fn record_blocked(cfg: &AppConfig, cmd: &str, why: &str) {
+    if !cfg.memory_enabled {
+        return;
+    }
     append_entry(PROGRESS, &format!("- NOT run ({why}): {cmd}"));
 }
 
@@ -393,9 +402,9 @@ mod tests {
     #[test]
     fn records_what_ran_and_what_did_not() {
         let dir = scratch("records");
-        start_task(None, "organize my downloads");
-        record_command("mkdir -p A", 0);
-        record_blocked("rm -rf .", "the user denied it");
+        start_task(&cfg(0), None, "organize my downloads");
+        record_command(&cfg(0), "mkdir -p A", 0);
+        record_blocked(&cfg(0), "rm -rf .", "the user denied it");
 
         let block = build_block(&cfg(0)).expect("expected a memory block");
         assert!(block.contains("organize my downloads"), "{block}");
@@ -408,8 +417,8 @@ mod tests {
     #[test]
     fn disabled_produces_nothing_at_all() {
         let dir = scratch("disabled");
-        start_task(None, "do a thing");
-        record_command("ls", 0);
+        start_task(&cfg(0), None, "do a thing");
+        record_command(&cfg(0), "ls", 0);
 
         let off = AppConfig {
             memory_enabled: false,
@@ -421,13 +430,41 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // "Off" has to mean nothing is written, not just nothing is sent: the
+    // record includes the user's messages verbatim, and keeping those on disk
+    // after the setting is switched off is not what the checkbox says.
+    #[test]
+    fn memory_off_writes_nothing_to_disk() {
+        let dir = scratch("off-writes-nothing");
+        let off = AppConfig {
+            memory_enabled: false,
+            ..Default::default()
+        };
+        start_task(&off, None, "something private");
+        record_command(&off, "ls", 0);
+        record_blocked(&off, "rm -rf .", "denied");
+
+        let files: Vec<String> = fs::read_dir(session_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".md"))
+            .collect();
+        assert!(
+            files.is_empty(),
+            "expected no record files, found {files:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_new_task_archives_the_previous_ledger_and_keeps_intent() {
         let dir = scratch("archive");
-        start_task(None, "first request");
-        record_command("mkdir A", 0);
-        start_task(None, "second request");
-        record_command("mkdir B", 0);
+        start_task(&cfg(0), None, "first request");
+        record_command(&cfg(0), "mkdir A", 0);
+        start_task(&cfg(0), None, "second request");
+        record_command(&cfg(0), "mkdir B", 0);
 
         let block = build_block(&cfg(0)).unwrap();
         // Both requests are still intent; only B is current progress.
@@ -447,13 +484,13 @@ mod tests {
     #[test]
     fn the_block_respects_its_token_cap_and_says_what_it_cut() {
         let dir = scratch("cap");
-        start_task(None, "first request");
+        start_task(&cfg(0), None, "first request");
         for i in 0..40 {
-            record_command(&format!("mkdir folder-number-{i}"), 0);
+            record_command(&cfg(0), &format!("mkdir folder-number-{i}"), 0);
         }
-        start_task(None, "second request");
+        start_task(&cfg(0), None, "second request");
         for i in 0..40 {
-            record_command(&format!("mv file-number-{i} folder-number-{i}"), 0);
+            record_command(&cfg(0), &format!("mv file-number-{i} folder-number-{i}"), 0);
         }
 
         let uncapped = build_block(&cfg(0)).unwrap();
@@ -480,8 +517,8 @@ mod tests {
     #[test]
     fn an_impossible_budget_overshoots_out_loud() {
         let dir = scratch("impossible-cap");
-        start_task(None, "a request");
-        record_command("ls", 0);
+        start_task(&cfg(0), None, "a request");
+        record_command(&cfg(0), "ls", 0);
 
         let block = build_block(&cfg(10)).unwrap();
         assert!(estimate_tokens(&block) > 10, "sanity: the floor is bigger");
@@ -497,7 +534,7 @@ mod tests {
     fn a_new_task_clears_scratch_but_keeps_the_directory() {
         let dir = scratch("scratch-clear");
         fs::write(temp_dir().join("notes.txt"), "working").unwrap();
-        start_task(None, "next thing");
+        start_task(&cfg(0), None, "next thing");
         assert!(temp_dir().is_dir(), "scratch dir must still exist");
         assert!(!temp_dir().join("notes.txt").exists());
 
@@ -512,7 +549,7 @@ mod tests {
         fs::create_dir_all(root.join("photos")).unwrap();
         fs::write(root.join("list.txt"), "x").unwrap();
 
-        start_task(Some(&root), "tidy up");
+        start_task(&cfg(0), Some(&root), "tidy up");
         let block = build_block(&cfg(0)).unwrap();
         assert!(block.contains("photos/"), "{block}");
         assert!(block.contains("list.txt"), "{block}");

@@ -196,10 +196,15 @@ pub fn ensure_shims(shim_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `scratch`, when given, is bound read-write -- the model's only writable
+/// path outside the working folder. Passed in rather than read from
+/// `memory::`, so the security module doesn't depend on the feature that
+/// happens to use it.
 pub fn run_sandboxed(
     root: &Path,
     shim_dir: &Path,
     granted: &[GrantedPath],
+    scratch: Option<&Path>,
     cmd: &str,
 ) -> anyhow::Result<RunOutcome> {
     let mut c = Command::new("bwrap");
@@ -226,9 +231,8 @@ pub fn run_sandboxed(
 
     // Scratch only. The rest of session memory stays unbound: `progress.md`
     // is worth trusting only if nothing but this app can write it.
-    let scratch = crate::memory::temp_dir();
-    if scratch.is_dir() {
-        c.arg("--bind").arg(&scratch).arg(&scratch);
+    if let Some(scratch) = scratch.filter(|p| p.is_dir()) {
+        c.arg("--bind").arg(scratch).arg(scratch);
     }
 
     for g in granted {
@@ -356,14 +360,14 @@ mod tests {
         let shim_dir = root.join("shims");
         ensure_shims(&shim_dir).unwrap();
 
-        let outcome = run_sandboxed(&root, &shim_dir, &[], "rm sub/note.txt").unwrap();
+        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "rm sub/note.txt").unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
 
         // Force a distinct nanosecond-precision timestamp for the second rm.
         sleep(Duration::from_millis(20));
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::write(root.join("sub/note.txt"), "version2").unwrap();
-        let outcome = run_sandboxed(&root, &shim_dir, &[], "rm sub/note.txt").unwrap();
+        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "rm sub/note.txt").unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
 
         let trash_root = root.join(".temp-trash");
@@ -420,7 +424,7 @@ mod tests {
         fs::write(root.join("new.txt"), "incoming").unwrap();
         fs::write(root.join("old.txt"), "about to be destroyed").unwrap();
 
-        let outcome = run_sandboxed(&root, &shim_dir, &[], "mv new.txt old.txt").unwrap();
+        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "mv new.txt old.txt").unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
         assert_eq!(
             fs::read_to_string(root.join("old.txt")).unwrap(),
@@ -449,7 +453,7 @@ mod tests {
         fs::write(root.join("note.txt"), "new version").unwrap();
         fs::write(root.join("dest/note.txt"), "old version").unwrap();
 
-        let outcome = run_sandboxed(&root, &shim_dir, &[], "mv note.txt dest").unwrap();
+        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "mv note.txt dest").unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
         assert_eq!(
             fs::read_to_string(root.join("dest/note.txt")).unwrap(),
@@ -474,7 +478,7 @@ mod tests {
         fs::write(root.join("src.txt"), "incoming").unwrap();
         fs::write(root.join("dst.txt"), "about to be destroyed").unwrap();
 
-        let outcome = run_sandboxed(&root, &shim_dir, &[], "cp src.txt dst.txt").unwrap();
+        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "cp src.txt dst.txt").unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
         assert_eq!(
             fs::read_to_string(root.join("dst.txt")).unwrap(),
@@ -502,7 +506,7 @@ mod tests {
         let (root, shim_dir) = scratch("truncate");
         fs::write(root.join("log.txt"), "important history").unwrap();
 
-        let outcome = run_sandboxed(&root, &shim_dir, &[], "truncate -s 0 log.txt").unwrap();
+        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "truncate -s 0 log.txt").unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
         assert_eq!(fs::read_to_string(root.join("log.txt")).unwrap(), "");
 
@@ -526,12 +530,12 @@ mod tests {
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::write(root.join("sub/a.txt"), "content").unwrap();
 
-        let outcome = run_sandboxed(&root, &shim_dir, &[], "rm sub/a.txt").unwrap();
+        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "rm sub/a.txt").unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
 
         fs::write(root.join("x.txt"), "x").unwrap();
         fs::write(root.join("y.txt"), "y").unwrap();
-        let outcome = run_sandboxed(&root, &shim_dir, &[], "mv x.txt y.txt").unwrap();
+        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "mv x.txt y.txt").unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
         assert_eq!(fs::read_to_string(root.join("y.txt")).unwrap(), "x");
 
@@ -555,7 +559,7 @@ mod tests {
         let shim_dir = root.join("shims");
         ensure_shims(&shim_dir).unwrap();
 
-        let outcome = run_sandboxed(&root, &shim_dir, &[], "rmdir empty_folder").unwrap();
+        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "rmdir empty_folder").unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
 
         assert!(
