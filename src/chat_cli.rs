@@ -6,10 +6,17 @@
 //!
 //! Also handles `--list-personas` and `--list-sessions`, small utility
 //! flags for finding out what to pass to `--persona`/`--session`.
+//!
+//! An `` ```image-prompt``` `` request actually runs here too (same
+//! `chat_turn::run_full_image_generation` the GUI uses) -- this is a
+//! terminal, so there's nowhere to render the result, but printing the
+//! saved file's path is enough to inspect it by hand afterward, and turned
+//! out to be a much faster way to debug dispatch-pass reliability than
+//! going back and forth through the GUI.
 
 use crate::llm::ChatMessage;
 use crate::rules::to_plain_text;
-use crate::{chat_session, chat_turn, config, persona};
+use crate::{chat_session, chat_turn, comfyui, config, persona};
 use std::io::{self, BufRead, Write};
 
 pub fn list_personas() {
@@ -162,10 +169,34 @@ async fn run_async(opts: Options) -> i32 {
                 if let Some(err) = &outcome.ruleset_error {
                     println!("\n[{err}]");
                 }
-                if outcome.image_prompt_requested.is_some() {
-                    println!(
-                        "\n[requested an image -- generation only happens through the GUI, not this CLI]"
-                    );
+                if let Some(fields) = &outcome.image_prompt_requested {
+                    println!("\n[requested an image -- generating now, this may take a while...]");
+                    match comfyui::load_or_init() {
+                        Ok(comfy_cfg) => {
+                            match chat_turn::run_full_image_generation(
+                                &cfg,
+                                &comfy_cfg,
+                                &session_id,
+                                fields,
+                            )
+                            .await
+                            {
+                                // Doesn't render -- this is a terminal, not a
+                                // GUI -- just the saved location, to check by
+                                // hand afterward.
+                                Ok(result) => {
+                                    println!("[image saved to: {}]", result.path.display());
+                                    if let Some(reaction) = &result.reaction {
+                                        println!("\n{}", to_plain_text(reaction));
+                                    } else {
+                                        println!("[reaction turn failed -- see the log]");
+                                    }
+                                }
+                                Err(e) => println!("[image generation failed: {e}]"),
+                            }
+                        }
+                        Err(e) => println!("[could not load ComfyUI config: {e}]"),
+                    }
                 }
                 if let Some(summary) = &outcome.summary {
                     eprintln!(

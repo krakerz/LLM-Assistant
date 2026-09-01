@@ -349,6 +349,12 @@
       <label>Filename pattern (available placeholders: <code>{session}</code>, <code>{timestamp}</code>)
         <input id="cfgComfyFilenamePattern" type="text" placeholder="{session}-{timestamp}" />
       </label>
+      <label>After generating an image, the persona should
+        <select id="cfgComfyReactionMode">
+          <option value="always">Always comment on it in character</option>
+          <option value="optional">Decide based on the reply and its state whether a comment fits</option>
+        </select>
+      </label>
 
       <div class="path-row">
         <button id="testComfyGenerationBtn" type="button">Test image generation</button>

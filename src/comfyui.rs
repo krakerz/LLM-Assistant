@@ -45,6 +45,20 @@ pub struct ComfyUiMapping {
     pub steps: String,
 }
 
+/// Whether turn 3 (`chat_turn::run_image_reaction_turn`) must always produce
+/// an in-character comment on a freshly generated image, or gets to decide
+/// for itself -- based on how turn 1 just went and the session's own
+/// `state.md` -- whether a comment fits at all. `Always` is the original,
+/// simpler behavior and stays the default so existing configs (missing this
+/// field entirely) don't change behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReactionMode {
+    #[default]
+    Always,
+    Optional,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComfyUiConfig {
     #[serde(default)]
@@ -57,6 +71,8 @@ pub struct ComfyUiConfig {
     pub output_dir: String,
     #[serde(default = "default_filename_pattern")]
     pub filename_pattern: String,
+    #[serde(default)]
+    pub reaction_mode: ReactionMode,
 }
 
 fn default_output_dir() -> String {
@@ -79,6 +95,7 @@ impl Default for ComfyUiConfig {
             mapping: ComfyUiMapping::default(),
             output_dir: default_output_dir(),
             filename_pattern: default_filename_pattern(),
+            reaction_mode: ReactionMode::default(),
         }
     }
 }
