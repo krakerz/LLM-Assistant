@@ -21,6 +21,7 @@ use std::path::PathBuf;
 const META_FILE: &str = "meta.json";
 const HISTORY_FILE: &str = "history.json";
 const STATE_FILE: &str = "state.md";
+const RULESETS_FILE: &str = "loaded-rulesets.json";
 
 /// Title a freshly created session starts with, and the signal
 /// `save_history` uses to decide whether it's still safe to auto-title from
@@ -140,6 +141,7 @@ pub fn create_session(persona: Option<&str>) -> anyhow::Result<SessionSummary> {
     write_meta(&id, &meta)?;
     fs::write(session_dir(&id).join(HISTORY_FILE), "[]")?;
     fs::write(session_dir(&id).join(STATE_FILE), "")?;
+    fs::write(session_dir(&id).join(RULESETS_FILE), "[]")?;
     Ok(SessionSummary {
         id,
         title: meta.title,
@@ -184,6 +186,32 @@ pub fn read_state(id: &str) -> String {
 
 pub fn update_state(id: &str, content: &str) -> anyhow::Result<()> {
     fs::write(session_dir(id).join(STATE_FILE), content)?;
+    Ok(())
+}
+
+/// Ruleset names requested (via a ` ```ruleset <name> ``` ` fence) and
+/// loaded into this session so far -- once loaded, a ruleset stays loaded
+/// for the rest of the session (see `rules::extract_ruleset_request`). A
+/// missing/unparseable file reads back as "none loaded yet" rather than an
+/// error -- every session created since this field existed writes an empty
+/// array up front (`create_session`), so a missing file only happens for a
+/// session from before this existed.
+pub fn read_loaded_rulesets(id: &str) -> Vec<String> {
+    fs::read_to_string(session_dir(id).join(RULESETS_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn add_loaded_ruleset(id: &str, name: &str) -> anyhow::Result<()> {
+    let mut names = read_loaded_rulesets(id);
+    if !names.iter().any(|n| n == name) {
+        names.push(name.to_string());
+        fs::write(
+            session_dir(id).join(RULESETS_FILE),
+            serde_json::to_string(&names)?,
+        )?;
+    }
     Ok(())
 }
 
@@ -301,6 +329,24 @@ mod tests {
         let b = create_session(None).unwrap();
         assert_ne!(a.id, b.id);
         assert_eq!(list_sessions().unwrap().len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loaded_rulesets_start_empty_and_accumulate_without_duplicates() {
+        let dir = scratch("rulesets");
+        let session = create_session(None).unwrap();
+        assert!(read_loaded_rulesets(&session.id).is_empty());
+        add_loaded_ruleset(&session.id, "other-tools").unwrap();
+        add_loaded_ruleset(&session.id, "image-generation-prompt").unwrap();
+        add_loaded_ruleset(&session.id, "other-tools").unwrap(); // no-op, already loaded
+        assert_eq!(
+            read_loaded_rulesets(&session.id),
+            vec![
+                "other-tools".to_string(),
+                "image-generation-prompt".to_string()
+            ]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

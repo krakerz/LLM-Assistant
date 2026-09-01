@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- Drag-and-drop and clipboard paste for chat attachments, sharing the same validation as the 📎 picker button
+- Unsupported file types are now rejected with an inline message instead of silently being mis-read as text
+- On-demand rulesets: `<config>/rulesets/*.md` reference docs (seeded with an image-generation-prompt placeholder for a future ComfyUI integration, and a free-form "other tools" doc) that the model can pull into the conversation mid-chat by requesting one with a ` ```ruleset <name>``` ` block, instead of every ruleset always sitting in the system prompt
+- A read-only 🗒️ button next to the narration toggle shows the current chat session's remembered state
+- Vision support is now checked automatically, once per app run on the first chat message sent, with a status indicator next to the narration toggle
+
+### Changed
+- Narration markers switched from `*single asterisks*` to `// double slashes //`, since asterisks collided with normal Markdown italics and `**bold**`; narration text is now accent cyan instead of muted gray
+- Removed the "Test vision support" button from Settings in favor of the automatic probe above
+- The narration toggle button now shows a 🚫 badge overlay when narration is hidden, instead of relying only on a border-color change
+
+### Fixed
+- Attached images no longer disappear when the chat log redraws (narration toggle, reopening a session, switching modes) -- the redraw now reconstructs them from the persisted message
+
 ## [1.9.0] — 2026-09-01
 
 <div align="justify">

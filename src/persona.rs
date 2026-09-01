@@ -9,7 +9,7 @@
 //! outside any working folder, not something a model can destroy by
 //! surprise. If that turns out wrong in practice, add it then.
 
-use crate::paths::app_config_dir;
+use crate::paths::{app_config_dir, sanitize_filename};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -35,25 +35,8 @@ fn personas_dir() -> PathBuf {
     app_config_dir().join("personas")
 }
 
-/// Keeps a persona name safe as a bare filename: no path separators, no
-/// leading dot (would make it a hidden file, and `..` a traversal), never
-/// empty. Applied to both imported filenames and user-typed names.
-fn sanitize_name(name: &str) -> String {
-    let cleaned: String = name
-        .trim()
-        .chars()
-        .map(|c| if c == '/' || c == '\\' { '-' } else { c })
-        .collect();
-    let cleaned = cleaned.trim_start_matches('.').trim();
-    if cleaned.is_empty() {
-        "persona".to_string()
-    } else {
-        cleaned.to_string()
-    }
-}
-
 fn persona_path(name: &str) -> PathBuf {
-    personas_dir().join(format!("{}.md", sanitize_name(name)))
+    personas_dir().join(format!("{}.md", sanitize_filename(name, "persona")))
 }
 
 #[cfg(test)]
@@ -98,7 +81,7 @@ pub fn import_persona(source: &Path) -> anyhow::Result<PersonaSummary> {
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow::anyhow!("couldn't read a filename from {source:?}"))?;
-    let name = sanitize_name(stem);
+    let name = sanitize_filename(stem, "persona");
     let dest = persona_path(&name);
     if dest.exists() {
         anyhow::bail!("a persona named \"{name}\" already exists");
@@ -111,7 +94,7 @@ pub fn import_persona(source: &Path) -> anyhow::Result<PersonaSummary> {
 /// Writes a persona authored directly in the app (the "New persona" dialog:
 /// a name field plus a textarea). Same no-clobber rule as `import_persona`.
 pub fn save_new_persona(name: &str, content: &str) -> anyhow::Result<PersonaSummary> {
-    let name = sanitize_name(name);
+    let name = sanitize_filename(name, "persona");
     let dest = persona_path(&name);
     if dest.exists() {
         anyhow::bail!("a persona named \"{name}\" already exists");

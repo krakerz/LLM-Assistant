@@ -12,6 +12,7 @@ mod memory;
 mod paths;
 mod persona;
 mod rules;
+mod ruleset;
 mod sandbox;
 
 use config::{AppConfig, GrantedPath};
@@ -607,6 +608,14 @@ fn delete_chat_session(session_id: String) -> Result<(), String> {
     chat_session::delete_session(&session_id).map_err(|e| e.to_string())
 }
 
+/// Read-only peek at a session's current ` ```state ``` ` snapshot -- the
+/// only writer is `chat_turn::run_chat_turn`'s turn-processing path, never
+/// this command, so there's nothing to guard against here.
+#[tauri::command]
+fn get_chat_state(session_id: String) -> String {
+    chat_session::read_state(&session_id)
+}
+
 /// Keeps a session's title on `chat_session::DEFAULT_TITLE` from growing
 /// unbounded -- the leading slice of the first message is plenty to
 /// recognize a chat in the session list.
@@ -617,6 +626,8 @@ struct SendChatMessageResult {
     /// Whether this turn's reply included a ` ```state ``` ` block that got
     /// saved -- the UI shows a small indicator rather than the raw block.
     state_updated: bool,
+    ruleset_loaded: Option<String>,
+    ruleset_error: Option<String>,
     dropped: usize,
     condensed: usize,
     summarized: usize,
@@ -640,6 +651,8 @@ async fn send_chat_message(
         reply: outcome.reply,
         thinking: outcome.thinking,
         state_updated: outcome.state_updated,
+        ruleset_loaded: outcome.ruleset_loaded,
+        ruleset_error: outcome.ruleset_error,
         dropped: outcome.dropped,
         condensed: outcome.condensed,
         summarized: outcome.summarized,
@@ -911,6 +924,7 @@ fn main() {
             load_chat_session,
             rename_chat_session,
             delete_chat_session,
+            get_chat_state,
             send_chat_message,
             probe_vision_capability,
             test_vision_support,
