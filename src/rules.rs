@@ -130,6 +130,14 @@ change, you don't need to include one at all.";
 /// reasoning and no off-switch as `CHAT_PROTOCOL_PROMPT` -- this is how the
 /// app displays every reply, not a style the model is free to skip.
 ///
+/// Both sides now need an explicit pair of markers -- dialogue used to be
+/// "whatever's left over," which a real session showed the model reading as
+/// license to drop a stray, unpaired `//` in as an ad-hoc separator between
+/// sentences (not meant as a real marker at all), which then couldn't
+/// pair with anything and leaked into the display as literal slashes. Two
+/// required, symmetric markers make "not inside a marker" a state that
+/// should never happen, rather than the default one.
+///
 /// Also states whose POV narration is describing, added after a real
 /// session where "you" narration read as the persona's own action rather
 /// than the real person's -- with no rule pinning "you" to one side, a
@@ -137,18 +145,23 @@ change, you don't need to include one at all.";
 /// human, never the persona itself, so a reader is never left guessing who
 /// is doing what.
 pub const CHAT_NARRATION_PROMPT: &str = "Write your replies as an alternation of spoken dialogue \
-and physical narration, like a script. Wrap any narration -- an action, a gesture, a description \
-of the scene, anything that isn't actually being spoken aloud -- in a single pair of asterisks on \
-one line, for example: *she leans back and crosses her arms*. Keep each asterisk pair on one \
-line; never let one span multiple lines. Leave dialogue as plain text -- no asterisks, no \
-quotation marks needed. Use this format for every reply, even a short one, and even if it isn't \
-your default style.\n\n\
+and physical narration, like a script, using two explicit markers -- never leave any part of your \
+reply unwrapped. Wrap narration -- an action, a gesture, a description of the scene, anything \
+that isn't actually being spoken aloud -- in a pair of double slashes: // she leans back and \
+crosses her arms //. Wrap spoken dialogue in a pair of double pipes: || Is everything alright? ||. \
+A reply mixing both looks like: // she takes a slow sip // || That's really refreshing. ||. Use \
+this format for every reply, even a short one, and even if it isn't your default style.\n\n\
+`//` and `||` only ever appear as a complete, matching pair around one piece of narration or \
+dialogue -- never on their own as a separator, dash, aside, or for any other purpose, and never \
+asterisks or a leading period instead. A marker you open must be closed before you move on to the \
+next thing; an unclosed or stray marker is worse than none, since it can't be told apart from \
+plain text.\n\n\
 Be unambiguous about whose action or perspective each piece of narration describes. \"You\" \
 always means the real person you're talking to -- the human actually typing, never yourself or \
 your own character. Narrate your own character's actions in the third person by name (or first \
-person \"I\" in dialogue), never as \"you\". For example: *Elara leans back and smiles* for your \
-own character's action, and *You unzip the satchel* only when narrating something the real \
-person did or is doing.";
+person \"I\" in dialogue), never as \"you\". For example: // Elara leans back and smiles // for \
+your own character's action, and // You unzip the satchel // only when narrating something the \
+real person did or is doing.";
 
 /// The read side of `PROTOCOL_PROMPT`'s fence contract. Only an
 /// explicitly-tagged fence counts, matching `parseAssistantReply` in
@@ -260,6 +273,73 @@ pub fn strip_state_blocks(text: &str) -> String {
         out.replace_range(pos..body_start + end_rel + 3, "");
     }
     collapse_blank_runs(&out).trim().to_string()
+}
+
+/// The read side of the "request a ruleset" contract: a ` ```ruleset <name> ```
+/// ` fence, name on the opening line. Unlike `extract_command`'s fixed
+/// language-tag set (`sh`/`bash`/`shell`), a ruleset name is open-ended, not
+/// one of a few known values, so it can't live in the fence's language slot
+/// the way a shell tag does -- it has to be read off the rest of that
+/// opening line instead. Only the first request in a reply counts, matching
+/// every other fence convention here. There's nothing useful the model
+/// could put in the block's body (this is a request, not a payload), so the
+/// body itself is never read -- only that a closing fence exists at all,
+/// confirming the block is well-formed.
+pub fn extract_ruleset_request(text: &str) -> Option<String> {
+    let marker = "```ruleset ";
+    let start = text.find(marker)? + marker.len();
+    let line_end = start + text[start..].find('\n')?;
+    let name = text[start..line_end].trim();
+    if name.is_empty() {
+        return None;
+    }
+    text[line_end..].find("```")?;
+    Some(name.to_string())
+}
+
+/// Removes every ` ```ruleset <name> ``` ` request from `text` for display,
+/// same reasoning as `strip_state_blocks` -- the model is told this is a
+/// request the app answers on the next turn, not something to show as-is.
+pub fn strip_ruleset_requests(text: &str) -> String {
+    let mut out = text.to_string();
+    loop {
+        let marker = "```ruleset ";
+        let Some(pos) = out.find(marker) else {
+            break;
+        };
+        let line_start = pos + marker.len();
+        let Some(line_end_rel) = out[line_start..].find('\n') else {
+            break;
+        };
+        let body_start = line_start + line_end_rel + 1;
+        let Some(end_rel) = out[body_start..].find("```") else {
+            break;
+        };
+        out.replace_range(pos..body_start + end_rel + 3, "");
+    }
+    collapse_blank_runs(&out).trim().to_string()
+}
+
+/// The names of rulesets not yet loaded into this conversation, and how to
+/// request one -- injected into the system message so the model knows what
+/// it can ask for without every ruleset's full content being sent up front.
+/// Empty when every existing ruleset is already loaded (or none exist).
+pub fn build_ruleset_availability_note(names: &[String]) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "## Optional rulesets available\n\
+        Not loaded into this conversation yet. If a task calls for one, request it with \
+        ```ruleset <name>``` on its own line, using the exact name below. Once requested it \
+        stays available for the rest of this chat.\n\n",
+    );
+    for name in names {
+        out.push_str("- ");
+        out.push_str(name);
+        out.push('\n');
+    }
+    out
 }
 
 /// The two tags reasoning-capable models are actually seen using in the
@@ -446,6 +526,8 @@ pub fn build_chat_system_content(
     persona: Option<&str>,
     state: &str,
     state_max_tokens: u32,
+    available_rulesets: &[String],
+    loaded_rulesets: &[(String, String)],
 ) -> String {
     let mut out = CHAT_PROTOCOL_PROMPT.to_string();
     out.push_str("\n\n");
@@ -453,6 +535,17 @@ pub fn build_chat_system_content(
     if let Some(persona) = persona {
         out.push_str("\n\n");
         out.push_str(persona);
+    }
+    let availability_note = build_ruleset_availability_note(available_rulesets);
+    if !availability_note.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&availability_note);
+    }
+    for (name, content) in loaded_rulesets {
+        out.push_str("\n\n## Loaded ruleset: ");
+        out.push_str(name);
+        out.push('\n');
+        out.push_str(content);
     }
     let state = state.trim();
     if !state.is_empty() {
@@ -588,7 +681,8 @@ mod tests {
 
     #[test]
     fn build_chat_system_content_includes_persona_and_state() {
-        let out = build_chat_system_content(Some("You are Aria, a shopkeeper."), "HP: 90", 0);
+        let out =
+            build_chat_system_content(Some("You are Aria, a shopkeeper."), "HP: 90", 0, &[], &[]);
         assert!(out.contains(CHAT_PROTOCOL_PROMPT));
         assert!(out.contains(CHAT_NARRATION_PROMPT));
         assert!(out.contains("You are Aria, a shopkeeper."));
@@ -598,20 +692,20 @@ mod tests {
     #[test]
     fn build_chat_system_content_always_includes_the_narration_prompt() {
         // No persona, no state -- there's still no off-switch for this one.
-        let out = build_chat_system_content(None, "", 0);
+        let out = build_chat_system_content(None, "", 0, &[], &[]);
         assert!(out.contains(CHAT_NARRATION_PROMPT));
     }
 
     #[test]
     fn build_chat_system_content_omits_empty_state() {
-        let out = build_chat_system_content(None, "   ", 0);
+        let out = build_chat_system_content(None, "   ", 0, &[], &[]);
         assert!(!out.contains("persistent state"));
     }
 
     #[test]
     fn build_chat_system_content_caps_a_long_state() {
         let long_state = "x".repeat(10_000);
-        let out = build_chat_system_content(None, &long_state, 50);
+        let out = build_chat_system_content(None, &long_state, 50, &[], &[]);
         assert!(
             out.len() < long_state.len(),
             "expected the state to be truncated"
@@ -620,6 +714,74 @@ mod tests {
             out.contains("condensed away"),
             "truncation must be stated, not silent: {out}"
         );
+    }
+
+    #[test]
+    fn build_chat_system_content_lists_available_rulesets_but_not_their_content() {
+        let out = build_chat_system_content(
+            None,
+            "",
+            0,
+            &[
+                "image-generation-prompt".to_string(),
+                "other-tools".to_string(),
+            ],
+            &[],
+        );
+        assert!(out.contains("image-generation-prompt"));
+        assert!(out.contains("other-tools"));
+        assert!(out.contains("```ruleset"));
+    }
+
+    #[test]
+    fn build_chat_system_content_omits_the_availability_note_when_none_are_available() {
+        let out = build_chat_system_content(None, "", 0, &[], &[]);
+        assert!(!out.contains("Optional rulesets available"));
+    }
+
+    #[test]
+    fn build_chat_system_content_includes_loaded_ruleset_content() {
+        let out = build_chat_system_content(
+            None,
+            "",
+            0,
+            &[],
+            &[(
+                "other-tools".to_string(),
+                "SearXNG URL: http://example".to_string(),
+            )],
+        );
+        assert!(out.contains("Loaded ruleset: other-tools"));
+        assert!(out.contains("SearXNG URL: http://example"));
+    }
+
+    #[test]
+    fn extract_ruleset_request_reads_the_name() {
+        let reply = "Sure, let me check.\n```ruleset other-tools\n```\nOne moment.";
+        assert_eq!(
+            extract_ruleset_request(reply).as_deref(),
+            Some("other-tools")
+        );
+    }
+
+    #[test]
+    fn extract_ruleset_request_is_none_when_absent() {
+        assert_eq!(extract_ruleset_request("just a normal reply"), None);
+    }
+
+    #[test]
+    fn strip_ruleset_requests_hides_it_from_display() {
+        let reply = "Here's what happened.\n```ruleset other-tools\n```\nAnything else?";
+        let display = strip_ruleset_requests(reply);
+        assert!(!display.contains("```ruleset"), "{display}");
+        assert!(display.contains("Here's what happened."));
+        assert!(display.contains("Anything else?"));
+    }
+
+    #[test]
+    fn strip_ruleset_requests_is_a_no_op_without_one() {
+        let reply = "just a normal reply";
+        assert_eq!(strip_ruleset_requests(reply), reply);
     }
 
     #[test]

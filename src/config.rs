@@ -26,7 +26,15 @@ pub struct AppConfig {
     #[serde(default)]
     pub api_key: String,
     pub system_prompt: String,
+    /// File-operations mode's sampling temperature. Chat mode has its own,
+    /// separate `chat_temperature` -- the two used to share this one field,
+    /// which meant tuning one for roleplay (usually higher) fought against
+    /// tuning the other for reliable command output (usually lower).
     pub temperature: f32,
+    /// Chat mode's sampling temperature, independent of file-operations
+    /// mode's `temperature` above (see its doc comment for why they split).
+    #[serde(default = "default_chat_temperature")]
+    pub chat_temperature: f32,
     #[serde(default)]
     pub granted_paths: Vec<GrantedPath>,
     #[serde(default)]
@@ -140,6 +148,10 @@ fn default_max_auto_steps() -> u32 {
     12
 }
 
+fn default_chat_temperature() -> f32 {
+    0.2
+}
+
 /// Short on purpose: the user-customizable part. Mechanical rules live in
 /// `rules.rs`/`rules.md` so editing this can't break them.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a local file assistant. The user has opened a \
@@ -154,6 +166,7 @@ impl Default for AppConfig {
             api_key: String::new(),
             system_prompt: DEFAULT_SYSTEM_PROMPT.into(),
             temperature: 0.2,
+            chat_temperature: default_chat_temperature(),
             granted_paths: vec![],
             auto_approve: vec![],
             max_auto_steps: default_max_auto_steps(),

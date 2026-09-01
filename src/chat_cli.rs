@@ -156,6 +156,12 @@ async fn run_async(opts: Options) -> i32 {
                 if outcome.state_updated {
                     println!("\n[persistent state updated]");
                 }
+                if let Some(name) = &outcome.ruleset_loaded {
+                    println!("\n[loaded ruleset: {name}]");
+                }
+                if let Some(err) = &outcome.ruleset_error {
+                    println!("\n[{err}]");
+                }
                 if let Some(summary) = &outcome.summary {
                     eprintln!(
                         "\n[summarized {} old message(s) to fit the context budget]\n{summary}",

@@ -6,7 +6,7 @@
 
 use crate::config::AppConfig;
 use crate::llm::ChatMessage;
-use crate::{chat_session, context, persona, rules};
+use crate::{chat_session, context, persona, rules, ruleset};
 
 pub struct ChatTurnOutcome {
     pub reply: String,
@@ -17,6 +17,13 @@ pub struct ChatTurnOutcome {
     /// Whether this turn's reply included a ` ```state ``` ` block that got
     /// saved -- callers show a small indicator rather than the raw block.
     pub state_updated: bool,
+    /// A ruleset the model requested this turn (` ```ruleset <name> ``` `)
+    /// that existed and is now loaded for the rest of this session.
+    pub ruleset_loaded: Option<String>,
+    /// Set instead of `ruleset_loaded` when the requested name doesn't
+    /// match any existing ruleset -- surfaced rather than silently dropped,
+    /// so a typo'd request doesn't just look like nothing happened.
+    pub ruleset_error: Option<String>,
     pub dropped: usize,
     pub condensed: usize,
     pub summarized: usize,
@@ -57,10 +64,23 @@ pub async fn run_chat_turn(
         None => None,
     };
     let state = chat_session::read_state(session_id);
+    let loaded_names = chat_session::read_loaded_rulesets(session_id);
+    let available_names: Vec<String> = ruleset::list_rulesets()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.name)
+        .filter(|name| !loaded_names.contains(name))
+        .collect();
+    let loaded_rulesets: Vec<(String, String)> = loaded_names
+        .iter()
+        .filter_map(|name| ruleset::load_ruleset(name).ok().map(|c| (name.clone(), c)))
+        .collect();
     let system_content = rules::build_chat_system_content(
         persona_content.as_deref(),
         &state,
         cfg.chat_state_max_tokens,
+        &available_names,
+        &loaded_rulesets,
     );
 
     let summarizer = cfg.summarize_before_dropping.then(|| context::Summarizer {
@@ -83,7 +103,7 @@ pub async fn run_chat_turn(
         &cfg.endpoint,
         &cfg.model,
         &cfg.api_key,
-        cfg.temperature,
+        cfg.chat_temperature,
         &messages,
     )
     .await?;
@@ -96,7 +116,19 @@ pub async fn run_chat_turn(
     if let Some(new_state) = &state_block {
         chat_session::update_state(session_id, new_state)?;
     }
-    let stored_reply = rules::strip_state_blocks(&reply);
+
+    let mut ruleset_loaded = None;
+    let mut ruleset_error = None;
+    if let Some(name) = rules::extract_ruleset_request(&reply) {
+        if ruleset::load_ruleset(&name).is_ok() {
+            chat_session::add_loaded_ruleset(session_id, &name)?;
+            ruleset_loaded = Some(name);
+        } else {
+            ruleset_error = Some(format!("requested unknown ruleset \"{name}\""));
+        }
+    }
+
+    let stored_reply = rules::strip_ruleset_requests(&rules::strip_state_blocks(&reply));
 
     let mut full_history = trimmed
         .rewritten_history
@@ -117,6 +149,8 @@ pub async fn run_chat_turn(
         reply: stored_reply,
         thinking,
         state_updated,
+        ruleset_loaded,
+        ruleset_error,
         dropped: trimmed.dropped,
         condensed: trimmed.condensed,
         summarized: trimmed.summarized,

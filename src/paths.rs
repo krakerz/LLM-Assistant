@@ -16,3 +16,21 @@ pub fn app_config_dir() -> PathBuf {
 pub fn app_log_dir() -> PathBuf {
     app_config_dir().join("logs")
 }
+
+/// Keeps a user-supplied name safe as a bare filename: no path separators,
+/// no leading dot (would make it a hidden file, and `..` a traversal),
+/// never empty. Shared by `persona.rs` and `ruleset.rs`, which both store
+/// freeform `.md` files named directly after a user-typed or imported name.
+pub fn sanitize_filename(name: &str, fallback: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| if c == '/' || c == '\\' { '-' } else { c })
+        .collect();
+    let cleaned = cleaned.trim_start_matches('.').trim();
+    if cleaned.is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned.to_string()
+    }
+}

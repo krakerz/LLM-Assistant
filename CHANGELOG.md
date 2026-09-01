@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [1.10.0] — 2026-09-01
+
+### Added
+- Drag-and-drop and clipboard paste for chat attachments, sharing the same validation as the 📎 picker button
+- Unsupported file types are now rejected with an inline message instead of silently being mis-read as text
+- On-demand rulesets: `<config>/rulesets/*.md` reference docs (seeded with an image-generation-prompt placeholder for a future ComfyUI integration, and a free-form "other tools" doc) that the model can pull into the conversation mid-chat by requesting one with a ` ```ruleset <name>``` ` block, instead of every ruleset always sitting in the system prompt
+- A read-only 🗒️ button next to the narration toggle shows the current chat session's remembered state
+- Vision support is now checked automatically, once per app run on the first chat message sent, with a status indicator next to the narration toggle
+- A 🧩 button next to the persona controls opens an editor for the two rulesets above, so their content no longer needs to be edited on disk by hand
+- The chat message box's placeholder now mentions `// action //` for narration
+
+### Changed
+- Narration markers switched from `*single asterisks*` to `// double slashes //`, since asterisks collided with normal Markdown italics and `**bold**`; narration text is now accent cyan instead of muted gray
+- Removed the "Test vision support" button from Settings in favor of the automatic probe above
+- The narration toggle button now shows a 🚫 badge overlay when narration is hidden, instead of relying only on a border-color change
+- Chat is now the default view (and the top rail icon) instead of File Operations
+- Removed the drag-over hover highlight in chat mode -- drag-and-drop attachment isn't reliable yet (deprioritized, see project notes), and a highlight for a drop that then does nothing was worse than none
+- Settings reorganized: **General** now only holds what's actually shared (endpoint/model/API key, context budget, summarize-before-dropping); a new **Chat** tab holds chat-only settings (temperature, persistent-state budget, thinking display); **File Operations** replaces the old flat Rules/Commands tabs and holds everything specific to that mode (temperature, auto-steps, session record, granted paths, always-allowed programs), with Rules and Commands now nested inside it as sub-tabs
+- Chat mode and file-operations mode now have independent temperature settings instead of sharing one -- if you'd customized temperature before this, file operations keeps your value and chat mode starts from the default (0.2) until set separately in the new Chat tab
+- Narration/dialogue formatting now uses two explicit, required markers instead of one implicit rule: narration in `// text //` (unchanged), spoken dialogue in `|| text ||` (new) -- for the model's own replies only, typing plain text yourself still works exactly as before. The old "anything not inside `//` defaults to dialogue" rule let a model-inserted stray, unpaired `//` (meant as an ad-hoc separator, not a real marker) leak into the display as literal slashes; both sides now need a real pair, and a `//`/`||` pair can span multiple lines
+- Settings' gear icon and the app version moved out of each mode's own topbar into one shared control pinned to the bottom of the left rail, sized to match the mode icons above it -- previously duplicated (slightly differently) in both topbars for no reason other than history
+
+### Fixed
+- A stray, unpaired narration marker the model sometimes inserted as an ad-hoc separator (see above) used to render as a literal `//` in the chat -- the parser now strips any leftover unpaired marker instead of showing it
+- Attached images no longer disappear when the chat log redraws (narration toggle, reopening a session, switching modes) -- the redraw now reconstructs them from the persisted message
+- The 📎 attach button stopped attaching anything at all right after the drag-and-drop/paste work above landed -- the picker's file list was being read from a live `FileList` that got cleared out from under it before it was ever read
+- A rejected attachment (e.g. an image format the endpoint won't accept) used to stay in the conversation history after the send failed, so every later turn silently resent it and failed the same way -- a failed turn is no longer kept
+- An unlisted image format could sneak past the attachment guard whenever the OS happened to report an `image/*` MIME type for it -- the allowed-extensions list is now authoritative, MIME sniffing only applies to the rare file with no extension at all
+- The ruleset editor dialog's `<select>`/`<textarea>` had no dialog-scoped styling and rendered cramped and unstyled
+- Plain Markdown italics (`*text*`) stopped rendering when narration moved off single asterisks -- restored, now unambiguous since narration uses `//` instead
+- Chat mode's topbar was visibly taller than File Operations' -- the persona `<select>`'s native styling ignored our padding/line-height; it's now drawn without native appearance so both topbars match
+- Settings' "Test connection" result text was misaligned with its button -- the row is now vertically centered
+
 ## [1.9.0] — 2026-09-01
 
 <div align="justify">

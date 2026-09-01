@@ -12,6 +12,7 @@ mod memory;
 mod paths;
 mod persona;
 mod rules;
+mod ruleset;
 mod sandbox;
 
 use config::{AppConfig, GrantedPath};
@@ -579,6 +580,28 @@ fn update_persona(name: String, content: String) -> Result<(), String> {
     persona::update_persona(&name, &content).map_err(|e| e.to_string())
 }
 
+// --- Chat mode: rulesets ---
+//
+// Editing only, not full CRUD like personas -- the two rulesets are seeded
+// by `ruleset::list_rulesets` itself, so there's no "new"/"import"/"delete"
+// to expose; this just lets the user edit their content without opening the
+// `.md` files by hand.
+
+#[tauri::command]
+fn list_rulesets() -> Result<Vec<ruleset::RulesetSummary>, String> {
+    ruleset::list_rulesets().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_ruleset_content(name: String) -> Result<String, String> {
+    ruleset::load_ruleset(&name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn update_ruleset(name: String, content: String) -> Result<(), String> {
+    ruleset::update_ruleset(&name, &content).map_err(|e| e.to_string())
+}
+
 // --- Chat mode: sessions ---
 
 #[tauri::command]
@@ -607,6 +630,14 @@ fn delete_chat_session(session_id: String) -> Result<(), String> {
     chat_session::delete_session(&session_id).map_err(|e| e.to_string())
 }
 
+/// Read-only peek at a session's current ` ```state ``` ` snapshot -- the
+/// only writer is `chat_turn::run_chat_turn`'s turn-processing path, never
+/// this command, so there's nothing to guard against here.
+#[tauri::command]
+fn get_chat_state(session_id: String) -> String {
+    chat_session::read_state(&session_id)
+}
+
 /// Keeps a session's title on `chat_session::DEFAULT_TITLE` from growing
 /// unbounded -- the leading slice of the first message is plenty to
 /// recognize a chat in the session list.
@@ -617,6 +648,8 @@ struct SendChatMessageResult {
     /// Whether this turn's reply included a ` ```state ``` ` block that got
     /// saved -- the UI shows a small indicator rather than the raw block.
     state_updated: bool,
+    ruleset_loaded: Option<String>,
+    ruleset_error: Option<String>,
     dropped: usize,
     condensed: usize,
     summarized: usize,
@@ -640,6 +673,8 @@ async fn send_chat_message(
         reply: outcome.reply,
         thinking: outcome.thinking,
         state_updated: outcome.state_updated,
+        ruleset_loaded: outcome.ruleset_loaded,
+        ruleset_error: outcome.ruleset_error,
         dropped: outcome.dropped,
         condensed: outcome.condensed,
         summarized: outcome.summarized,
@@ -906,11 +941,15 @@ fn main() {
             delete_persona,
             get_persona_content,
             update_persona,
+            list_rulesets,
+            get_ruleset_content,
+            update_ruleset,
             list_chat_sessions,
             create_chat_session,
             load_chat_session,
             rename_chat_session,
             delete_chat_session,
+            get_chat_state,
             send_chat_message,
             probe_vision_capability,
             test_vision_support,

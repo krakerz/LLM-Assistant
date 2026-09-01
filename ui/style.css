@@ -67,6 +67,17 @@ body {
   border-color: var(--accent);
 }
 
+/* Settings + version, pinned to the bottom of the rail instead of living in
+   each mode's own topbar -- one control shared by both modes belongs in the
+   one place both modes show, not duplicated in each. */
+.mode-rail-bottom {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
 /* Both file-ops and chat mode fill whatever space the rail leaves --
    this is what `body` used to be. */
 .view {
@@ -127,6 +138,39 @@ button:disabled {
    an accent border, same signal `.mode-rail-btn.active` uses for "on". */
 .icon-btn.active {
   border-color: var(--accent);
+}
+
+/* The narration toggle overlays a 🚫 badge on the base 🎭 icon when
+   narration is hidden, so the disabled state reads at a glance rather than
+   relying on the subtle border-color change alone. */
+.narration-toggle-btn {
+  position: relative;
+}
+
+.narration-badge {
+  display: none;
+  position: absolute;
+  bottom: 1px;
+  right: 1px;
+  font-size: 9px;
+  line-height: 1;
+}
+
+.narration-toggle-btn.active .narration-badge {
+  display: inline;
+}
+
+.vision-status {
+  font-size: 14px;
+  padding: 0 4px;
+}
+
+.vision-status.vision-ok {
+  color: var(--accent);
+}
+
+.vision-status.vision-off {
+  color: var(--muted);
 }
 
 .chat-log {
@@ -474,6 +518,36 @@ dialog .explain.warn {
   border-bottom-color: var(--accent);
 }
 
+/* Rules/Commands, nested one level inside the File Operations tab -- same
+   idea as `.tabs`/`.tab-btn` but visually smaller and set off with a top
+   margin, so it doesn't read as another top-level tab row. */
+.subtabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin: 18px 0 12px;
+}
+
+.subtab-btn {
+  background: none;
+  border: none;
+  border-radius: 0;
+  border-bottom: 2px solid transparent;
+  padding: 4px 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.subtab-btn:hover {
+  background: none;
+  color: var(--text);
+}
+
+.subtab-btn.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
 dialog .cmd {
   background: #0f1116;
   border: 1px solid var(--border);
@@ -510,9 +584,10 @@ dialog .cmd {
 }
 
 .app-version {
-  margin-right: auto;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 10px;
+  line-height: 1.2;
+  text-align: center;
 }
 
 #approveBtn {
@@ -540,7 +615,8 @@ dialog .cmd {
 #settingsDialog label,
 #addPathDialog label,
 #newPersonaDialog label,
-#renameSessionDialog label {
+#renameSessionDialog label,
+#rulesetDialog label {
   display: block;
   margin: 12px 0 4px;
   color: var(--muted);
@@ -556,7 +632,9 @@ dialog .cmd {
 #addPathDialog textarea,
 #newPersonaDialog input[type="text"],
 #newPersonaDialog textarea,
-#renameSessionDialog input[type="text"] {
+#renameSessionDialog input[type="text"],
+#rulesetDialog select,
+#rulesetDialog textarea {
   width: 100%;
   background: #0f1116;
   color: var(--text);
@@ -564,6 +642,21 @@ dialog .cmd {
   border-radius: 6px;
   padding: 8px 10px;
   font: inherit;
+}
+
+/* The shorthand `background` above resets the base `select` rule's
+   gradient-drawn dropdown arrow -- restore just that piece, plus the extra
+   right padding it needs, without touching the width:100%/border/etc. above. */
+#rulesetDialog select {
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position:
+    calc(100% - 17px) center,
+    calc(100% - 12px) center;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 28px;
 }
 
 fieldset {
@@ -649,6 +742,7 @@ legend {
 
 .path-row {
   display: flex;
+  align-items: center;
   gap: 6px;
 }
 
@@ -680,12 +774,29 @@ legend {
 
 /* --- Chat mode --- */
 
+/* The native widget's own theming otherwise ignores our padding/line-height
+   and renders taller than a button -- which is what made chat mode's
+   topbar (the only one with a <select>) visibly taller than file-ops'.
+   Stripping the native appearance puts height fully under our control, at
+   the cost of drawing our own dropdown arrow (two small gradient
+   triangles, no image asset needed). */
 select {
-  background: #0f1116;
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background-color: #0f1116;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position:
+    calc(100% - 17px) center,
+    calc(100% - 12px) center;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 6px 10px;
+  padding: 6px 28px 6px 10px;
   font: inherit;
 }
 
@@ -846,9 +957,9 @@ select {
   margin: 8px 0 0;
 }
 
-/* Roleplay text split into alternating blocks: *action/narration* gets its
-   own line (italic, muted, matching `.chat-thinking-content`'s color),
-   spoken dialogue stays plain -- separated by a blank line rather than any
+/* Roleplay text scanned for explicit `//action/narration//` and
+   `||dialogue||` pairs: narration gets its own line (italic, accent cyan),
+   dialogue stays plain -- separated by a blank line rather than any
    border/indent, closer to how it'd read in prose. Applies to both sides of
    the conversation -- see `renderChatText` in main.js. */
 .chat-action,
@@ -868,5 +979,5 @@ select {
 
 .chat-action {
   font-style: italic;
-  color: var(--muted);
+  color: var(--accent);
 }
