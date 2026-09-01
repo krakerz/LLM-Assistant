@@ -123,6 +123,12 @@ button:disabled {
   padding: 6px 10px;
 }
 
+/* Quick-toggle buttons in a topbar (currently just narration visibility) --
+   an accent border, same signal `.mode-rail-btn.active` uses for "on". */
+.icon-btn.active {
+  border-color: var(--accent);
+}
+
 .chat-log {
   flex: 1;
   overflow-y: auto;
@@ -300,7 +306,10 @@ details.bubble.thinking > .bubble.assistant {
   font-family: inherit;
 }
 
-.bubble.assistant code {
+/* Not `.bubble.assistant` only -- chat mode's user bubbles run through the
+   same `renderChatText` and can contain the same inline code/fences. */
+.bubble.assistant code,
+.bubble.user code {
   background: #0f1116;
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -309,7 +318,8 @@ details.bubble.thinking > .bubble.assistant {
   font-size: 0.9em;
 }
 
-.bubble.assistant pre.md-code {
+.bubble.assistant pre.md-code,
+.bubble.user pre.md-code {
   background: #0f1116;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -318,7 +328,8 @@ details.bubble.thinking > .bubble.assistant {
   margin: 8px 0;
 }
 
-.bubble.assistant pre.md-code code {
+.bubble.assistant pre.md-code code,
+.bubble.user pre.md-code code {
   background: none;
   border: none;
   padding: 0;
@@ -833,4 +844,29 @@ select {
   font-size: 0.9em;
   color: var(--muted);
   margin: 8px 0 0;
+}
+
+/* Roleplay text split into alternating blocks: *action/narration* gets its
+   own line (italic, muted, matching `.chat-thinking-content`'s color),
+   spoken dialogue stays plain -- separated by a blank line rather than any
+   border/indent, closer to how it'd read in prose. Applies to both sides of
+   the conversation -- see `renderChatText` in main.js. */
+.chat-action,
+.chat-dialogue {
+  margin: 10px 0;
+}
+
+.chat-action:first-child,
+.chat-dialogue:first-child {
+  margin-top: 0;
+}
+
+.chat-action:last-child,
+.chat-dialogue:last-child {
+  margin-bottom: 0;
+}
+
+.chat-action {
+  font-style: italic;
+  color: var(--muted);
 }

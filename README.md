@@ -93,13 +93,14 @@ Linux namespaces with no equivalent on Windows/macOS yet.
 ## Building
 
 ```sh
-cargo install tauri-cli --version "^2"   # once
-cargo tauri build --bundles deb          # produces the binary + a .deb
+cargo install tauri-cli --version "^2"     # once
+cargo tauri build --bundles deb,appimage   # produces the binary + a .deb and an AppImage
 ```
 
 `cargo tauri dev` runs it with live reload. See `CLAUDE.md` for the full
-command reference, including a known `--bundles appimage` caveat on very
-new/rolling-release distros.
+command reference, including a known `--bundles appimage` caveat (`strip`
+choking on newer binutils' `.relr.dyn` sections; prefix `NO_STRIP=true`) on
+very new/rolling-release distros.
 
 ## Usage
 

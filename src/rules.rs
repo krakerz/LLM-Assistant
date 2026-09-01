@@ -120,6 +120,36 @@ want remembered, not just what changed -- anything you leave out is gone. It is 
 user as part of your reply, so don't reference it as if they can see it. If nothing needs to \
 change, you don't need to include one at all.";
 
+/// Forces every reply into the same narration/dialogue split
+/// `ui/main.js`'s `renderChatText` renders as separate blocks (see the
+/// "Roleplay text formatting" note in the project `CLAUDE.md`) -- most
+/// models don't write this way on their own, so without an explicit
+/// instruction a reply comes back as one plain paragraph and there's
+/// nothing for the renderer to split; the visual feature is only as good as
+/// the model actually producing the markers. Always sent in chat mode, same
+/// reasoning and no off-switch as `CHAT_PROTOCOL_PROMPT` -- this is how the
+/// app displays every reply, not a style the model is free to skip.
+///
+/// Also states whose POV narration is describing, added after a real
+/// session where "you" narration read as the persona's own action rather
+/// than the real person's -- with no rule pinning "you" to one side, a
+/// model can drift into using it for either. "You" is reserved for the real
+/// human, never the persona itself, so a reader is never left guessing who
+/// is doing what.
+pub const CHAT_NARRATION_PROMPT: &str = "Write your replies as an alternation of spoken dialogue \
+and physical narration, like a script. Wrap any narration -- an action, a gesture, a description \
+of the scene, anything that isn't actually being spoken aloud -- in a single pair of asterisks on \
+one line, for example: *she leans back and crosses her arms*. Keep each asterisk pair on one \
+line; never let one span multiple lines. Leave dialogue as plain text -- no asterisks, no \
+quotation marks needed. Use this format for every reply, even a short one, and even if it isn't \
+your default style.\n\n\
+Be unambiguous about whose action or perspective each piece of narration describes. \"You\" \
+always means the real person you're talking to -- the human actually typing, never yourself or \
+your own character. Narrate your own character's actions in the third person by name (or first \
+person \"I\" in dialogue), never as \"you\". For example: *Elara leans back and smiles* for your \
+own character's action, and *You unzip the satchel* only when narrating something the real \
+person did or is doing.";
+
 /// The read side of `PROTOCOL_PROMPT`'s fence contract. Only an
 /// explicitly-tagged fence counts, matching `parseAssistantReply` in
 /// `ui/main.js`: a plain ``` fence is the model showing text.
@@ -402,11 +432,11 @@ pub fn build_system_content(
     out
 }
 
-/// Chat mode's whole system message: the mechanical `CHAT_PROTOCOL_PROMPT`,
-/// then the persona's own content (if one is loaded), then the session's
-/// current ` ```state ` snapshot (if it's ever written one). No root note,
-/// no rules.md/command-rules.md -- those are operation-mode concepts with
-/// nothing to say here.
+/// Chat mode's whole system message: the mechanical `CHAT_PROTOCOL_PROMPT`
+/// and `CHAT_NARRATION_PROMPT`, then the persona's own content (if one is
+/// loaded), then the session's current ` ```state ` snapshot (if it's ever
+/// written one). No root note, no rules.md/command-rules.md -- those are
+/// operation-mode concepts with nothing to say here.
 ///
 /// `state` is capped at `state_max_tokens` (0 = no cap) with an explicit
 /// truncation note, same reasoning as `memory::build_block`'s cap: this goes
@@ -418,6 +448,8 @@ pub fn build_chat_system_content(
     state_max_tokens: u32,
 ) -> String {
     let mut out = CHAT_PROTOCOL_PROMPT.to_string();
+    out.push_str("\n\n");
+    out.push_str(CHAT_NARRATION_PROMPT);
     if let Some(persona) = persona {
         out.push_str("\n\n");
         out.push_str(persona);
@@ -558,8 +590,16 @@ mod tests {
     fn build_chat_system_content_includes_persona_and_state() {
         let out = build_chat_system_content(Some("You are Aria, a shopkeeper."), "HP: 90", 0);
         assert!(out.contains(CHAT_PROTOCOL_PROMPT));
+        assert!(out.contains(CHAT_NARRATION_PROMPT));
         assert!(out.contains("You are Aria, a shopkeeper."));
         assert!(out.contains("HP: 90"));
+    }
+
+    #[test]
+    fn build_chat_system_content_always_includes_the_narration_prompt() {
+        // No persona, no state -- there's still no off-switch for this one.
+        let out = build_chat_system_content(None, "", 0);
+        assert!(out.contains(CHAT_NARRATION_PROMPT));
     }
 
     #[test]

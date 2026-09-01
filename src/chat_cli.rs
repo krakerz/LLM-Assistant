@@ -103,7 +103,12 @@ async fn run_async(opts: Options) -> i32 {
     for m in &history {
         match m.role.as_str() {
             "user" => println!("\n>>> {}", m.content),
-            "assistant" => println!("\n{}", to_plain_text(&m.content)),
+            "assistant" => {
+                if let Some(t) = &m.thinking {
+                    println!("\n🧠 {}", to_plain_text(t));
+                }
+                println!("\n{}", to_plain_text(&m.content));
+            }
             _ => {}
         }
     }

@@ -83,6 +83,25 @@ pub struct AppConfig {
     /// and never shown, not that the model stops producing it.
     #[serde(default = "default_chat_show_thinking")]
     pub chat_show_thinking: bool,
+    /// Whether a shown thinking block is written into `history.json` (on the
+    /// assistant `ChatMessage`, alongside `content`) rather than only ever
+    /// existing for the one live turn. Off by default -- reasoning text can
+    /// be long, most of it isn't worth keeping once read, and the default
+    /// keeps every existing session file exactly the shape it already is.
+    /// Has no effect if `chat_show_thinking` is off; a persisted block is
+    /// never re-sent to the model (`llm::to_wire` only reads `content`/
+    /// `images`), it's display-only, same as showing it live already was.
+    #[serde(default = "default_chat_persist_thinking")]
+    pub chat_persist_thinking: bool,
+    /// Client-side display only -- the model is still always told to write
+    /// `*narration*` this way (`rules::CHAT_NARRATION_PROMPT` has no
+    /// off-switch of its own), this just controls whether `ui/main.js`'s
+    /// `renderChatText` shows those blocks or drops them from the rendered
+    /// bubble entirely. Off by default (narration shown, styled and
+    /// separated from dialogue); on hides it completely, for someone who
+    /// only wants the spoken lines.
+    #[serde(default = "default_chat_hide_narration")]
+    pub chat_hide_narration: bool,
 }
 
 fn default_confirm_fade_after() -> u32 {
@@ -103,6 +122,14 @@ fn default_chat_state_max_tokens() -> u32 {
 
 fn default_chat_show_thinking() -> bool {
     true
+}
+
+fn default_chat_persist_thinking() -> bool {
+    false
+}
+
+fn default_chat_hide_narration() -> bool {
+    false
 }
 
 fn default_max_context_tokens() -> u32 {
@@ -138,6 +165,8 @@ impl Default for AppConfig {
             memory_max_tokens: default_memory_max_tokens(),
             chat_state_max_tokens: default_chat_state_max_tokens(),
             chat_show_thinking: default_chat_show_thinking(),
+            chat_persist_thinking: default_chat_persist_thinking(),
+            chat_hide_narration: default_chat_hide_narration(),
         }
     }
 }

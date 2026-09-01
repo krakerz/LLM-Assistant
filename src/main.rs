@@ -97,9 +97,18 @@ fn init_logging() {
 
 /// Uses the non-blocking `pick_folder` callback API on purpose:
 /// `blocking_pick_folder()` inside a Tauri command deadlocks the picker.
+///
+/// `.set_parent(&window)` ties the native GTK file chooser to the main
+/// window -- without it, the window manager has no relationship between the
+/// two, and the picker can end up opening behind the app instead of on top
+/// of it.
 async fn pick_folder_path(app: &AppHandle) -> Result<Option<PathBuf>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog().file().pick_folder(move |folder| {
+    let mut builder = app.dialog().file();
+    if let Some(window) = app.get_webview_window("main") {
+        builder = builder.set_parent(&window);
+    }
+    builder.pick_folder(move |folder| {
         let _ = tx.send(folder);
     });
     let picked = rx.await.map_err(|e| {
@@ -534,12 +543,13 @@ fn list_personas() -> Result<Vec<persona::PersonaSummary>, String> {
 #[tauri::command]
 async fn pick_persona_file(app: AppHandle) -> Result<Option<String>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
-        .file()
-        .add_filter("Markdown", &["md"])
-        .pick_file(move |file| {
-            let _ = tx.send(file);
-        });
+    let mut builder = app.dialog().file().add_filter("Markdown", &["md"]);
+    if let Some(window) = app.get_webview_window("main") {
+        builder = builder.set_parent(&window);
+    }
+    builder.pick_file(move |file| {
+        let _ = tx.send(file);
+    });
     let picked = rx.await.map_err(|e| e.to_string())?;
     Ok(picked.map(|p| p.to_string()))
 }
@@ -557,6 +567,16 @@ fn save_new_persona(name: String, content: String) -> Result<persona::PersonaSum
 #[tauri::command]
 fn delete_persona(name: String) -> Result<(), String> {
     persona::delete_persona(&name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_persona_content(name: String) -> Result<String, String> {
+    persona::load_persona(&name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn update_persona(name: String, content: String) -> Result<(), String> {
+    persona::update_persona(&name, &content).map_err(|e| e.to_string())
 }
 
 // --- Chat mode: sessions ---
@@ -884,6 +904,8 @@ fn main() {
             import_persona,
             save_new_persona,
             delete_persona,
+            get_persona_content,
+            update_persona,
             list_chat_sessions,
             create_chat_session,
             load_chat_session,

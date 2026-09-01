@@ -15,6 +15,12 @@ pub struct ChatMessage {
     pub content: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    /// Chat mode only, and only when `AppConfig.chat_persist_thinking` is on
+    /// -- the model's own reasoning for this reply, kept purely for display
+    /// (a completed session's "Thinking" disclosure survives reopening it).
+    /// Never read by `to_wire` below, so it's never re-sent to the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 impl ChatMessage {
@@ -23,6 +29,7 @@ impl ChatMessage {
             role: role.into(),
             content: content.into(),
             images: Vec::new(),
+            thinking: None,
         }
     }
 }
