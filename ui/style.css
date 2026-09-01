@@ -628,6 +628,7 @@ dialog .cmd {
 #settingsDialog input[type="number"],
 #settingsDialog input[type="password"],
 #settingsDialog textarea,
+#settingsDialog select,
 #addPathDialog input[type="text"],
 #addPathDialog textarea,
 #newPersonaDialog input[type="text"],
@@ -647,6 +648,7 @@ dialog .cmd {
 /* The shorthand `background` above resets the base `select` rule's
    gradient-drawn dropdown arrow -- restore just that piece, plus the extra
    right padding it needs, without touching the width:100%/border/etc. above. */
+#settingsDialog select,
 #rulesetDialog select {
   background-image:
     linear-gradient(45deg, transparent 50%, var(--muted) 50%),
@@ -933,11 +935,20 @@ select {
   font-size: 11px;
 }
 
-.chat-attachment-thumb {
+.chat-attachment-thumb,
+.chat-generated-image {
   max-width: 220px;
   border-radius: 8px;
   display: block;
   margin-top: 6px;
+}
+
+.comfy-test-image {
+  max-width: 300px;
+  border-radius: 8px;
+  display: block;
+  margin-top: 10px;
+  border: 1px solid var(--border);
 }
 
 .chat-attachment-note {

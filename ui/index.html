@@ -160,6 +160,7 @@
       <button type="button" class="tab-btn active" data-tab="general">General</button>
       <button type="button" class="tab-btn" data-tab="chat">Chat</button>
       <button type="button" class="tab-btn" data-tab="fileops">File Operations</button>
+      <button type="button" class="tab-btn" data-tab="imagegen">Image Gen</button>
     </div>
 
     <div class="tab-panel" data-panel="general">
@@ -287,6 +288,73 @@
         </label>
         <button id="resetCommandRulesBtn" type="button" class="link-btn">Reset to default</button>
       </div>
+    </div>
+
+    <div class="tab-panel" data-panel="imagegen" hidden>
+      <p class="explain">
+        Generates images through ComfyUI when the model requests one (see the
+        "image-generation-prompt" ruleset, the 🧩 button in chat mode). Paste an API-format workflow
+        exported from ComfyUI's own UI, then map the fields below to wherever they live in it --
+        everything else in the workflow stays exactly as you set it up there.
+      </p>
+      <label>ComfyUI base URL
+        <input id="cfgComfyBaseUrl" type="text" placeholder="http://127.0.0.1:8188" />
+      </label>
+      <label>Workflow JSON (API format -- ComfyUI's "Export (API)", not the regular workflow export)
+        <textarea id="cfgComfyWorkflowJson" rows="10" placeholder="Paste the exported JSON here…"></textarea>
+      </label>
+
+      <fieldset>
+        <legend>Field mapping</legend>
+        <p class="explain">
+          Each dropdown lists the actual fields found in the workflow JSON above -- pick which one
+          each row controls. Node numbers vary between workflow exports, so you never need to type
+          one yourself; re-paste a different workflow above and these repopulate from it.
+        </p>
+        <label>Checkpoint / model
+          <select id="cfgComfyMapCheckpoint"></select>
+        </label>
+        <label>Positive prompt
+          <select id="cfgComfyMapPositive"></select>
+        </label>
+        <label>Negative prompt
+          <select id="cfgComfyMapNegative"></select>
+        </label>
+        <label>Width
+          <select id="cfgComfyMapWidth"></select>
+        </label>
+        <label>Height
+          <select id="cfgComfyMapHeight"></select>
+        </label>
+        <label>Sampler
+          <select id="cfgComfyMapSampler"></select>
+        </label>
+        <label>Scheduler
+          <select id="cfgComfyMapScheduler"></select>
+        </label>
+        <label>CFG scale
+          <select id="cfgComfyMapCfg"></select>
+        </label>
+        <label>Steps
+          <select id="cfgComfyMapSteps"></select>
+        </label>
+      </fieldset>
+
+      <label>Save generated images to
+        <div class="path-row">
+          <input id="cfgComfyOutputDir" type="text" placeholder="/absolute/path" />
+          <button id="cfgComfyOutputDirBrowseBtn" type="button">Browse…</button>
+        </div>
+      </label>
+      <label>Filename pattern (available placeholders: <code>{session}</code>, <code>{timestamp}</code>)
+        <input id="cfgComfyFilenamePattern" type="text" placeholder="{session}-{timestamp}" />
+      </label>
+
+      <div class="path-row">
+        <button id="testComfyGenerationBtn" type="button">Test image generation</button>
+        <span id="testComfyGenerationResult" class="explain"></span>
+      </div>
+      <img id="testComfyGenerationImg" class="comfy-test-image" hidden />
     </div>
 
     <div class="dialog-actions">

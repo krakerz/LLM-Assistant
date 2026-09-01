@@ -1,6 +1,6 @@
 [package]
 name = "llm-assistant"
-version = "1.10.0"
+version = "1.11.0"
 description = "Chat-driven local file assistant, sandboxed to a chosen folder"
 edition = "2021"
 rust-version = "1.77"
@@ -23,6 +23,7 @@ shell-words = "1"
 log = "0.4"
 simplelog = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+base64 = "0.22"
 
 [[bin]]
 name = "llm-assistant"

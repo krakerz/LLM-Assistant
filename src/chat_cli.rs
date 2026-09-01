@@ -154,13 +154,18 @@ async fn run_async(opts: Options) -> i32 {
                 }
                 println!("\n{}", to_plain_text(&outcome.reply));
                 if outcome.state_updated {
-                    println!("\n[persistent state updated]");
+                    println!("\n[memories updated]");
                 }
                 if let Some(name) = &outcome.ruleset_loaded {
                     println!("\n[loaded ruleset: {name}]");
                 }
                 if let Some(err) = &outcome.ruleset_error {
                     println!("\n[{err}]");
+                }
+                if outcome.image_prompt_requested.is_some() {
+                    println!(
+                        "\n[requested an image -- generation only happens through the GUI, not this CLI]"
+                    );
                 }
                 if let Some(summary) = &outcome.summary {
                     eprintln!(
