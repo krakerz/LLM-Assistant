@@ -107,6 +107,19 @@ pub fn load_ruleset(name: &str) -> anyhow::Result<String> {
     Ok(fs::read_to_string(ruleset_path(name))?)
 }
 
+/// Overwrites an existing ruleset's content -- the ruleset editor's save,
+/// same reasoning as `persona::update_persona`. Errors if `name` doesn't
+/// match an existing ruleset rather than creating one, since the editor
+/// only ever offers names `list_rulesets` already returned.
+pub fn update_ruleset(name: &str, content: &str) -> anyhow::Result<()> {
+    let dest = ruleset_path(name);
+    if !dest.exists() {
+        anyhow::bail!("no ruleset named \"{name}\" to edit");
+    }
+    fs::write(&dest, content)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +161,25 @@ mod tests {
         let dir = scratch("load");
         list_rulesets().unwrap(); // seeds the two default files
         assert_eq!(load_ruleset("other-tools").unwrap(), SEED_OTHER_TOOLS);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_overwrites_a_seeded_rulesets_content() {
+        let dir = scratch("update");
+        list_rulesets().unwrap(); // seeds the two default files
+        update_ruleset("other-tools", "SearXNG URL: http://localhost:8080").unwrap();
+        assert_eq!(
+            load_ruleset("other-tools").unwrap(),
+            "SearXNG URL: http://localhost:8080"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_refuses_a_name_that_does_not_exist() {
+        let dir = scratch("update-missing");
+        assert!(update_ruleset("ghost", "x").is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 

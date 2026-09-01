@@ -580,6 +580,28 @@ fn update_persona(name: String, content: String) -> Result<(), String> {
     persona::update_persona(&name, &content).map_err(|e| e.to_string())
 }
 
+// --- Chat mode: rulesets ---
+//
+// Editing only, not full CRUD like personas -- the two rulesets are seeded
+// by `ruleset::list_rulesets` itself, so there's no "new"/"import"/"delete"
+// to expose; this just lets the user edit their content without opening the
+// `.md` files by hand.
+
+#[tauri::command]
+fn list_rulesets() -> Result<Vec<ruleset::RulesetSummary>, String> {
+    ruleset::list_rulesets().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_ruleset_content(name: String) -> Result<String, String> {
+    ruleset::load_ruleset(&name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn update_ruleset(name: String, content: String) -> Result<(), String> {
+    ruleset::update_ruleset(&name, &content).map_err(|e| e.to_string())
+}
+
 // --- Chat mode: sessions ---
 
 #[tauri::command]
@@ -919,6 +941,9 @@ fn main() {
             delete_persona,
             get_persona_content,
             update_persona,
+            list_rulesets,
+            get_ruleset_content,
+            update_ruleset,
             list_chat_sessions,
             create_chat_session,
             load_chat_session,

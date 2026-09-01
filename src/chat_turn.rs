@@ -103,7 +103,7 @@ pub async fn run_chat_turn(
         &cfg.endpoint,
         &cfg.model,
         &cfg.api_key,
-        cfg.temperature,
+        cfg.chat_temperature,
         &messages,
     )
     .await?;

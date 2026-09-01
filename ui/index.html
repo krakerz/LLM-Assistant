@@ -9,11 +9,11 @@
 <body>
   <div class="app-shell">
     <nav id="modeRail" class="mode-rail">
-      <button id="fileOpsModeBtn" class="mode-rail-btn active" title="File Operations">📁</button>
-      <button id="chatModeBtn" class="mode-rail-btn" title="Chat">💬</button>
+      <button id="chatModeBtn" class="mode-rail-btn active" title="Chat">💬</button>
+      <button id="fileOpsModeBtn" class="mode-rail-btn" title="File Operations">📁</button>
     </nav>
 
-    <div id="fileOpsView" class="view">
+    <div id="fileOpsView" class="view" hidden>
       <header class="topbar">
         <button id="pickBtn">Select Folder…</button>
         <span id="rootPath" class="root-path">No folder selected</span>
@@ -32,7 +32,7 @@
       </form>
     </div>
 
-    <div id="chatModeView" class="view" hidden>
+    <div id="chatModeView" class="view">
       <header class="topbar">
         <select id="personaSelect" title="Persona">
           <option value="">(no persona)</option>
@@ -41,6 +41,7 @@
         <button id="newPersonaBtn" class="icon-btn" title="Write a new persona">＋</button>
         <button id="editPersonaBtn" class="icon-btn" title="Edit the selected persona">✎</button>
         <button id="deletePersonaBtn" class="icon-btn" title="Delete the selected persona">🗑</button>
+        <button id="editRulesetsBtn" class="icon-btn" title="Edit rulesets (tool/capability reference docs the model can request mid-chat)">🧩</button>
         <span class="root-path" style="flex:1"></span>
         <span id="visionStatusIndicator" class="vision-status" title="Vision support: not yet checked"></span>
         <button id="viewStateBtn" class="icon-btn" title="View this chat's remembered state">🗒️</button>
@@ -71,7 +72,7 @@
               hidden
             />
             <button type="button" id="chatAttachBtn" class="icon-btn" title="Attach an image or text file">📎</button>
-            <textarea id="chatModeInput" placeholder="Message… (Enter to send, Shift+Enter for newline)" rows="2"></textarea>
+            <textarea id="chatModeInput" placeholder="Message… (Enter to send, Shift+Enter for newline; use // action // for narration)" rows="2"></textarea>
             <button type="submit" id="chatModeSendBtn">Send</button>
           </form>
         </div>
@@ -101,6 +102,24 @@
     <div class="dialog-actions">
       <button id="renameSessionCancelBtn" type="button">Cancel</button>
       <button id="renameSessionSaveBtn" type="button">Save</button>
+    </div>
+  </dialog>
+
+  <dialog id="rulesetDialog">
+    <h3>Edit rulesets</h3>
+    <p class="explain">
+      Reference docs the model isn't shown by default -- only their names -- and pulls into the
+      conversation itself when a task needs one. Edit them here instead of the files directly.
+    </p>
+    <label>Ruleset
+      <select id="rulesetSelect"></select>
+    </label>
+    <label>Content
+      <textarea id="rulesetContent" rows="12"></textarea>
+    </label>
+    <div class="dialog-actions">
+      <button id="rulesetCloseBtn" type="button">Close</button>
+      <button id="rulesetSaveBtn" type="button">Save</button>
     </div>
   </dialog>
 
@@ -137,8 +156,8 @@
 
     <div class="tabs">
       <button type="button" class="tab-btn active" data-tab="general">General</button>
-      <button type="button" class="tab-btn" data-tab="rules">Rules</button>
-      <button type="button" class="tab-btn" data-tab="commands">Commands</button>
+      <button type="button" class="tab-btn" data-tab="chat">Chat</button>
+      <button type="button" class="tab-btn" data-tab="fileops">File Operations</button>
     </div>
 
     <div class="tab-panel" data-panel="general">
@@ -155,37 +174,33 @@
         <button id="testConnectionBtn" type="button">Test connection</button>
         <span id="testConnectionResult" class="explain"></span>
       </div>
+      <label>Context budget in tokens (once a turn would exceed this, finished command steps are condensed to just the command and its output, and beyond that the oldest turns are dropped; 0 = never trim). Rough estimate, not a real tokenizer — leave headroom under your model's actual limit. Shared by both modes below.
+        <input id="cfgMaxContextTokens" type="number" step="500" min="0" />
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="cfgSummarizeBeforeDropping" />
+        Summarize old turns instead of dropping them, when condensing isn't enough. Off by default
+        on purpose: the summary is written by this same model and then becomes the record it works
+        from, so a wrong one is worse than an honest gap. It's shown in the chat and you can edit it
+        there — read it when it appears. Costs one extra request per turn while over budget. Shared
+        by both modes below.
+      </label>
+    </div>
+
+    <div class="tab-panel" data-panel="chat" hidden>
       <p class="explain">
         Vision support is checked automatically (once) the first time you send a chat message —
         see the indicator next to the narration toggle in chat mode.
       </p>
       <label>Temperature
-        <input id="cfgTemperature" type="number" step="0.1" min="0" max="2" />
+        <input id="cfgChatTemperature" type="number" step="0.1" min="0" max="2" />
       </label>
-      <label>Max automatic steps (propose → run → respond cycles before it waits for you; 0 = no limit)
-        <input id="cfgMaxAutoSteps" type="number" step="1" min="0" />
-      </label>
-      <label>Context budget in tokens (once a turn would exceed this, finished command steps are condensed to just the command and its output, and beyond that the oldest turns are dropped; 0 = never trim). Rough estimate, not a real tokenizer — leave headroom under your model's actual limit.
-        <input id="cfgMaxContextTokens" type="number" step="500" min="0" />
-      </label>
-
-      <label class="checkbox-row">
-        <input type="checkbox" id="cfgMemoryEnabled" />
-        Keep a session record (what you asked for, what the folder looked like, every command that
-        actually ran and its exit code) and include it with each turn. Written by the app from what
-        it observed, never by the model, and it survives context trimming — so a long chain can
-        still tell what has and hasn't been done. Turn it off for a model with a small context
-        window, where the tokens are better spent on the conversation.
-      </label>
-      <label>Token budget for that record (recommended: about a tenth of the context budget above — 800 suits the default 8000; 0 = no cap). It goes in the system block, which is never trimmed, so this is the only thing keeping it in check.
-        <input id="cfgMemoryMaxTokens" type="number" step="100" min="0" />
-      </label>
-      <label>Chat mode's persistent-state budget (same reasoning, different feature — a chat session's saved state also sits in the system block every turn; 0 = no cap).
+      <label>Chat mode's persistent-state budget (a chat session's saved state sits in the system block every turn, same reasoning as file operations' session record; 0 = no cap).
         <input id="cfgChatStateMaxTokens" type="number" step="100" min="0" />
       </label>
       <label class="checkbox-row">
         <input type="checkbox" id="cfgChatShowThinking" />
-        In chat mode, show a model's own reasoning if it wraps any in a
+        Show a model's own reasoning if it wraps any in a
         <code>&lt;think&gt;</code> tag, collapsed under a "Thinking" disclosure. Off just hides it
         (some models emit it regardless) — it never stops the model from thinking, just from
         showing you.
@@ -196,18 +211,30 @@
         restarting the app) still shows it. Off by default — otherwise it's only visible for the
         turn it arrived on. Has no effect if the option above is off.
       </label>
+    </div>
 
+    <div class="tab-panel" data-panel="fileops" hidden>
+      <label>Temperature
+        <input id="cfgTemperature" type="number" step="0.1" min="0" max="2" />
+      </label>
+      <label>Max automatic steps (propose → run → respond cycles before it waits for you; 0 = no limit)
+        <input id="cfgMaxAutoSteps" type="number" step="1" min="0" />
+      </label>
       <label class="checkbox-row">
-        <input type="checkbox" id="cfgSummarizeBeforeDropping" />
-        Summarize old turns instead of dropping them, when condensing isn't enough. Off by default
-        on purpose: the summary is written by this same model and then becomes the record it works
-        from, so a wrong one is worse than an honest gap. It's shown in the chat and you can edit it
-        there — read it when it appears. Costs one extra request per turn while over budget.
+        <input type="checkbox" id="cfgMemoryEnabled" />
+        Keep a session record (what you asked for, what the folder looked like, every command that
+        actually ran and its exit code) and include it with each turn. Written by the app from what
+        it observed, never by the model, and it survives context trimming — so a long chain can
+        still tell what has and hasn't been done. Turn it off for a model with a small context
+        window, where the tokens are better spent on the conversation.
+      </label>
+      <label>Token budget for that record (recommended: about a tenth of the context budget in General — 800 suits the default 8000; 0 = no cap). It goes in the system block, which is never trimmed, so this is the only thing keeping it in check.
+        <input id="cfgMemoryMaxTokens" type="number" step="100" min="0" />
       </label>
       <label>Stop asking about a program after this many approvals in one session (0 = always ask). Session-only — it resets when the app closes or you open a different folder, and one denial puts that program back to always-asking.
         <input id="cfgConfirmFadeAfter" type="number" step="1" min="0" />
       </label>
-      <label>System prompt (persona/focus -- behavior and command mechanics live in their own tabs)
+      <label>System prompt (persona/focus -- behavior and command mechanics live in the Rules/Commands tabs below)
         <textarea id="cfgSystemPrompt" rows="4"></textarea>
       </label>
       <button id="resetPromptBtn" type="button" class="link-btn">Reset to default</button>
@@ -229,30 +256,35 @@
         <legend>Always-allowed programs</legend>
         <ul id="autoApproveList" class="auto-approve-list"></ul>
       </fieldset>
-    </div>
 
-    <div class="tab-panel" data-panel="rules" hidden>
-      <p class="explain">
-        General behavior: identity, honesty about uncertainty, re-verifying stale info, searching
-        before guessing. Read before your system prompt, on every turn. Shell mechanics (command
-        format, quoting, sudo handling, etc.) live in the Commands tab instead.
-      </p>
-      <label>General rules
-        <textarea id="cfgGeneralRules" rows="14"></textarea>
-      </label>
-      <button id="resetGeneralRulesBtn" type="button" class="link-btn">Reset to default</button>
-    </div>
+      <div class="subtabs">
+        <button type="button" class="subtab-btn active" data-subtab="rules">Rules</button>
+        <button type="button" class="subtab-btn" data-subtab="commands">Commands</button>
+      </div>
 
-    <div class="tab-panel" data-panel="commands" hidden>
-      <p class="explain">
-        The shell-mechanics half: command format, quoting, confirmation behavior, sudo handling,
-        mv/cp argument syntax. Edit it if you know what you're changing -- most customization belongs
-        in the system prompt or General rules instead.
-      </p>
-      <label>Command rules
-        <textarea id="cfgCommandRules" rows="14"></textarea>
-      </label>
-      <button id="resetCommandRulesBtn" type="button" class="link-btn">Reset to default</button>
+      <div class="subtab-panel" data-subpanel="rules">
+        <p class="explain">
+          General behavior: identity, honesty about uncertainty, re-verifying stale info, searching
+          before guessing. Read before your system prompt, on every turn. Shell mechanics (command
+          format, quoting, sudo handling, etc.) live in the Commands tab instead.
+        </p>
+        <label>General rules
+          <textarea id="cfgGeneralRules" rows="14"></textarea>
+        </label>
+        <button id="resetGeneralRulesBtn" type="button" class="link-btn">Reset to default</button>
+      </div>
+
+      <div class="subtab-panel" data-subpanel="commands" hidden>
+        <p class="explain">
+          The shell-mechanics half: command format, quoting, confirmation behavior, sudo handling,
+          mv/cp argument syntax. Edit it if you know what you're changing -- most customization belongs
+          in the system prompt or General rules instead.
+        </p>
+        <label>Command rules
+          <textarea id="cfgCommandRules" rows="14"></textarea>
+        </label>
+        <button id="resetCommandRulesBtn" type="button" class="link-btn">Reset to default</button>
+      </div>
     </div>
 
     <div class="dialog-actions">
