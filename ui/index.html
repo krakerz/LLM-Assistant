@@ -116,12 +116,26 @@
     <label>Ruleset
       <select id="rulesetSelect"></select>
     </label>
+    <p id="rulesetExampleRow" class="explain" hidden>
+      Blank by default, so nothing extra applies until you type something --
+      <button id="rulesetExampleBtn" type="button" class="link-btn">see an example</button>
+      of what you can put here.
+    </p>
     <label>Content
       <textarea id="rulesetContent" rows="12"></textarea>
     </label>
     <div class="dialog-actions">
       <button id="rulesetCloseBtn" type="button">Close</button>
       <button id="rulesetSaveBtn" type="button">Save</button>
+    </div>
+  </dialog>
+
+  <dialog id="rulesetExampleDialog">
+    <h3>Example</h3>
+    <p class="explain">Reference only -- this isn't written to your ruleset. Copy whatever's useful into it yourself.</p>
+    <pre id="rulesetExampleContent" class="ruleset-example-pre"></pre>
+    <div class="dialog-actions">
+      <button id="rulesetExampleCloseBtn" type="button">Close</button>
     </div>
   </dialog>
 

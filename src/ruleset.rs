@@ -96,19 +96,18 @@ pub const IMAGE_GENERATION_HINT: &str = "Use this the moment the user asks to se
 draw, create, or make an image, picture, photo, or drawing of anything -- request it \
 immediately, don't just describe what the image would look like in words instead.";
 
-/// The hint (`IMAGE_GENERATION_HINT`) and fence mechanics
-/// (`comfyui::IMAGE_PROMPT_PROTOCOL`) are both guaranteed to the *model*
-/// regardless of what this file says -- but a person editing this file
-/// through the GUI's ruleset editor never sees either of those, since
-/// they're Rust-only. Without a placeholder line for every recognized
-/// field, there'd be no way to discover that `checkpoint`/`width`/
-/// `height`/`sampler`/`scheduler`/`cfg`/`steps` can be given a standing
-/// preference too, not just `positive`/`negative`. So the seed lists all
-/// nine as delete-if-unwanted example lines, not just the two most people
-/// will actually want.
-pub const SEED_IMAGE_GENERATION_PROMPT: &str = "\
-(Delete any line you don't need -- leaving a field out entirely keeps \
-whatever value the workflow already has configured for it.)
+/// This ruleset ships *blank* -- the hint (`IMAGE_GENERATION_HINT`) and
+/// fence mechanics (`comfyui::IMAGE_PROMPT_PROTOCOL`) are both guaranteed
+/// to the *model* regardless of what the file says, so there's nothing
+/// mechanical a fresh file actually needs to contain. Writing a real
+/// template into the file by default turned out to be the wrong call
+/// though: it reads as content the user is expected to keep and prune,
+/// when really it's just documentation of what's possible. This constant
+/// is that documentation instead -- served to the ruleset editor's "see an
+/// example" popup (`get_ruleset_example`) on request, never written to
+/// disk, so the file itself stays whatever the user actually typed, blank
+/// included.
+pub const IMAGE_GENERATION_EXAMPLE: &str = "\
 - Always start `positive` with: masterpiece, best quality
 - Always include in `negative`: bad hands, blurry, watermark
 - Always use `checkpoint`: my_favorite_model.safetensors
@@ -118,7 +117,9 @@ whatever value the workflow already has configured for it.)
 - Always use `scheduler`: normal
 - Always use `cfg`: 7
 - Always use `steps`: 30
-";
+
+Any field left out keeps whatever value the workflow already has \
+configured for it -- only include the ones you actually want to fix.";
 
 pub const SEED_OTHER_TOOLS: &str = "\
 > Use this when the user asks you to search or browse the web, or mentions a tool you don't have direct instructions for.
@@ -134,25 +135,24 @@ Nothing here is wired into the app automatically; it's reference material
 for you to point the model at.
 ";
 
-/// True if `path` doesn't exist yet, or exists but has nothing but
-/// whitespace in it -- the latter covers a user clearing a ruleset's
-/// content back out through the editor, which should get the placeholder
-/// example back rather than staying blank forever.
-fn is_missing_or_empty(path: &std::path::Path) -> bool {
-    fs::read_to_string(path)
-        .map(|content| content.trim().is_empty())
-        .unwrap_or(true)
+/// Example content for the ruleset editor's "see an example" popup, if this
+/// ruleset has one -- `None` means that link/button stays hidden for it.
+/// Only `image-generation-prompt` has one today; a freeform doc like
+/// `other-tools` doesn't need a separate example since its own seed
+/// content already reads as one.
+pub fn example_for(name: &str) -> Option<&'static str> {
+    (name == IMAGE_GENERATION_RULESET_NAME).then_some(IMAGE_GENERATION_EXAMPLE)
 }
 
 pub fn list_rulesets() -> anyhow::Result<Vec<RulesetSummary>> {
     let dir = rulesets_dir();
     fs::create_dir_all(&dir)?;
-    let image_gen = ruleset_path("image-generation-prompt");
-    if is_missing_or_empty(&image_gen) {
-        fs::write(&image_gen, SEED_IMAGE_GENERATION_PROMPT)?;
+    let image_gen = ruleset_path(IMAGE_GENERATION_RULESET_NAME);
+    if !image_gen.exists() {
+        fs::write(&image_gen, "")?;
     }
     let other_tools = ruleset_path("other-tools");
-    if is_missing_or_empty(&other_tools) {
+    if !other_tools.exists() {
         fs::write(&other_tools, SEED_OTHER_TOOLS)?;
     }
 
@@ -236,10 +236,9 @@ mod tests {
                 "other-tools".to_string()
             ]
         );
-        assert_eq!(
-            load_ruleset("image-generation-prompt").unwrap(),
-            SEED_IMAGE_GENERATION_PROMPT
-        );
+        // Blank by default -- see `IMAGE_GENERATION_EXAMPLE`'s doc comment
+        // for why this one isn't pre-filled with a template.
+        assert_eq!(load_ruleset("image-generation-prompt").unwrap(), "");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -282,21 +281,13 @@ mod tests {
     }
 
     #[test]
-    fn clearing_a_seeded_ruleset_back_to_empty_restores_the_placeholder() {
-        // A user clearing a ruleset's content out through the GUI editor
-        // shouldn't be left with a permanently blank file -- since that's
-        // the only place a normal user ever sees the placeholder examples
-        // for every recognized field (the hint/protocol are Rust-only), an
-        // emptied file should get the full example back on next load.
-        let dir = scratch("reseed-on-empty");
-        list_rulesets().unwrap(); // seeds it first
-        update_ruleset(IMAGE_GENERATION_RULESET_NAME, "   \n\n").unwrap();
-        list_rulesets().unwrap();
+    fn example_for_is_only_offered_for_image_generation() {
         assert_eq!(
-            load_ruleset(IMAGE_GENERATION_RULESET_NAME).unwrap(),
-            SEED_IMAGE_GENERATION_PROMPT
+            example_for(IMAGE_GENERATION_RULESET_NAME),
+            Some(IMAGE_GENERATION_EXAMPLE)
         );
-        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(example_for("other-tools"), None);
+        assert_eq!(example_for("some-made-up-name"), None);
     }
 
     #[test]

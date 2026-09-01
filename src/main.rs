@@ -626,6 +626,13 @@ fn update_ruleset(name: String, content: String) -> Result<(), String> {
     ruleset::update_ruleset(&name, &content).map_err(|e| e.to_string())
 }
 
+/// Backs the ruleset editor's "see an example" link -- `None` (and the
+/// link stays hidden) for a ruleset with no example content of its own.
+#[tauri::command]
+fn get_ruleset_example(name: String) -> Option<String> {
+    ruleset::example_for(&name).map(|s| s.to_string())
+}
+
 // --- Chat mode: sessions ---
 
 #[tauri::command]
@@ -1047,6 +1054,7 @@ fn main() {
             list_rulesets,
             get_ruleset_content,
             update_ruleset,
+            get_ruleset_example,
             list_chat_sessions,
             create_chat_session,
             load_chat_session,

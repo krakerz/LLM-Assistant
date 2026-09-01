@@ -19,7 +19,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - Chat mode's system messages next to the narration toggle are clearer about what's actually happening: "loaded ruleset" now reads as an in-progress step rather than a finished fact (loading one is only ever a means to using it a moment later), with an explicit note when nothing further happens that turn; the image-generating placeholder now says it can take a while; "persistent state updated" is now "memories updated" (GUI and CLI)
 
 ### Added
-- The `image-generation-prompt` ruleset's seed placeholder now shows an example line for every recognized field (`checkpoint`, `width`, `height`, `sampler`, `scheduler`, `cfg`, `steps`), not just `positive`/`negative` -- the mechanical field list is otherwise Rust-only and never shown to a person editing the file through the GUI. Clearing the file back to empty through the editor restores this placeholder rather than leaving it permanently blank
+- The `image-generation-prompt` ruleset ships blank again -- a "see an example" link in the ruleset editor instead shows a reference template covering every recognized field (`checkpoint`, `width`, `height`, `sampler`, `scheduler`, `cfg`, `steps`, not just `positive`/`negative`), without writing any of it into the actual file. What you type there is entirely up to you
 - Image Gen settings: a "After generating an image, the persona should" option -- always comment on it in character (the original behavior, still the default), or decide for itself, based on how the reply just went and the session's own `state.md`, whether an in-character comment actually fits right now
 
 ### Changed

@@ -557,6 +557,18 @@ dialog .cmd {
   font-family: ui-monospace, monospace;
 }
 
+.ruleset-example-pre {
+  background: #0f1116;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  white-space: pre-wrap;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
 .checkbox-row {
   display: flex;
   align-items: flex-start;
