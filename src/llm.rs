@@ -15,6 +15,15 @@ pub struct ChatMessage {
     pub content: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    /// Local file paths (not base64 -- keeps `history.json` small) of
+    /// ComfyUI-generated images attached to this (always `assistant`)
+    /// message. Deliberately a separate field from `images` above, not a
+    /// reuse of it: `images` holds attachments *sent to* the model as
+    /// vision input, and `to_wire` below only ever reads that field --
+    /// `generated_images` must never be resent as input on a later turn the
+    /// way a user's own attachment would be.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_images: Vec<String>,
     /// Chat mode only, and only when `AppConfig.chat_persist_thinking` is on
     /// -- the model's own reasoning for this reply, kept purely for display
     /// (a completed session's "Thinking" disclosure survives reopening it).
@@ -29,6 +38,7 @@ impl ChatMessage {
             role: role.into(),
             content: content.into(),
             images: Vec::new(),
+            generated_images: Vec::new(),
             thinking: None,
         }
     }

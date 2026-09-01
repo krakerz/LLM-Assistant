@@ -4,6 +4,7 @@ mod chat_cli;
 mod chat_log;
 mod chat_session;
 mod chat_turn;
+mod comfyui;
 mod config;
 mod context;
 mod headless;
@@ -186,6 +187,29 @@ fn load_config() -> Result<AppConfig, String> {
 fn save_config(cfg: AppConfig) -> Result<(), String> {
     log::info!("save_config: endpoint={} model={}", cfg.endpoint, cfg.model);
     config::save(&cfg).map_err(|e| e.to_string())
+}
+
+/// Kept separate from `load_config`/`save_config` -- see `comfyui.rs`'s doc
+/// comment for why this lives in its own file instead of `config.toml`.
+#[tauri::command]
+fn get_comfyui_config() -> Result<comfyui::ComfyUiConfig, String> {
+    comfyui::load_or_init().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_comfyui_config(cfg: comfyui::ComfyUiConfig) -> Result<(), String> {
+    log::info!("save_comfyui_config: base_url={}", cfg.base_url);
+    comfyui::save(&cfg).map_err(|e| e.to_string())
+}
+
+/// Picker for the ComfyUI output-directory setting; same
+/// `pick_folder_path` helper `pick_granted_path` uses, doesn't touch app
+/// state.
+#[tauri::command]
+async fn pick_comfyui_output_dir(app: AppHandle) -> Result<Option<String>, String> {
+    Ok(pick_folder_path(&app)
+        .await?
+        .map(|p| p.display().to_string()))
 }
 
 /// Tests what's typed in the dialog, not what's saved. A real completion
@@ -650,6 +674,7 @@ struct SendChatMessageResult {
     state_updated: bool,
     ruleset_loaded: Option<String>,
     ruleset_error: Option<String>,
+    image_prompt_requested: Option<comfyui::ImagePromptFields>,
     dropped: usize,
     condensed: usize,
     summarized: usize,
@@ -675,12 +700,114 @@ async fn send_chat_message(
         state_updated: outcome.state_updated,
         ruleset_loaded: outcome.ruleset_loaded,
         ruleset_error: outcome.ruleset_error,
+        image_prompt_requested: outcome.image_prompt_requested,
         dropped: outcome.dropped,
         condensed: outcome.condensed,
         summarized: outcome.summarized,
         summary: outcome.summary,
         rewritten_history: outcome.rewritten_history,
     })
+}
+
+/// Settings' "Test image generation" button -- runs the real pipeline
+/// (`comfyui::generate_image`) with a trivial fixed prompt against whatever
+/// config is currently *typed* (not necessarily saved yet, same "tests what's
+/// typed" contract as `test_connection`/`test_vision_support`), and returns
+/// the actual resulting image as a `data:` URL rather than just a checkmark
+/// -- this mapping is easy to get subtly wrong (a stale node id from a
+/// previously-pasted workflow, a field mapped to the wrong node), so seeing
+/// the real output matters more here than for the other two "Test" buttons.
+#[tauri::command]
+async fn test_comfyui_generation(cfg: comfyui::ComfyUiConfig) -> Result<String, String> {
+    log::info!("test_comfyui_generation: base_url={}", cfg.base_url);
+    let fields = comfyui::ImagePromptFields {
+        positive: Some("a red circle on a white background".to_string()),
+        ..Default::default()
+    };
+    let image = comfyui::generate_image(&cfg, &fields)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mime = if image.filename.to_lowercase().ends_with(".jpg")
+        || image.filename.to_lowercase().ends_with(".jpeg")
+    {
+        "image/jpeg"
+    } else if image.filename.to_lowercase().ends_with(".webp") {
+        "image/webp"
+    } else {
+        "image/png"
+    };
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &image.bytes)
+    ))
+}
+
+/// The real image-generation path a chat turn's ` ```image-prompt``` `
+/// request goes through, once `send_chat_message` has already returned the
+/// (fast) text reply -- see `chat_turn::ChatTurnOutcome::image_prompt_requested`'s
+/// doc comment for why this is a separate, later call rather than part of
+/// that same turn.
+#[derive(serde::Serialize)]
+struct GeneratedImageResult {
+    path: String,
+    data_url: String,
+    /// The persona's in-character reaction to the image (turn 3 -- see
+    /// `chat_turn`'s module doc comment), if that call succeeded. `None`
+    /// rather than failing the whole command on a reaction error -- the
+    /// image itself already generated fine, and losing the commentary on
+    /// it isn't worth treating as an overall failure.
+    reaction: Option<String>,
+}
+
+#[tauri::command]
+async fn generate_comfyui_image(
+    session_id: String,
+    fields: comfyui::ImagePromptFields,
+) -> Result<GeneratedImageResult, String> {
+    let comfy_cfg = comfyui::load_or_init().map_err(|e| e.to_string())?;
+    let image = comfyui::generate_image(&comfy_cfg, &fields)
+        .await
+        .map_err(|e| e.to_string())?;
+    let path = comfyui::save_generated_image(&comfy_cfg, &session_id, &image)
+        .map_err(|e| e.to_string())?;
+    chat_session::append_generated_image(&session_id, &path.display().to_string())
+        .map_err(|e| e.to_string())?;
+    let data_url = comfyui::read_as_data_url(&path).map_err(|e| e.to_string())?;
+
+    let reaction = match config::load_or_init() {
+        Ok(cfg) => {
+            let positive = fields.positive.as_deref().unwrap_or("an image");
+            match chat_turn::run_image_reaction_turn(&cfg, &session_id, positive, &data_url).await {
+                Ok(text) => {
+                    if let Err(e) = chat_session::append_assistant_message(&session_id, &text) {
+                        log::warn!("generate_comfyui_image: failed to save reaction: {e}");
+                    }
+                    Some(text)
+                }
+                Err(e) => {
+                    log::warn!("generate_comfyui_image: reaction turn failed: {e}");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("generate_comfyui_image: could not load config for reaction turn: {e}");
+            None
+        }
+    };
+
+    Ok(GeneratedImageResult {
+        path: path.display().to_string(),
+        data_url,
+        reaction,
+    })
+}
+
+/// Redisplays an already-saved generated image -- reopening a session calls
+/// this once per `ChatMessage.generated_images` entry.
+#[tauri::command]
+fn read_generated_image(path: String) -> Result<String, String> {
+    comfyui::read_as_data_url(std::path::Path::new(&path)).map_err(|e| e.to_string())
 }
 
 /// Passive, best-effort hint for whether the configured model supports
@@ -914,6 +1041,9 @@ fn main() {
             unmount_root,
             load_config,
             save_config,
+            get_comfyui_config,
+            save_comfyui_config,
+            pick_comfyui_output_dir,
             default_system_prompt,
             test_connection,
             app_version,
@@ -951,6 +1081,9 @@ fn main() {
             delete_chat_session,
             get_chat_state,
             send_chat_message,
+            test_comfyui_generation,
+            generate_comfyui_image,
+            read_generated_image,
             probe_vision_capability,
             test_vision_support,
         ])

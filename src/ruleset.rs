@@ -1,16 +1,29 @@
 //! On-demand tool/capability rulesets: plain `.md` files under
 //! `<app-config-dir>/rulesets/`, freeform, same shape as `persona.rs`. The
-//! model is never handed their content by default -- only their names, via
+//! model is never handed their content by default -- only their names (and
+//! an optional one-line hint, see below), via
 //! `rules::build_ruleset_availability_note` -- and only pulls one in mid
 //! conversation by requesting it with a ` ```ruleset <name> ``` ` fence (see
 //! `rules::extract_ruleset_request`). Once loaded for a chat session it
 //! stays loaded for the rest of it (`chat_session::add_loaded_ruleset`).
 //!
+//! **The hint line**: a ruleset file's first line, if it starts with `> `,
+//! is shown alongside its name in the availability note as a concrete
+//! trigger condition (e.g. "use this when the user asks for an image").
+//! Added after a real session where a small local model, told only the bare
+//! names "image-generation-prompt"/"other-tools", never once connected a
+//! direct "generate me a beach image" request to either -- an abstract
+//! "request one if a task calls for it" instruction asks the model to
+//! reason its way to relevance, which is exactly the kind of indirect
+//! inference small models are worst at; a concrete "if X, request Y" is the
+//! kind of instruction they follow far more reliably. Optional and
+//! convention-based (not a required frontmatter field) so an existing
+//! ruleset without one still works exactly as before, just without a hint.
+//!
 //! Two seed files ship so there's always something to request: an
-//! image-generation-prompt ruleset (for a future ComfyUI integration -- this
-//! app doesn't talk to ComfyUI yet, this is just the doc the model will read
-//! once it does) and a free-form "other tools" ruleset (e.g. a SearXNG URL
-//! for web browsing, filled in by the user).
+//! image-generation-prompt ruleset (for the ComfyUI integration) and a
+//! free-form "other tools" ruleset (e.g. a SearXNG URL for web browsing,
+//! filled in by the user).
 
 use crate::paths::{app_config_dir, sanitize_filename};
 use std::fs;
@@ -19,6 +32,16 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RulesetSummary {
     pub name: String,
+    /// This ruleset file's own `> ...` first-line hint, if it has one --
+    /// see the module doc comment.
+    pub hint: Option<String>,
+}
+
+/// A ruleset file's first line, if it starts with `> ` -- see the module
+/// doc comment for why this exists.
+fn extract_hint(content: &str) -> Option<String> {
+    let first_line = content.lines().next()?.trim();
+    first_line.strip_prefix("> ").map(|s| s.trim().to_string())
 }
 
 // See the identical fix/note in `persona.rs`/`memory.rs`: `XDG_CONFIG_HOME`
@@ -46,19 +69,33 @@ pub(crate) fn ruleset_path_for_test(name: &str) -> PathBuf {
     ruleset_path(name)
 }
 
+/// The one ruleset name the app treats as special -- `rules::build_dispatch_system_content`
+/// always injects `comfyui::IMAGE_PROMPT_PROTOCOL` (the actual
+/// `` ```image-prompt``` `` fence mechanics) alongside this ruleset's own
+/// content, regardless of what that content says. This keeps the mechanical
+/// part working even if the file is edited down to nothing but personal
+/// tag preferences -- which is exactly what happened in a real session:
+/// hand-editing this ruleset replaced the (then file-only) protocol
+/// explanation entirely, and image generation silently stopped working
+/// until that was noticed and fixed by hand. Making the protocol
+/// app-controlled instead of file-content-dependent means that class of
+/// bug can't recur.
+pub const IMAGE_GENERATION_RULESET_NAME: &str = "image-generation-prompt";
+
 pub const SEED_IMAGE_GENERATION_PROMPT: &str = "\
+> Use this the moment the user asks to see, generate, draw, create, or make an image, picture, photo, or drawing of anything -- request it immediately, don't just describe what the image would look like in words instead.
 # Image generation prompts
 
-This app doesn't talk to an image generator yet -- this ruleset is a
-placeholder for when it does (planned: ComfyUI's API). Once that lands,
-follow whatever prompt-format rules end up here before requesting an
-image generation.
+Your own prompt conventions -- always applied on top of whatever the user asked for. Edit this
+however you like; the mechanical part of how image requests actually work is handled by the app
+itself, not this file. For example:
 
-For now, if asked to generate an image, say the feature isn't wired up yet
-instead of describing an image in prose as if it were generated.
+- Always start `positive` with: masterpiece, best quality
+- Always include in `negative`: bad hands, blurry, watermark
 ";
 
 pub const SEED_OTHER_TOOLS: &str = "\
+> Use this when the user asks you to search or browse the web, or mentions a tool you don't have direct instructions for.
 # Other tools
 
 Free-form notes about extra tools/services available outside this app's
@@ -99,7 +136,12 @@ pub fn list_rulesets() -> anyhow::Result<Vec<RulesetSummary>> {
     names.sort();
     Ok(names
         .into_iter()
-        .map(|name| RulesetSummary { name })
+        .map(|name| {
+            let hint = fs::read_to_string(ruleset_path(&name))
+                .ok()
+                .and_then(|content| extract_hint(&content));
+            RulesetSummary { name, hint }
+        })
         .collect())
 }
 
@@ -154,6 +196,35 @@ mod tests {
             SEED_IMAGE_GENERATION_PROMPT
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_rulesets_extracts_each_seeds_hint() {
+        let dir = scratch("hints");
+        let summaries = list_rulesets().unwrap();
+        let image_gen = summaries
+            .iter()
+            .find(|r| r.name == "image-generation-prompt")
+            .unwrap();
+        assert!(
+            image_gen.hint.as_deref().unwrap().contains("image"),
+            "{:?}",
+            image_gen.hint
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_hint_is_none_without_the_blockquote_prefix() {
+        assert_eq!(extract_hint("# Just a heading\nsome text"), None);
+    }
+
+    #[test]
+    fn extract_hint_reads_the_first_line() {
+        assert_eq!(
+            extract_hint("> use this for X\n# heading"),
+            Some("use this for X".to_string())
+        );
     }
 
     #[test]

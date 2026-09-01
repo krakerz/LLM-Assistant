@@ -111,14 +111,46 @@ it: say you no longer have it rather than describing file contents you cannot se
 /// relationship level, or nothing) -- this text never says what to track,
 /// only how. Always sent in chat mode; there's no `disable_builtin_rules`
 /// equivalent here since there's nothing else to conflict with it.
+///
+/// **Mandatory every reply, no "if nothing changed" exception** -- it used
+/// to have one ("if nothing needs to change, you don't need to include one
+/// at all"), which a real session showed was enough of an out for the
+/// model to skip it most turns, leaving `state.md` stale. That's a bigger
+/// problem now than it was originally: `rules::build_dispatch_system_content`
+/// (the dispatch pass, `chat_turn::run_dispatch_turn`) reads `state.md` as
+/// its *only* context beyond the single latest exchange, so a stale
+/// snapshot doesn't just show old info in the transcript -- it actively
+/// feeds the tool-dispatch decision wrong information. Same lesson as the
+/// narration markers and the dispatch fence itself: an optional instruction
+/// with an escape hatch is exactly what a small model uses to skip the
+/// mechanical part in favor of just the creative reply.
+///
+/// Also explicitly forbids narrating a fabricated tool result (e.g. "an
+/// image is generated showing...") -- added after a real session where the
+/// model, asked for an image, wrote prose describing a fake one right in
+/// its normal reply instead of deferring to the actual mechanism, whether
+/// or not the dispatch pass (`chat_turn::run_dispatch_turn`) even fired
+/// that turn. Turn 1 genuinely has no way to know here whether a tool
+/// request will succeed -- it runs and returns before dispatch does -- so
+/// the only honest instruction is "don't claim it happened," not "confirm
+/// only if it happened."
 pub const CHAT_PROTOCOL_PROMPT: &str = "If you want something to reliably persist for the rest of \
 this conversation -- a stat, a fact, a relationship status, anything your character sheet says to \
 keep track of -- put the COMPLETE current version of it in a single fenced ```state code block \
 somewhere in your reply, for example:\n\n```state\nHP: 85/100\nTrust in the user: growing\n```\n\n\
 This replaces everything you wrote in your last ```state block, so restate everything you still \
 want remembered, not just what changed -- anything you leave out is gone. It is never shown to the \
-user as part of your reply, so don't reference it as if they can see it. If nothing needs to \
-change, you don't need to include one at all.";
+user as part of your reply, so don't reference it as if they can see it. Include this block in \
+EVERY reply, without exception -- even a short one, and even if nothing has changed since your \
+last one, in which case just restate the same content again rather than leaving it out. Never skip \
+it.\n\n\
+Separately: some requests (like generating an image) are handled by a different part of this app, \
+outside this reply entirely -- you have no way to know here whether that actually happened or \
+succeeded. If the user asks for something like that, acknowledge the request naturally and stay in \
+character, but never narrate, describe, or claim the result as if it already happened (for example, \
+never write something like \"an image is generated showing...\") -- the real result, if any, \
+appears on its own afterward. Describing a result yourself only produces a fake one no one asked \
+for.";
 
 /// Forces every reply into the same narration/dialogue split
 /// `ui/main.js`'s `renderChatText` renders as separate blocks (see the
@@ -324,22 +356,99 @@ pub fn strip_ruleset_requests(text: &str) -> String {
 /// request one -- injected into the system message so the model knows what
 /// it can ask for without every ruleset's full content being sent up front.
 /// Empty when every existing ruleset is already loaded (or none exist).
-pub fn build_ruleset_availability_note(names: &[String]) -> String {
-    if names.is_empty() {
+///
+/// Each ruleset's own `hint` (see `ruleset.rs`'s module doc comment), when
+/// it has one, is shown right next to its name as a concrete "if X, request
+/// this" trigger -- added after a real session where a small local model,
+/// given only bare names and "request one if a task calls for it," never
+/// once connected a direct "generate me a beach image" to the
+/// "image-generation-prompt" ruleset. A vague "use your judgment"
+/// instruction asks for exactly the kind of indirect inference small models
+/// are worst at.
+pub fn build_ruleset_availability_note(rulesets: &[crate::ruleset::RulesetSummary]) -> String {
+    if rulesets.is_empty() {
         return String::new();
     }
     let mut out = String::from(
         "## Optional rulesets available\n\
-        Not loaded into this conversation yet. If a task calls for one, request it with \
-        ```ruleset <name>``` on its own line, using the exact name below. Once requested it \
-        stays available for the rest of this chat.\n\n",
+        Not loaded into this conversation yet. The moment a request matches one of the triggers \
+        below, request it immediately with ```ruleset <name>``` on its own line, using the exact \
+        name -- don't wait to be asked twice, and don't just describe what you'd do instead. \
+        Once requested it stays available for the rest of this chat.\n\n",
     );
-    for name in names {
+    for r in rulesets {
         out.push_str("- ");
-        out.push_str(name);
+        out.push_str(&r.name);
+        if let Some(hint) = &r.hint {
+            out.push_str(" -- ");
+            out.push_str(hint);
+        }
         out.push('\n');
     }
     out
+}
+
+/// The read side of the "request an image" contract: a ` ```image-prompt ```
+/// ` fence whose body is line-based `key: value` pairs, all optional --
+/// unlike `extract_ruleset_request`'s name-on-the-fence-line shape, an image
+/// request can specify several fields at once, so they live in the body
+/// instead. Unrecognized keys are ignored rather than erroring, so a typo'd
+/// or future-added field name doesn't break the rest of the request. `None`
+/// both when the fence is absent and when it's present but empty/only
+/// unrecognized keys -- either way there's nothing for `comfyui::apply_mapping`
+/// to act on.
+pub fn extract_image_prompt_request(text: &str) -> Option<crate::comfyui::ImagePromptFields> {
+    let marker = "```image-prompt\n";
+    let start = text.find(marker)? + marker.len();
+    let end = text[start..].find("```")?;
+    let body = &text[start..start + end];
+
+    let mut fields = crate::comfyui::ImagePromptFields::default();
+    let mut saw_any = false;
+    for line in body.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key {
+            "checkpoint" => fields.checkpoint = Some(value.to_string()),
+            "positive" => fields.positive = Some(value.to_string()),
+            "negative" => fields.negative = Some(value.to_string()),
+            "sampler" => fields.sampler = Some(value.to_string()),
+            "scheduler" => fields.scheduler = Some(value.to_string()),
+            "width" => fields.width = value.parse().ok(),
+            "height" => fields.height = value.parse().ok(),
+            "steps" => fields.steps = value.parse().ok(),
+            "cfg" => fields.cfg = value.parse().ok(),
+            _ => continue,
+        }
+        saw_any = true;
+    }
+    saw_any.then_some(fields)
+}
+
+/// Removes every ` ```image-prompt ``` ` block from `text` for display, same
+/// reasoning as `strip_state_blocks` -- the model is told this is a request
+/// the app answers separately (with the generated image itself, once ready),
+/// not something to show as raw fenced text.
+pub fn strip_image_prompt_blocks(text: &str) -> String {
+    let mut out = text.to_string();
+    loop {
+        let marker = "```image-prompt\n";
+        let Some(pos) = out.find(marker) else {
+            break;
+        };
+        let body_start = pos + marker.len();
+        let Some(end_rel) = out[body_start..].find("```") else {
+            break;
+        };
+        out.replace_range(pos..body_start + end_rel + 3, "");
+    }
+    collapse_blank_runs(&out).trim().to_string()
 }
 
 /// The two tags reasoning-capable models are actually seen using in the
@@ -512,26 +621,102 @@ pub fn build_system_content(
     out
 }
 
-/// Chat mode's whole system message: the mechanical `CHAT_PROTOCOL_PROMPT`
-/// and `CHAT_NARRATION_PROMPT`, then the persona's own content (if one is
+/// Shared by `build_chat_system_content` and `build_dispatch_system_content`
+/// -- both need the same capped `state.md` snapshot appended, just as the
+/// last thing in an otherwise different system message. `state` is capped
+/// at `state_max_tokens` (0 = no cap) with an explicit truncation note, same
+/// reasoning as `memory::build_block`'s cap: this goes in the system
+/// message, which `context::fit_to_budget` never trims, so nothing else is
+/// in a position to keep it in check.
+fn append_state_block(out: &mut String, state: &str, state_max_tokens: u32) {
+    let state = state.trim();
+    if state.is_empty() {
+        return;
+    }
+    let capped = if state_max_tokens == 0 {
+        state.to_string()
+    } else {
+        crate::context::truncate_with_note(state, (state_max_tokens as usize) * 4, "state")
+    };
+    out.push_str("\n\n## Your persistent state from earlier in this conversation\n");
+    out.push_str(&capped);
+}
+
+/// Chat mode's whole system message for the user-facing reply (turn 1 of
+/// the turn/dispatch/reaction split -- see `chat_turn::run_chat_turn`'s doc
+/// comment): the mechanical `CHAT_PROTOCOL_PROMPT` and
+/// `CHAT_NARRATION_PROMPT`, then the persona's own content (if one is
 /// loaded), then the session's current ` ```state ` snapshot (if it's ever
 /// written one). No root note, no rules.md/command-rules.md -- those are
 /// operation-mode concepts with nothing to say here.
 ///
-/// `state` is capped at `state_max_tokens` (0 = no cap) with an explicit
-/// truncation note, same reasoning as `memory::build_block`'s cap: this goes
-/// in the system message, which `context::fit_to_budget` never trims, so
-/// nothing else is in a position to keep it in check.
+/// Deliberately carries **no** ruleset information -- this reply is no
+/// longer the one expected to request or use a ruleset (that moved entirely
+/// to `build_dispatch_system_content`, a real session having shown a model
+/// asked to do both at once reliably did neither). Also reused as-is for
+/// `chat_turn::run_image_reaction_turn`'s system message, since a reaction
+/// **is** a normal in-character reply -- it just needs a different trigger
+/// message, not a different system prompt.
 pub fn build_chat_system_content(
     persona: Option<&str>,
     state: &str,
     state_max_tokens: u32,
-    available_rulesets: &[String],
-    loaded_rulesets: &[(String, String)],
 ) -> String {
     let mut out = CHAT_PROTOCOL_PROMPT.to_string();
     out.push_str("\n\n");
     out.push_str(CHAT_NARRATION_PROMPT);
+    if let Some(persona) = persona {
+        out.push_str("\n\n");
+        out.push_str(persona);
+    }
+    append_state_block(&mut out, state, state_max_tokens);
+    out
+}
+
+/// The dispatch pass's own instructions (turn 2 -- see
+/// `chat_turn::run_dispatch_turn`'s doc comment). Deliberately not
+/// `CHAT_PROTOCOL_PROMPT`/`CHAT_NARRATION_PROMPT` -- this reply is never
+/// shown to the user, so narration formatting has nothing to do here; its
+/// only job is deciding whether a ruleset/tool applies and, if so, emitting
+/// exactly the fence for it. Spelled out as a strict three-way choice
+/// (request a ruleset / use one already loaded / say `none`) rather than an
+/// open-ended "decide what to do," since a narrowly-scoped instruction is
+/// far more reliably followed by a small model than an abstract one asking
+/// it to reason its way to the right action.
+pub const CHAT_DISPATCH_PROMPT: &str =
+    "You are not replying to the user -- nothing you write here \
+is ever shown to them, and you are not continuing the conversation. Your only job is deciding \
+whether the exchange below calls for one of the tools listed below, then acting on exactly one of \
+these three outcomes:\n\n\
+1. A listed tool applies and its ruleset is NOT loaded yet -- output exactly the word \"ruleset\", \
+a space, then the exact name shown, wrapped in one pair of triple backticks, and nothing else. For \
+a ruleset named image-generation-prompt that looks like:\n\
+```ruleset image-generation-prompt```\n\
+The name goes AFTER the word \"ruleset\" -- never use the ruleset's name as the fence's own tag by \
+itself (```image-generation-prompt``` alone, with no \"ruleset\" in front, does NOT count and will \
+be ignored).\n\
+2. A listed tool applies and its ruleset IS already loaded below -- follow that ruleset's own \
+instructions and output exactly the fence it describes (for example ```image-prompt```) with \
+values that fit the exchange, and nothing else.\n\
+3. Nothing listed applies -- output exactly the single word: none\n\n\
+Never explain your choice, never add commentary, never continue the conversation, never wrap your \
+answer in anything else -- only ever one of the three outputs above.";
+
+/// Chat mode's system message for the dispatch pass (turn 2): persona
+/// content (so a tool payload like an image prompt stays thematically
+/// correct -- it needs to know who the persona actually is), the ruleset
+/// availability note and any already-loaded ruleset content (moved here
+/// wholesale from `build_chat_system_content`), and the same capped `state.md`
+/// snapshot turn 1 gets. Only ever sent with the just-completed exchange as
+/// the message list, not the full conversation -- see `run_dispatch_turn`.
+pub fn build_dispatch_system_content(
+    persona: Option<&str>,
+    state: &str,
+    state_max_tokens: u32,
+    available_rulesets: &[crate::ruleset::RulesetSummary],
+    loaded_rulesets: &[(String, String)],
+) -> String {
+    let mut out = CHAT_DISPATCH_PROMPT.to_string();
     if let Some(persona) = persona {
         out.push_str("\n\n");
         out.push_str(persona);
@@ -545,18 +730,28 @@ pub fn build_chat_system_content(
         out.push_str("\n\n## Loaded ruleset: ");
         out.push_str(name);
         out.push('\n');
+        // Injected regardless of what this specific ruleset's own content
+        // says -- see `ruleset::IMAGE_GENERATION_RULESET_NAME`'s doc
+        // comment for why the mechanics can't depend on the file alone.
+        if name == crate::ruleset::IMAGE_GENERATION_RULESET_NAME {
+            out.push_str(crate::comfyui::IMAGE_PROMPT_PROTOCOL);
+            out.push_str("\n\n");
+        }
         out.push_str(content);
     }
-    let state = state.trim();
-    if !state.is_empty() {
-        let capped = if state_max_tokens == 0 {
-            state.to_string()
-        } else {
-            crate::context::truncate_with_note(state, (state_max_tokens as usize) * 4, "state")
-        };
-        out.push_str("\n\n## Your persistent state from earlier in this conversation\n");
-        out.push_str(&capped);
-    }
+    append_state_block(&mut out, state, state_max_tokens);
+    // Restated at the very end, after the persona/state content above --
+    // added after a real session where the model, given this same prompt,
+    // still slipped back into just continuing the roleplay or restating
+    // the state block verbatim instead of the three-way dispatch decision.
+    // Everything above this point exists as reference material for making
+    // that decision, not something to continue, restate, or add to.
+    out.push_str(
+        "\n\n---\nReminder: everything above is reference material only. You are still deciding \
+        between exactly the three outcomes at the top -- ```ruleset <name>```, the tool's own \
+        fence, or the single word none. Do not continue the conversation, do not restate the \
+        state block above, do not write in character.",
+    );
     out
 }
 
@@ -681,8 +876,7 @@ mod tests {
 
     #[test]
     fn build_chat_system_content_includes_persona_and_state() {
-        let out =
-            build_chat_system_content(Some("You are Aria, a shopkeeper."), "HP: 90", 0, &[], &[]);
+        let out = build_chat_system_content(Some("You are Aria, a shopkeeper."), "HP: 90", 0);
         assert!(out.contains(CHAT_PROTOCOL_PROMPT));
         assert!(out.contains(CHAT_NARRATION_PROMPT));
         assert!(out.contains("You are Aria, a shopkeeper."));
@@ -692,20 +886,20 @@ mod tests {
     #[test]
     fn build_chat_system_content_always_includes_the_narration_prompt() {
         // No persona, no state -- there's still no off-switch for this one.
-        let out = build_chat_system_content(None, "", 0, &[], &[]);
+        let out = build_chat_system_content(None, "", 0);
         assert!(out.contains(CHAT_NARRATION_PROMPT));
     }
 
     #[test]
     fn build_chat_system_content_omits_empty_state() {
-        let out = build_chat_system_content(None, "   ", 0, &[], &[]);
+        let out = build_chat_system_content(None, "   ", 0);
         assert!(!out.contains("persistent state"));
     }
 
     #[test]
     fn build_chat_system_content_caps_a_long_state() {
         let long_state = "x".repeat(10_000);
-        let out = build_chat_system_content(None, &long_state, 50, &[], &[]);
+        let out = build_chat_system_content(None, &long_state, 50);
         assert!(
             out.len() < long_state.len(),
             "expected the state to be truncated"
@@ -717,31 +911,63 @@ mod tests {
     }
 
     #[test]
-    fn build_chat_system_content_lists_available_rulesets_but_not_their_content() {
-        let out = build_chat_system_content(
+    fn build_chat_system_content_carries_no_ruleset_information() {
+        // Ruleset info moved entirely to build_dispatch_system_content --
+        // turn 1 shouldn't even see the word.
+        let out = build_chat_system_content(None, "", 0);
+        assert!(!out.contains("ruleset"), "{out}");
+    }
+
+    #[test]
+    fn build_dispatch_system_content_includes_persona_and_state() {
+        let out = build_dispatch_system_content(
+            Some("You are Aria, a shopkeeper."),
+            "HP: 90",
+            0,
+            &[],
+            &[],
+        );
+        assert!(out.contains(CHAT_DISPATCH_PROMPT));
+        assert!(out.contains("You are Aria, a shopkeeper."));
+        assert!(out.contains("HP: 90"));
+        // The dispatch reply is never shown to the user, so it has no
+        // business being told the roleplay narration convention.
+        assert!(!out.contains(CHAT_NARRATION_PROMPT));
+    }
+
+    #[test]
+    fn build_dispatch_system_content_lists_available_rulesets_but_not_their_content() {
+        let out = build_dispatch_system_content(
             None,
             "",
             0,
             &[
-                "image-generation-prompt".to_string(),
-                "other-tools".to_string(),
+                crate::ruleset::RulesetSummary {
+                    name: "image-generation-prompt".to_string(),
+                    hint: Some("use this for images".to_string()),
+                },
+                crate::ruleset::RulesetSummary {
+                    name: "other-tools".to_string(),
+                    hint: None,
+                },
             ],
             &[],
         );
         assert!(out.contains("image-generation-prompt"));
+        assert!(out.contains("use this for images"));
         assert!(out.contains("other-tools"));
         assert!(out.contains("```ruleset"));
     }
 
     #[test]
-    fn build_chat_system_content_omits_the_availability_note_when_none_are_available() {
-        let out = build_chat_system_content(None, "", 0, &[], &[]);
+    fn build_dispatch_system_content_omits_the_availability_note_when_none_are_available() {
+        let out = build_dispatch_system_content(None, "", 0, &[], &[]);
         assert!(!out.contains("Optional rulesets available"));
     }
 
     #[test]
-    fn build_chat_system_content_includes_loaded_ruleset_content() {
-        let out = build_chat_system_content(
+    fn build_dispatch_system_content_includes_loaded_ruleset_content() {
+        let out = build_dispatch_system_content(
             None,
             "",
             0,
@@ -753,6 +979,26 @@ mod tests {
         );
         assert!(out.contains("Loaded ruleset: other-tools"));
         assert!(out.contains("SearXNG URL: http://example"));
+    }
+
+    #[test]
+    fn build_dispatch_system_content_injects_the_image_prompt_protocol_regardless_of_file_content()
+    {
+        // The exact bug this guards against: a user hand-editing the
+        // ruleset file down to nothing but their own tag preferences must
+        // not lose the actual fence mechanics.
+        let out = build_dispatch_system_content(
+            None,
+            "",
+            0,
+            &[],
+            &[(
+                crate::ruleset::IMAGE_GENERATION_RULESET_NAME.to_string(),
+                "Always start positive with: masterpiece".to_string(),
+            )],
+        );
+        assert!(out.contains("```image-prompt"));
+        assert!(out.contains("Always start positive with: masterpiece"));
     }
 
     #[test]
@@ -782,6 +1028,50 @@ mod tests {
     fn strip_ruleset_requests_is_a_no_op_without_one() {
         let reply = "just a normal reply";
         assert_eq!(strip_ruleset_requests(reply), reply);
+    }
+
+    #[test]
+    fn extract_image_prompt_request_reads_the_recognized_fields() {
+        let reply = "Sure, one moment.\n```image-prompt\npositive: a red circle\nnegative: blurry\nwidth: 512\ncfg: 5.5\n```\nDone.";
+        let fields = extract_image_prompt_request(reply).unwrap();
+        assert_eq!(fields.positive.as_deref(), Some("a red circle"));
+        assert_eq!(fields.negative.as_deref(), Some("blurry"));
+        assert_eq!(fields.width, Some(512));
+        assert_eq!(fields.cfg, Some(5.5));
+        assert_eq!(fields.height, None);
+    }
+
+    #[test]
+    fn extract_image_prompt_request_ignores_unrecognized_keys() {
+        let reply = "```image-prompt\npositive: a cat\nsome_future_field: whatever\n```";
+        let fields = extract_image_prompt_request(reply).unwrap();
+        assert_eq!(fields.positive.as_deref(), Some("a cat"));
+    }
+
+    #[test]
+    fn extract_image_prompt_request_is_none_when_absent() {
+        assert!(extract_image_prompt_request("just a normal reply").is_none());
+    }
+
+    #[test]
+    fn extract_image_prompt_request_is_none_when_empty() {
+        assert!(extract_image_prompt_request("```image-prompt\n```").is_none());
+    }
+
+    #[test]
+    fn strip_image_prompt_blocks_hides_it_from_display() {
+        let reply = "Here you go.\n```image-prompt\npositive: a cat\n```\nEnjoy.";
+        let display = strip_image_prompt_blocks(reply);
+        assert!(!display.contains("```image-prompt"), "{display}");
+        assert!(!display.contains("positive:"), "{display}");
+        assert!(display.contains("Here you go."));
+        assert!(display.contains("Enjoy."));
+    }
+
+    #[test]
+    fn strip_image_prompt_blocks_is_a_no_op_without_one() {
+        let reply = "just a normal reply";
+        assert_eq!(strip_image_prompt_blocks(reply), reply);
     }
 
     #[test]

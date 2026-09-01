@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [1.11.0] — 2026-09-02
+
+### Added
+- **ComfyUI image generation.** A new Settings "Image Gen" tab: paste an API-format workflow exported from ComfyUI, then map checkpoint/positive/negative/width/height/sampler/scheduler/cfg/steps to fields in it by picking from dropdowns built from the pasted workflow itself (no node numbers to type -- they're specific to one export and would silently break on a different one). In chat, the model requests an image with a ` ```image-prompt``` ` block (all fields optional -- anything omitted keeps the workflow's own configured value); generation happens as its own step after the text reply (it can take a while), shown as a placeholder that becomes the real image, and is saved both to a configurable folder/filename pattern (`{session}`/`{timestamp}` placeholders) and into the chat session so it's still there next time it's opened. Once an image is ready, the persona now also sends an in-character reaction to it as a follow-up message
+- A ruleset file can now start with a `> ...` line as a one-line "when to use this" hint, shown next to its name in the system prompt's list of available rulesets
+
+### Changed
+- **Chat mode now runs a dedicated "dispatch" pass after every reply**, on top of the reply itself, whose only job is deciding whether the exchange calls for a ruleset/tool and firing it -- previously one single completion was expected to stay in character, update state, *and* remember to request/use a ruleset all at once, which small local models turned out to reliably fail at (the actual cause of image generation never triggering, even with a correct ruleset and ComfyUI config). The user-facing reply no longer carries any ruleset information at all; that's the dispatch pass's job now, using a separate, low-temperature, narrowly-scoped request
+- The `image-generation-prompt` ruleset's mechanical protocol (the actual `` ```image-prompt``` `` fence syntax) is now injected by the app itself whenever that ruleset is loaded, regardless of what the ruleset file's own content says -- the file can now be as short as your own prompt-tag preferences. This also fixes a related failure mode: hand-editing the ruleset file used to be able to silently delete the protocol explanation entirely (which is exactly what happened in one real session), quietly breaking image generation with no obvious cause
+
+### Fixed
+- The model would never actually request the `image-generation-prompt` ruleset even when directly asked for an image -- the availability note only listed bare ruleset names with an abstract "request one if a task calls for it," which is exactly the kind of indirect reasoning small local models are worst at. Each ruleset can now carry a concrete "if X, request this" hint (see Added above); both seed rulesets ship with one
+- `state.md` could go stale for many turns at a time -- the model was told it could skip updating it "if nothing needs to change," which turned out to mean "skip it most of the time." Now mandatory every reply (restate the same content if nothing actually changed); this matters more since the dispatch pass reads `state.md` as its only real context
+- Chat replies would sometimes narrate a fabricated result for a request that's actually handled elsewhere (e.g. "an image is generated showing...") regardless of whether generation was ever actually requested or succeeded -- the model is now told plainly that it has no way to know the outcome at reply time and must never claim one
+- The dispatch pass would sometimes write the ruleset's name directly as a fence's own language tag (e.g. `` ```image-generation-prompt``` ``) instead of the correct `` ```ruleset image-generation-prompt``` `` -- now recognized as a fallback in addition to fixing the prompt wording that caused it, so an image request still fires correctly even when the model gets the exact syntax wrong
+
 ## [1.10.0] — 2026-09-01
 
 ### Added

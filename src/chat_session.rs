@@ -180,6 +180,37 @@ pub fn save_history(
     Ok(())
 }
 
+/// Attaches a just-saved ComfyUI-generated image's local file path onto the
+/// last `assistant` message in this session's history -- called after
+/// `run_chat_turn` has already saved that reply (generation happens as its
+/// own, separately-timed step; see `chat_turn::ChatTurnOutcome::image_prompt_requested`'s
+/// doc comment for why). Errors if there's no assistant message to attach
+/// to at all, which should never happen in practice since this is only ever
+/// called right after that reply was saved.
+pub fn append_generated_image(id: &str, image_path: &str) -> anyhow::Result<()> {
+    let (_, mut history) = load_session(id)?;
+    let last_assistant = history
+        .iter_mut()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .ok_or_else(|| {
+            anyhow::anyhow!("no assistant message in session \"{id}\" to attach an image to")
+        })?;
+    last_assistant.generated_images.push(image_path.to_string());
+    save_history(id, &history, None)
+}
+
+/// Appends one more `assistant` message onto this session's history --
+/// generic enough to reuse for anything that needs to add a reply outside
+/// `chat_turn::run_chat_turn`'s own flow. First use: `run_image_reaction_turn`'s
+/// reply, which arrives well after the turn that requested the image has
+/// already been saved.
+pub fn append_assistant_message(id: &str, content: &str) -> anyhow::Result<()> {
+    let (_, mut history) = load_session(id)?;
+    history.push(ChatMessage::text("assistant", content));
+    save_history(id, &history, None)
+}
+
 pub fn read_state(id: &str) -> String {
     fs::read_to_string(session_dir(id).join(STATE_FILE)).unwrap_or_default()
 }
@@ -294,6 +325,44 @@ mod tests {
             "HP: 80",
             "state.md holds the current snapshot, not a growing log"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_generated_image_attaches_to_the_last_assistant_message() {
+        let dir = scratch("generated-image");
+        let session = create_session(None).unwrap();
+        save_history(
+            &session.id,
+            &[msg("user", "draw a cat"), msg("assistant", "here you go")],
+            None,
+        )
+        .unwrap();
+        append_generated_image(&session.id, "/tmp/fake-image.png").unwrap();
+        let (_, history) = load_session(&session.id).unwrap();
+        assert_eq!(history[1].generated_images, vec!["/tmp/fake-image.png"]);
+        assert!(history[0].generated_images.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_generated_image_errors_without_an_assistant_message() {
+        let dir = scratch("generated-image-missing");
+        let session = create_session(None).unwrap();
+        assert!(append_generated_image(&session.id, "/tmp/fake-image.png").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_assistant_message_adds_a_new_message_at_the_end() {
+        let dir = scratch("append-assistant");
+        let session = create_session(None).unwrap();
+        save_history(&session.id, &[msg("user", "hi")], None).unwrap();
+        append_assistant_message(&session.id, "reaction text").unwrap();
+        let (_, history) = load_session(&session.id).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[1].content, "reaction text");
         let _ = fs::remove_dir_all(&dir);
     }
 
