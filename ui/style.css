@@ -67,6 +67,17 @@ body {
   border-color: var(--accent);
 }
 
+/* Settings + version, pinned to the bottom of the rail instead of living in
+   each mode's own topbar -- one control shared by both modes belongs in the
+   one place both modes show, not duplicated in each. */
+.mode-rail-bottom {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
 /* Both file-ops and chat mode fill whatever space the rail leaves --
    this is what `body` used to be. */
 .view {
@@ -573,9 +584,10 @@ dialog .cmd {
 }
 
 .app-version {
-  margin-right: auto;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 10px;
+  line-height: 1.2;
+  text-align: center;
 }
 
 #approveBtn {
@@ -945,11 +957,11 @@ select {
   margin: 8px 0 0;
 }
 
-/* Roleplay text split into alternating blocks: //action/narration// gets its
-   own line (italic, accent cyan), spoken dialogue stays plain -- separated
-   by a blank line rather than any border/indent, closer to how it'd read in
-   prose. Applies to both sides of the conversation -- see `renderChatText`
-   in main.js. */
+/* Roleplay text scanned for explicit `//action/narration//` and
+   `||dialogue||` pairs: narration gets its own line (italic, accent cyan),
+   dialogue stays plain -- separated by a blank line rather than any
+   border/indent, closer to how it'd read in prose. Applies to both sides of
+   the conversation -- see `renderChatText` in main.js. */
 .chat-action,
 .chat-dialogue {
   margin: 10px 0;

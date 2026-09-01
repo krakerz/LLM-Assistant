@@ -130,6 +130,14 @@ change, you don't need to include one at all.";
 /// reasoning and no off-switch as `CHAT_PROTOCOL_PROMPT` -- this is how the
 /// app displays every reply, not a style the model is free to skip.
 ///
+/// Both sides now need an explicit pair of markers -- dialogue used to be
+/// "whatever's left over," which a real session showed the model reading as
+/// license to drop a stray, unpaired `//` in as an ad-hoc separator between
+/// sentences (not meant as a real marker at all), which then couldn't
+/// pair with anything and leaked into the display as literal slashes. Two
+/// required, symmetric markers make "not inside a marker" a state that
+/// should never happen, rather than the default one.
+///
 /// Also states whose POV narration is describing, added after a real
 /// session where "you" narration read as the persona's own action rather
 /// than the real person's -- with no rule pinning "you" to one side, a
@@ -137,13 +145,17 @@ change, you don't need to include one at all.";
 /// human, never the persona itself, so a reader is never left guessing who
 /// is doing what.
 pub const CHAT_NARRATION_PROMPT: &str = "Write your replies as an alternation of spoken dialogue \
-and physical narration, like a script. Wrap any narration -- an action, a gesture, a description \
-of the scene, anything that isn't actually being spoken aloud -- in a pair of double slashes on \
-one line, for example: // she leans back and crosses her arms //. Keep each `//` pair on one \
-line; never let one span multiple lines. Leave dialogue as plain text -- no `//`, no quotation \
-marks needed. Use this format for every reply, even a short one, and even if it isn't your \
-default style. Never use asterisks, or a leading period, or any other marker for narration -- \
-`//` on both sides is the only recognized format.\n\n\
+and physical narration, like a script, using two explicit markers -- never leave any part of your \
+reply unwrapped. Wrap narration -- an action, a gesture, a description of the scene, anything \
+that isn't actually being spoken aloud -- in a pair of double slashes: // she leans back and \
+crosses her arms //. Wrap spoken dialogue in a pair of double pipes: || Is everything alright? ||. \
+A reply mixing both looks like: // she takes a slow sip // || That's really refreshing. ||. Use \
+this format for every reply, even a short one, and even if it isn't your default style.\n\n\
+`//` and `||` only ever appear as a complete, matching pair around one piece of narration or \
+dialogue -- never on their own as a separator, dash, aside, or for any other purpose, and never \
+asterisks or a leading period instead. A marker you open must be closed before you move on to the \
+next thing; an unclosed or stray marker is worse than none, since it can't be told apart from \
+plain text.\n\n\
 Be unambiguous about whose action or perspective each piece of narration describes. \"You\" \
 always means the real person you're talking to -- the human actually typing, never yourself or \
 your own character. Narrate your own character's actions in the third person by name (or first \
