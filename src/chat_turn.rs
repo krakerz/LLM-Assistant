@@ -252,10 +252,25 @@ async fn run_dispatch_turn(
             &available_rulesets,
             &loaded_rulesets,
         );
+        // Deliberately ONE trailing "user"-role message, not a separate
+        // user/assistant pair -- ending the list on an "assistant" message
+        // is out-of-distribution for how chat templates expect to elicit a
+        // fresh completion (they append the generation prompt right after
+        // whatever the last message is, and most instruction tuning never
+        // sees "continue after your own prior turn" as a shape), and lined
+        // up with the real symptom: dispatch was intermittently returning
+        // an empty string, or a raw continuation of the state block, both
+        // consistent with the model treating the last "assistant" message
+        // as something to extend rather than a decision to make fresh.
         let messages = vec![
             ChatMessage::text("system", system_content),
-            ChatMessage::text("user", last_user_message),
-            ChatMessage::text("assistant", last_assistant_reply),
+            ChatMessage::text(
+                "user",
+                format!(
+                    "-- Exchange to evaluate --\nUser: {last_user_message}\n\
+                     Assistant: {last_assistant_reply}\n-- end of exchange --"
+                ),
+            ),
         ];
 
         let dispatch_reply = match crate::llm::send_chat(
@@ -279,7 +294,9 @@ async fn run_dispatch_turn(
         // failed outright" apart from "it correctly said none".
         log::debug!("dispatch turn raw reply: {dispatch_reply:?}");
 
-        if let Some(fields) = rules::extract_image_prompt_request(&dispatch_reply) {
+        let image_request = rules::extract_image_prompt_request(&dispatch_reply)
+            .or_else(|| extract_mistagged_image_prompt(&dispatch_reply, &loaded_rulesets));
+        if let Some(fields) = image_request {
             outcome.image_prompt_requested = Some(fields);
             return outcome;
         }
@@ -291,9 +308,11 @@ async fn run_dispatch_turn(
                     log::warn!("dispatch turn: failed to record loaded ruleset {name}: {e}");
                     return outcome;
                 }
+                log::info!("dispatch turn: loaded ruleset \"{name}\"");
                 outcome.ruleset_loaded = Some(name);
                 continue; // retry now that this ruleset's content is available
             } else {
+                log::warn!("dispatch turn: requested unknown ruleset \"{name}\"");
                 outcome.ruleset_error = Some(format!("requested unknown ruleset \"{name}\""));
                 return outcome;
             }
@@ -327,6 +346,91 @@ fn extract_bare_ruleset_fence(
         .map(|r| r.name.clone())
 }
 
+/// Another near-miss variant `rules::extract_image_prompt_request` won't
+/// catch, seen repeatedly in the same real CLI testing:
+/// ` ```image-generation-prompt\npositive: ...\n``` ` -- the *correct*
+/// `key: value` body, but tagged with the ruleset's own name instead of the
+/// actual `image-prompt` fence tag. Unsurprising given how close
+/// "image-prompt" and "image-generation-prompt" are as strings; rather than
+/// keep chasing every new near-miss with its own one-off patch, this
+/// rewrites the fence tag to the correct one for every *currently loaded*
+/// ruleset name found in the reply, then re-runs the real extractor on the
+/// patched text -- bounded to loaded rulesets specifically, same reasoning
+/// as `extract_bare_ruleset_fence`: it can only ever match a name that's
+/// genuinely relevant to this conversation, not an arbitrary tag.
+fn extract_mistagged_image_prompt(
+    reply: &str,
+    loaded_rulesets: &[(String, String)],
+) -> Option<comfyui::ImagePromptFields> {
+    for (name, _) in loaded_rulesets {
+        let marker = format!("```{name}\n");
+        if reply.contains(&marker) {
+            let patched = reply.replacen(&marker, "```image-prompt\n", 1);
+            if let Some(fields) = rules::extract_image_prompt_request(&patched) {
+                return Some(fields);
+            }
+        }
+    }
+    None
+}
+
+/// The whole "an image was requested" pipeline: generate, save, persist the
+/// path onto the message that requested it, then let the persona react
+/// (turn 3). Shared by `main.rs`'s `generate_comfyui_image` Tauri command
+/// and `chat_cli.rs` -- same reasoning as the rest of this module, one
+/// implementation so the two can't drift.
+pub struct ImageGenerationResult {
+    pub path: std::path::PathBuf,
+    pub data_url: String,
+    /// `None` if the reaction call itself failed -- the image already
+    /// generated fine, and losing the commentary on it isn't worth
+    /// treating as an overall failure of this whole function.
+    pub reaction: Option<String>,
+}
+
+pub async fn run_full_image_generation(
+    cfg: &AppConfig,
+    comfy_cfg: &comfyui::ComfyUiConfig,
+    session_id: &str,
+    fields: &comfyui::ImagePromptFields,
+) -> anyhow::Result<ImageGenerationResult> {
+    let image = comfyui::generate_image(comfy_cfg, fields).await?;
+    let path = comfyui::save_generated_image(comfy_cfg, session_id, &image)?;
+    chat_session::append_generated_image(session_id, &path.display().to_string())?;
+    let data_url = comfyui::read_as_data_url(&path)?;
+
+    let positive = fields.positive.as_deref().unwrap_or("an image");
+    let reaction = match run_image_reaction_turn(
+        cfg,
+        session_id,
+        positive,
+        &data_url,
+        comfy_cfg.reaction_mode,
+    )
+    .await
+    {
+        Ok(Some(text)) => {
+            if let Err(e) = chat_session::append_assistant_message(session_id, &text) {
+                log::warn!("run_full_image_generation: failed to save reaction: {e}");
+            }
+            Some(text)
+        }
+        // `Optional` mode's own considered choice not to comment -- not a
+        // failure, nothing to log or persist.
+        Ok(None) => None,
+        Err(e) => {
+            log::warn!("run_full_image_generation: reaction turn failed: {e}");
+            None
+        }
+    };
+
+    Ok(ImageGenerationResult {
+        path,
+        data_url,
+        reaction,
+    })
+}
+
 /// Turn 3 -- see the module doc comment. Reuses `build_chat_system_content`
 /// (the same one turn 1 uses) rather than a bespoke prompt: a reaction
 /// **is** a normal in-character reply, it just needs a different trigger
@@ -335,12 +439,20 @@ fn extract_bare_ruleset_fence(
 /// the generated image attached as vision input -- if the configured model
 /// can't actually see it, the prompt text alone is still enough to react
 /// to, so this degrades gracefully rather than depending on a vision probe.
+///
+/// `reaction_mode` decides whether a comment is mandatory
+/// (`ReactionMode::Always`, the original behavior) or left to the model,
+/// based on how turn 1 just went and the session's own `state.md` -- both
+/// already in `system_content`/persisted history, so no extra context is
+/// needed to let it decide. `Ok(None)` is that considered "no comment
+/// fits", distinct from an actual request failure (`Err`).
 pub async fn run_image_reaction_turn(
     cfg: &AppConfig,
     session_id: &str,
     positive_prompt: &str,
     image_data_url: &str,
-) -> anyhow::Result<String> {
+    reaction_mode: comfyui::ReactionMode,
+) -> anyhow::Result<Option<String>> {
     let (meta, _) = chat_session::load_session(session_id)?;
     let persona_content = match &meta.persona {
         Some(name) => persona::load_persona(name).ok(),
@@ -353,11 +465,21 @@ pub async fn run_image_reaction_turn(
         cfg.chat_state_max_tokens,
     );
 
+    let instruction = match reaction_mode {
+        comfyui::ReactionMode::Always => "React to it, briefly, in character.".to_string(),
+        comfyui::ReactionMode::Optional => {
+            "Given how the conversation has just gone and your current state, decide for \
+             yourself whether an in-character comment on it actually fits right now. If it \
+             does, react to it briefly, in character. If it doesn't (for example if you were \
+             already mid-scene and it's not a natural moment for one), reply with exactly the \
+             single word: none"
+                .to_string()
+        }
+    };
     let mut trigger = ChatMessage::text(
         "user",
         format!(
-            "[You just finished generating an image described as: {positive_prompt}] React to \
-             it, briefly, in character."
+            "[You just finished generating an image described as: {positive_prompt}] {instruction}"
         ),
     );
     trigger.images = vec![image_data_url.to_string()];
@@ -380,7 +502,13 @@ pub async fn run_image_reaction_turn(
     let stored_reply = rules::strip_image_prompt_blocks(&rules::strip_ruleset_requests(
         &rules::strip_state_blocks(&reply),
     ));
-    Ok(stored_reply)
+
+    if reaction_mode == comfyui::ReactionMode::Optional
+        && stored_reply.trim().eq_ignore_ascii_case("none")
+    {
+        return Ok(None);
+    }
+    Ok(Some(stored_reply))
 }
 
 #[cfg(test)]
@@ -432,5 +560,29 @@ mod tests {
             extract_bare_ruleset_fence("I hope you're having a wonderful day!", &available()),
             None
         );
+    }
+
+    #[test]
+    fn extract_mistagged_image_prompt_catches_the_ruleset_name_used_as_the_fence_tag() {
+        // The exact real-world near-miss: correct body, wrong tag.
+        let reply = "\n```image-generation-prompt\npositive: a red circle\nnegative: bad hand\n```";
+        let loaded = vec![(
+            "image-generation-prompt".to_string(),
+            "some ruleset content".to_string(),
+        )];
+        let fields = extract_mistagged_image_prompt(reply, &loaded).unwrap();
+        assert_eq!(fields.positive.as_deref(), Some("a red circle"));
+        assert_eq!(fields.negative.as_deref(), Some("bad hand"));
+    }
+
+    #[test]
+    fn extract_mistagged_image_prompt_ignores_a_ruleset_not_currently_loaded() {
+        let reply = "```image-generation-prompt\npositive: a red circle\n```";
+        assert!(extract_mistagged_image_prompt(reply, &[]).is_none());
+    }
+
+    #[test]
+    fn extract_mistagged_image_prompt_ignores_unrelated_text() {
+        assert!(extract_mistagged_image_prompt("just a normal reply", &[]).is_none());
     }
 }

@@ -82,16 +82,42 @@ pub(crate) fn ruleset_path_for_test(name: &str) -> PathBuf {
 /// bug can't recur.
 pub const IMAGE_GENERATION_RULESET_NAME: &str = "image-generation-prompt";
 
+/// This ruleset's hint, guaranteed by `list_rulesets` regardless of what
+/// the file's own first line says -- same reasoning, and the same real
+/// failure mode, as `comfyui::IMAGE_PROMPT_PROTOCOL`: a user simplifying
+/// this ruleset down to just their own tag preferences (exactly the
+/// compact style this file is *meant* to support) silently deleted the
+/// `> ...` hint line along with everything else, and the model went right
+/// back to never requesting it -- the first bug this hint was added to fix
+/// in the first place. A hint this specific ruleset needs to always carry
+/// can't be allowed to depend on a file the user is explicitly encouraged
+/// to trim down.
+pub const IMAGE_GENERATION_HINT: &str = "Use this the moment the user asks to see, generate, \
+draw, create, or make an image, picture, photo, or drawing of anything -- request it \
+immediately, don't just describe what the image would look like in words instead.";
+
+/// The hint (`IMAGE_GENERATION_HINT`) and fence mechanics
+/// (`comfyui::IMAGE_PROMPT_PROTOCOL`) are both guaranteed to the *model*
+/// regardless of what this file says -- but a person editing this file
+/// through the GUI's ruleset editor never sees either of those, since
+/// they're Rust-only. Without a placeholder line for every recognized
+/// field, there'd be no way to discover that `checkpoint`/`width`/
+/// `height`/`sampler`/`scheduler`/`cfg`/`steps` can be given a standing
+/// preference too, not just `positive`/`negative`. So the seed lists all
+/// nine as delete-if-unwanted example lines, not just the two most people
+/// will actually want.
 pub const SEED_IMAGE_GENERATION_PROMPT: &str = "\
-> Use this the moment the user asks to see, generate, draw, create, or make an image, picture, photo, or drawing of anything -- request it immediately, don't just describe what the image would look like in words instead.
-# Image generation prompts
-
-Your own prompt conventions -- always applied on top of whatever the user asked for. Edit this
-however you like; the mechanical part of how image requests actually work is handled by the app
-itself, not this file. For example:
-
+(Delete any line you don't need -- leaving a field out entirely keeps \
+whatever value the workflow already has configured for it.)
 - Always start `positive` with: masterpiece, best quality
 - Always include in `negative`: bad hands, blurry, watermark
+- Always use `checkpoint`: my_favorite_model.safetensors
+- Always use `width`: 832
+- Always use `height`: 1216
+- Always use `sampler`: euler
+- Always use `scheduler`: normal
+- Always use `cfg`: 7
+- Always use `steps`: 30
 ";
 
 pub const SEED_OTHER_TOOLS: &str = "\
@@ -108,15 +134,25 @@ Nothing here is wired into the app automatically; it's reference material
 for you to point the model at.
 ";
 
+/// True if `path` doesn't exist yet, or exists but has nothing but
+/// whitespace in it -- the latter covers a user clearing a ruleset's
+/// content back out through the editor, which should get the placeholder
+/// example back rather than staying blank forever.
+fn is_missing_or_empty(path: &std::path::Path) -> bool {
+    fs::read_to_string(path)
+        .map(|content| content.trim().is_empty())
+        .unwrap_or(true)
+}
+
 pub fn list_rulesets() -> anyhow::Result<Vec<RulesetSummary>> {
     let dir = rulesets_dir();
     fs::create_dir_all(&dir)?;
     let image_gen = ruleset_path("image-generation-prompt");
-    if !image_gen.exists() {
+    if is_missing_or_empty(&image_gen) {
         fs::write(&image_gen, SEED_IMAGE_GENERATION_PROMPT)?;
     }
     let other_tools = ruleset_path("other-tools");
-    if !other_tools.exists() {
+    if is_missing_or_empty(&other_tools) {
         fs::write(&other_tools, SEED_OTHER_TOOLS)?;
     }
 
@@ -137,9 +173,18 @@ pub fn list_rulesets() -> anyhow::Result<Vec<RulesetSummary>> {
     Ok(names
         .into_iter()
         .map(|name| {
-            let hint = fs::read_to_string(ruleset_path(&name))
-                .ok()
-                .and_then(|content| extract_hint(&content));
+            // The one built-in ruleset always gets its guaranteed hint,
+            // regardless of what its file says -- see
+            // `IMAGE_GENERATION_HINT`'s doc comment for why this can't be
+            // allowed to depend on file content the way an arbitrary
+            // user-created ruleset's hint does.
+            let hint = if name == IMAGE_GENERATION_RULESET_NAME {
+                Some(IMAGE_GENERATION_HINT.to_string())
+            } else {
+                fs::read_to_string(ruleset_path(&name))
+                    .ok()
+                    .and_then(|content| extract_hint(&content))
+            };
             RulesetSummary { name, hint }
         })
         .collect())
@@ -210,6 +255,46 @@ mod tests {
             image_gen.hint.as_deref().unwrap().contains("image"),
             "{:?}",
             image_gen.hint
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_rulesets_keeps_the_image_generation_hint_even_if_the_file_loses_it() {
+        // The exact real-world regression: a user simplifying this ruleset
+        // down to just their own tag preferences (no `> ...` first line at
+        // all) must not lose the hint that makes the model request it in
+        // the first place.
+        let dir = scratch("hint-survives-edit");
+        list_rulesets().unwrap(); // seeds it first
+        update_ruleset(
+            IMAGE_GENERATION_RULESET_NAME,
+            "- always use positive with: some tag\n- always use negative with: some other tag\n",
+        )
+        .unwrap();
+        let summaries = list_rulesets().unwrap();
+        let image_gen = summaries
+            .iter()
+            .find(|r| r.name == IMAGE_GENERATION_RULESET_NAME)
+            .unwrap();
+        assert_eq!(image_gen.hint.as_deref(), Some(IMAGE_GENERATION_HINT));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_a_seeded_ruleset_back_to_empty_restores_the_placeholder() {
+        // A user clearing a ruleset's content out through the GUI editor
+        // shouldn't be left with a permanently blank file -- since that's
+        // the only place a normal user ever sees the placeholder examples
+        // for every recognized field (the hint/protocol are Rust-only), an
+        // emptied file should get the full example back on next load.
+        let dir = scratch("reseed-on-empty");
+        list_rulesets().unwrap(); // seeds it first
+        update_ruleset(IMAGE_GENERATION_RULESET_NAME, "   \n\n").unwrap();
+        list_rulesets().unwrap();
+        assert_eq!(
+            load_ruleset(IMAGE_GENERATION_RULESET_NAME).unwrap(),
+            SEED_IMAGE_GENERATION_PROMPT
         );
         let _ = fs::remove_dir_all(&dir);
     }

@@ -765,41 +765,14 @@ async fn generate_comfyui_image(
     fields: comfyui::ImagePromptFields,
 ) -> Result<GeneratedImageResult, String> {
     let comfy_cfg = comfyui::load_or_init().map_err(|e| e.to_string())?;
-    let image = comfyui::generate_image(&comfy_cfg, &fields)
+    let cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let result = chat_turn::run_full_image_generation(&cfg, &comfy_cfg, &session_id, &fields)
         .await
         .map_err(|e| e.to_string())?;
-    let path = comfyui::save_generated_image(&comfy_cfg, &session_id, &image)
-        .map_err(|e| e.to_string())?;
-    chat_session::append_generated_image(&session_id, &path.display().to_string())
-        .map_err(|e| e.to_string())?;
-    let data_url = comfyui::read_as_data_url(&path).map_err(|e| e.to_string())?;
-
-    let reaction = match config::load_or_init() {
-        Ok(cfg) => {
-            let positive = fields.positive.as_deref().unwrap_or("an image");
-            match chat_turn::run_image_reaction_turn(&cfg, &session_id, positive, &data_url).await {
-                Ok(text) => {
-                    if let Err(e) = chat_session::append_assistant_message(&session_id, &text) {
-                        log::warn!("generate_comfyui_image: failed to save reaction: {e}");
-                    }
-                    Some(text)
-                }
-                Err(e) => {
-                    log::warn!("generate_comfyui_image: reaction turn failed: {e}");
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            log::warn!("generate_comfyui_image: could not load config for reaction turn: {e}");
-            None
-        }
-    };
-
     Ok(GeneratedImageResult {
-        path: path.display().to_string(),
-        data_url,
-        reaction,
+        path: result.path.display().to_string(),
+        data_url: result.data_url,
+        reaction: result.reaction,
     })
 }
 
