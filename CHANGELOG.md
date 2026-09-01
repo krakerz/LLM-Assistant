@@ -4,7 +4,27 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
-## [1.8.0] — 2026-09-01
+## [1.9.0] — 2026-09-01
+
+<div align="justify">
+
+Chat mode reads more like a persona conversation and less like a plain text log: roleplay-style `*action*` text is now visually separated from spoken dialogue, on both sides of the chat, and a model's shown reasoning can optionally be kept with the session instead of vanishing the moment you switch away. Personas can be edited in place rather than only imported, created or deleted. The File Operations rail icon also got a size fix.
+
+</div>
+
+### Added
+- **Roleplay-style text formatting in chat mode.** `*Action or narration text*` (a common convention for "the character does something" as opposed to speaking) is now split out from the surrounding dialogue and rendered as its own block -- italic, muted, separated by a blank line -- instead of just italicized inline. Applies to both the model's replies and what you type yourself, so `*knocks on the door*` reads the same way from either side. Bold and inline/fenced code still work inside either kind of block. New `chat_hide_narration` config field (off by default, toggled from chat mode's own header -- see below) hides narration blocks from the chat entirely, for anyone who'd rather see only the spoken lines -- the model is still always told to write them (see `CHAT_NARRATION_PROMPT` below), this is purely a display choice.
+- **Chat mode can keep a shown thinking block with the session.** New setting `chat_persist_thinking` (off by default) -- when on, a reply's reasoning is saved onto its `ChatMessage` in `history.json` alongside the text, so reopening that session (or restarting the app) still shows it collapsed under "Thinking → Completed," rather than it only ever existing for the one live turn. Never re-sent to the model either way; display-only, same as showing it live already was. `chat_persist_thinking` has no effect if `chat_show_thinking` is off.
+- **Edit button for personas.** The same dialog used for writing a new persona now doubles as an editor for the selected one (name locked, content editable) -- `persona::update_persona` overwrites the `.md` file in place. Previously personas could only be imported, created fresh, or deleted; fixing a typo meant deleting and recreating one.
+- **The narration/dialogue split above is now forced on every model, not just the ones that already write that way.** New always-sent `rules::CHAT_NARRATION_PROMPT` explicitly tells the model to wrap any action/narration in a single pair of asterisks and leave dialogue plain -- without it, a model with no roleplay habit just writes one plain paragraph and there's nothing for the renderer to split. No setting to turn it off, same reasoning as the existing `CHAT_PROTOCOL_PROMPT`: it's how the app displays every reply, not a style choice. Verified against a real local model with no roleplay tendencies of its own, which reliably produced the format once instructed.
+- **Narration now states clearly whose POV it's in.** `CHAT_NARRATION_PROMPT` now spells out that "you" always means the real person typing -- never the persona itself -- after a real session where narration used "you" for the persona's own action, reading as if the character were addressing itself. The persona's own actions are now narrated in the third person by name (or first-person "I" in dialogue) instead. Verified against a real local model: narrating its own character's actions now consistently reads "*Elara leans back...*" rather than "*you lean back...*".
+- **A quick narration toggle and a Settings button in chat mode's own header.** The 🎭 button (left of the font-size controls) flips `chat_hide_narration` and immediately re-draws the open chat so it takes effect -- this is now the only way to reach the setting; the equivalent checkbox in Settings was removed as redundant. The ⚙ button (same rightmost spot Settings already occupies in File Operations) opens the same Settings dialog -- previously only reachable from the other mode.
+
+### Changed
+- The File Operations rail icon is now 📁 instead of 🗀 -- the latter (`U+1F5C0 FOLDER`) renders as a small monochrome glyph in most fonts, visibly smaller than the chat rail's 💬, which is a fully-supported color emoji. 📁 (`U+1F4C1 FILE FOLDER`) matches its visual weight.
+
+### Fixed
+- **A popup or native file/folder picker could open behind the app window** instead of on top of it, if another application had focus at the time. Every in-page dialog now focuses the main window (`getCurrentWindow().setFocus()`, new `core:window:allow-set-focus` permission) right before it opens, and the native folder/file pickers are now explicitly parented to the main window (`FileDialogBuilder::set_parent`) so the window manager keeps them stacked correctly.
 
 <div align="justify">
 

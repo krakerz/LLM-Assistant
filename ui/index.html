@@ -9,7 +9,7 @@
 <body>
   <div class="app-shell">
     <nav id="modeRail" class="mode-rail">
-      <button id="fileOpsModeBtn" class="mode-rail-btn active" title="File Operations">🗀</button>
+      <button id="fileOpsModeBtn" class="mode-rail-btn active" title="File Operations">📁</button>
       <button id="chatModeBtn" class="mode-rail-btn" title="Chat">💬</button>
     </nav>
 
@@ -39,10 +39,13 @@
         </select>
         <button id="importPersonaBtn" class="icon-btn" title="Import a persona .md file">⬆</button>
         <button id="newPersonaBtn" class="icon-btn" title="Write a new persona">＋</button>
+        <button id="editPersonaBtn" class="icon-btn" title="Edit the selected persona">✎</button>
         <button id="deletePersonaBtn" class="icon-btn" title="Delete the selected persona">🗑</button>
         <span class="root-path" style="flex:1"></span>
+        <button id="toggleNarrationBtn" class="icon-btn" title="Hide narration text">🎭</button>
         <button id="chatFontDecBtn" title="Decrease font size" class="icon-btn">A−</button>
         <button id="chatFontIncBtn" title="Increase font size" class="icon-btn">A+</button>
+        <button id="chatSettingsBtn" title="Settings" class="icon-btn">⚙</button>
       </header>
 
       <div class="chat-mode-body">
@@ -72,7 +75,7 @@
   </div>
 
   <dialog id="newPersonaDialog">
-    <h3>New persona</h3>
+    <h3 id="newPersonaDialogTitle">New persona</h3>
     <label>Name
       <input id="newPersonaName" type="text" placeholder="e.g. Aria the Shopkeeper" />
     </label>
@@ -178,6 +181,12 @@
         <code>&lt;think&gt;</code> tag, collapsed under a "Thinking" disclosure. Off just hides it
         (some models emit it regardless) — it never stops the model from thinking, just from
         showing you.
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="cfgChatPersistThinking" />
+        Keep a shown thinking block saved with the chat, so reopening that session later (or after
+        restarting the app) still shows it. Off by default — otherwise it's only visible for the
+        turn it arrived on. Has no effect if the option above is off.
       </label>
 
       <label class="checkbox-row">

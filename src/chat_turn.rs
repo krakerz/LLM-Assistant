@@ -39,11 +39,12 @@ fn auto_title_from(message: &str) -> String {
 }
 
 /// `history` is the caller's live copy, already including the new user
-/// message. The updated history -- reply appended, thinking and any
-/// ` ```state ``` ` block stripped before being stored (the model's
-/// reasoning is never worth re-explaining to itself next turn, and
-/// `state.md` already keeps the durable copy of state) -- is persisted
-/// before returning, so a session survives a crash up to its last
+/// message. The updated history -- reply appended, any ` ```state ``` `
+/// block always stripped before being stored (`state.md` already keeps the
+/// durable copy) and the model's reasoning attached only if
+/// `chat_persist_thinking` says to keep it (never re-explained to the model
+/// itself next turn either way -- `llm::to_wire` never reads it) -- is
+/// persisted before returning, so a session survives a crash up to its last
 /// successful reply.
 pub async fn run_chat_turn(
     cfg: &AppConfig,
@@ -101,7 +102,11 @@ pub async fn run_chat_turn(
         .rewritten_history
         .clone()
         .unwrap_or_else(|| history.clone());
-    full_history.push(ChatMessage::text("assistant", stored_reply.clone()));
+    let mut assistant_message = ChatMessage::text("assistant", stored_reply.clone());
+    if cfg.chat_persist_thinking {
+        assistant_message.thinking = thinking.clone();
+    }
+    full_history.push(assistant_message);
     let title_hint = (full_history.len() == 2)
         .then(|| full_history.first())
         .flatten()

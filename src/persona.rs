@@ -126,6 +126,20 @@ pub fn delete_persona(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Overwrites an existing persona's content -- the "Edit" button's save,
+/// unlike `save_new_persona` this is meant to clobber. Errors if `name`
+/// doesn't already exist, since editing implies there's something there to
+/// edit (a stale name -- e.g. deleted from another window -- should surface
+/// as an error, not silently create a new file).
+pub fn update_persona(name: &str, content: &str) -> anyhow::Result<()> {
+    let dest = persona_path(name);
+    if !dest.exists() {
+        anyhow::bail!("no persona named \"{name}\" to edit");
+    }
+    fs::write(&dest, content)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +208,22 @@ mod tests {
         save_new_persona("Temp", "x").unwrap();
         delete_persona("Temp").unwrap();
         assert!(list_personas().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_overwrites_an_existing_personas_content() {
+        let dir = scratch("update");
+        save_new_persona("Aria", "first draft").unwrap();
+        update_persona("Aria", "revised draft").unwrap();
+        assert_eq!(load_persona("Aria").unwrap(), "revised draft");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_refuses_a_name_that_does_not_exist() {
+        let dir = scratch("update-missing");
+        assert!(update_persona("Ghost", "x").is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 

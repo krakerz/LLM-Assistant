@@ -10,12 +10,12 @@ build.
    .deb (recommended - pulls in bubblewrap for you). Note the space in the
    filename, so keep the quotes:
 
-       sudo apt install "./LLM Assistant_1.8.0_amd64.deb"
+       sudo apt install "./LLM Assistant_1.9.0_amd64.deb"
 
    AppImage:
 
-       chmod +x "LLM Assistant_1.8.0_amd64.AppImage"
-       "./LLM Assistant_1.8.0_amd64.AppImage"
+       chmod +x "LLM Assistant_1.9.0_amd64.AppImage"
+       "./LLM Assistant_1.9.0_amd64.AppImage"
 
    The AppImage does NOT bring its own bubblewrap. Install it first, or every
    command the assistant proposes will fail:
