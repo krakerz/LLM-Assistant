@@ -148,8 +148,18 @@ fn default_chat_hide_narration() -> bool {
     false
 }
 
+/// 8000 turned out tight once accounted for: `CHAT_PROTOCOL_PROMPT` +
+/// `CHAT_NARRATION_PROMPT` alone are already ~1350 tokens, `chat_state_max_tokens`
+/// allows up to 2000 more, and persona content on top of that -- all fixed,
+/// system-level, never trimmed by `context.rs` -- easily leaves under half
+/// the old budget for actual conversation history before dropping/condensing
+/// kicks in. That history is what turn 3/4's reaction/answer now also read
+/// (see `chat_turn::run_image_reaction_turn`'s doc comment), so a tight
+/// budget pinches more than just turn 1. 16000 is still a context size most
+/// modern small local models handle natively, and this is a plain default
+/// -- freely raised or lowered per model in Settings, never forced.
 fn default_max_context_tokens() -> u32 {
-    8000
+    16000
 }
 
 fn default_max_auto_steps() -> u32 {

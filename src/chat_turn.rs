@@ -12,11 +12,17 @@
 //! 3. `run_image_reaction_turn` -- triggered later, once ComfyUI actually
 //!    returns a generated image (`main.rs`'s `generate_comfyui_image`,
 //!    which can be seconds to minutes after 1/2 already returned) -- not
-//!    part of `run_chat_turn` at all.
+//!    part of `run_chat_turn` at all. The GUI calls it as its own separate
+//!    `run_image_reaction` command, after `generate_comfyui_image` has
+//!    already returned the image, so the image shows up right away instead
+//!    of waiting on this turn too; `chat_cli.rs` still runs both back to
+//!    back in one `run_full_image_generation` call, since a terminal has no
+//!    separate "thinking" indicator to show between the two.
 //! 4. `run_search_answer_turn` -- the same shape as 3, but for a real
 //!    `searxng` web search instead of an image: fired once real results
 //!    come back, feeding them to the model for an answer grounded in what
-//!    was actually found rather than a guess.
+//!    was actually found rather than a guess. Split into its own
+//!    `run_search_answer` GUI command the same way, behind `run_web_search`.
 //!
 //! This three-way split is a deliberate departure from "one LLM request per
 //! call, no auto-continue chain": a real session showed one completion
@@ -456,17 +462,111 @@ fn extract_mistagged_image_prompt(
     None
 }
 
-/// The whole "an image was requested" pipeline: generate, save, persist the
-/// path onto the message that requested it, then let the persona react
-/// (turn 3). Shared by `main.rs`'s `generate_comfyui_image` Tauri command
-/// and `chat_cli.rs` -- same reasoning as the rest of this module, one
-/// implementation so the two can't drift.
-pub struct ImageGenerationResult {
+/// Just the generate-and-save half of "an image was requested" -- no
+/// reaction. Split out of what used to be one `run_full_image_generation`
+/// call so the GUI can show the finished image the moment it's ready
+/// instead of turn 3's own separate LLM call (which can take a real chunk
+/// of time on its own) holding up something that's already done. Shared by
+/// `main.rs`'s `generate_comfyui_image` Tauri command and
+/// `run_full_image_generation` below.
+pub struct GeneratedImage {
     pub path: std::path::PathBuf,
     pub data_url: String,
-    /// `None` if the reaction call itself failed -- the image already
-    /// generated fine, and losing the commentary on it isn't worth
-    /// treating as an overall failure of this whole function.
+}
+
+pub async fn generate_and_save_image(
+    comfy_cfg: &comfyui::ComfyUiConfig,
+    session_id: &str,
+    fields: &comfyui::ImagePromptFields,
+) -> anyhow::Result<GeneratedImage> {
+    let image = comfyui::generate_image(comfy_cfg, fields).await?;
+    let path = comfyui::save_generated_image(comfy_cfg, session_id, &image)?;
+    chat_session::append_generated_image(session_id, &path.display().to_string())?;
+    let data_url = comfyui::read_as_data_url(&path)?;
+    Ok(GeneratedImage { path, data_url })
+}
+
+/// A turn 3/4 reply plus whatever reasoning came with it -- both turns share
+/// this shape. `thinking` used to be silently discarded for these two turns
+/// (only turn 1 ever surfaced it), even though the GUI's own "thinking"
+/// placeholder (`createChatThinkingPlaceholder`/`resolveChatThinking`) is
+/// generic enough to show any turn's reasoning, not just turn 1's -- kept
+/// here purely for live display, same as turn 1's; never persisted into
+/// session history, since only the reply text itself is part of the
+/// conversation the model needs to see again next turn.
+pub struct TurnReply {
+    pub text: Option<String>,
+    pub thinking: Option<String>,
+}
+
+/// Runs turn 3 and persists the result if it produced one, folding `Never`
+/// mode's "skip the extra request entirely" and an actual request failure
+/// into the same "nothing to show" -- neither is worth surfacing as an
+/// error to a caller, only a log line. Shared by `run_full_image_generation`
+/// (the CLI's one-shot path) and `main.rs`'s standalone `run_image_reaction`
+/// command (the GUI's split-out second round-trip -- see that command's
+/// doc comment).
+pub async fn run_and_persist_image_reaction(
+    cfg: &AppConfig,
+    session_id: &str,
+    positive_prompt: &str,
+    image_data_url: &str,
+    reaction_mode: comfyui::ReactionMode,
+) -> TurnReply {
+    if reaction_mode == comfyui::ReactionMode::Never {
+        return TurnReply {
+            text: None,
+            thinking: None,
+        };
+    }
+    match run_image_reaction_turn(
+        cfg,
+        session_id,
+        positive_prompt,
+        image_data_url,
+        reaction_mode,
+    )
+    .await
+    {
+        Ok(TurnReply {
+            text: Some(text),
+            thinking,
+        }) => {
+            if let Err(e) = chat_session::append_assistant_message(session_id, &text) {
+                log::warn!("run_and_persist_image_reaction: failed to save reaction: {e}");
+            }
+            TurnReply {
+                text: Some(text),
+                thinking,
+            }
+        }
+        // `Optional` mode's own considered choice not to comment -- not a
+        // failure, nothing to log or persist, but any reasoning behind that
+        // choice is still worth showing.
+        Ok(reply) => reply,
+        Err(e) => {
+            log::warn!("run_and_persist_image_reaction: reaction turn failed: {e}");
+            TurnReply {
+                text: None,
+                thinking: None,
+            }
+        }
+    }
+}
+
+/// The whole "an image was requested" pipeline: generate, save, then let the
+/// persona react (turn 3), all in one call -- what the GUI used to do too,
+/// before splitting into two round-trips (see `generate_and_save_image` and
+/// `run_and_persist_image_reaction`'s doc comments). Still exactly what
+/// `chat_cli.rs` wants: a terminal has no separate "thinking" indicator to
+/// show between the two, so there's nothing to gain from splitting them
+/// there.
+pub struct ImageGenerationResult {
+    pub path: std::path::PathBuf,
+    /// `None` if the reaction call itself failed, or `reaction_mode` was
+    /// `Never` -- the image already generated fine either way, and losing
+    /// the commentary on it isn't worth treating as an overall failure of
+    /// this whole function.
     pub reaction: Option<String>,
 }
 
@@ -476,46 +576,20 @@ pub async fn run_full_image_generation(
     session_id: &str,
     fields: &comfyui::ImagePromptFields,
 ) -> anyhow::Result<ImageGenerationResult> {
-    let image = comfyui::generate_image(comfy_cfg, fields).await?;
-    let path = comfyui::save_generated_image(comfy_cfg, session_id, &image)?;
-    chat_session::append_generated_image(session_id, &path.display().to_string())?;
-    let data_url = comfyui::read_as_data_url(&path)?;
-
+    let image = generate_and_save_image(comfy_cfg, session_id, fields).await?;
     let positive = fields.positive.as_deref().unwrap_or("an image");
-    // `Never` skips the extra request entirely -- there's nothing to decide,
-    // unlike `Optional`'s own considered "none" from inside the call itself.
-    let reaction = if comfy_cfg.reaction_mode == comfyui::ReactionMode::Never {
-        None
-    } else {
-        match run_image_reaction_turn(
-            cfg,
-            session_id,
-            positive,
-            &data_url,
-            comfy_cfg.reaction_mode,
-        )
-        .await
-        {
-            Ok(Some(text)) => {
-                if let Err(e) = chat_session::append_assistant_message(session_id, &text) {
-                    log::warn!("run_full_image_generation: failed to save reaction: {e}");
-                }
-                Some(text)
-            }
-            // `Optional` mode's own considered choice not to comment -- not a
-            // failure, nothing to log or persist.
-            Ok(None) => None,
-            Err(e) => {
-                log::warn!("run_full_image_generation: reaction turn failed: {e}");
-                None
-            }
-        }
-    };
+    let reaction = run_and_persist_image_reaction(
+        cfg,
+        session_id,
+        positive,
+        &image.data_url,
+        comfy_cfg.reaction_mode,
+    )
+    .await;
 
     Ok(ImageGenerationResult {
-        path,
-        data_url,
-        reaction,
+        path: image.path,
+        reaction: reaction.text,
     })
 }
 
@@ -528,20 +602,38 @@ pub async fn run_full_image_generation(
 /// can't actually see it, the prompt text alone is still enough to react
 /// to, so this degrades gracefully rather than depending on a vision probe.
 ///
-/// `reaction_mode` decides whether a comment is mandatory
-/// (`ReactionMode::Always`, the original behavior) or left to the model,
-/// based on how turn 1 just went and the session's own `state.md` -- both
-/// already in `system_content`/persisted history, so no extra context is
-/// needed to let it decide. `Ok(None)` is that considered "no comment
-/// fits", distinct from an actual request failure (`Err`).
+/// Also sends the real, trimmed conversation history alongside the trigger
+/// -- a first version sent only the system prompt plus the ephemeral
+/// trigger, so all the model actually had to go on was `state.md`'s summary
+/// and the raw ComfyUI tag string (`positive_prompt`), never the actual
+/// back-and-forth that led to the image. That's exactly why the reaction
+/// often read as a generic caption disconnected from the scene rather than
+/// a real continuation of it. Trimmed the same way turn 1 respects the
+/// context budget (`context::trim_to_budget`), but mechanically only, with
+/// no summarizer -- this is a lightweight follow-up, not the place to
+/// trigger a fresh summarization pass over the session's history.
+///
+/// The instruction itself no longer asks for a caption or review of the
+/// image either: the picture is treated as part of the scene, the same way
+/// anything else the character just did or showed would be, and the model's
+/// job is to continue the conversation forward in character from there --
+/// grounded in what's actually in the picture, the real history above, and
+/// its current state -- rather than stepping outside the moment to comment
+/// on an image file. Immersion, which is this turn's whole purpose, over a
+/// reflexive "nice picture" remark every time.
+///
+/// `reaction_mode` decides whether continuing is mandatory
+/// (`ReactionMode::Always`, the original behavior) or left to the model.
+/// `text: None` is that considered "no comment fits", distinct from an
+/// actual request failure (`Err`).
 pub async fn run_image_reaction_turn(
     cfg: &AppConfig,
     session_id: &str,
     positive_prompt: &str,
     image_data_url: &str,
     reaction_mode: comfyui::ReactionMode,
-) -> anyhow::Result<Option<String>> {
-    let (meta, _) = chat_session::load_session(session_id)?;
+) -> anyhow::Result<TurnReply> {
+    let (meta, history) = chat_session::load_session(session_id)?;
     let persona_content = match &meta.persona {
         Some(name) => persona::load_persona(name).ok(),
         None => None,
@@ -559,26 +651,46 @@ pub async fn run_image_reaction_turn(
         // `Always` here only so the match stays exhaustive, not because
         // this arm is expected to run.
         comfyui::ReactionMode::Always | comfyui::ReactionMode::Never => {
-            "React to it, briefly, in character.".to_string()
+            "The picture is now part of the scene, exactly like anything else your character just \
+             said or did -- don't step outside the moment to review or caption it. Continue the \
+             conversation forward in character, using what's actually in the picture together with \
+             how things have actually been going and your current state to decide what your \
+             character would naturally say or do next. For example, if the user asked to see you \
+             relaxing with your cat, your next line is something like \"See? Isn't he cute?\" -- a \
+             real next beat of dialogue that happens to reference the picture, not a description or \
+             review of an image file."
+                .to_string()
         }
         comfyui::ReactionMode::Optional => {
-            "Given how the conversation has just gone and your current state, decide for \
-             yourself whether an in-character comment on it actually fits right now. If it \
-             does, react to it briefly, in character. If it doesn't (for example if you were \
-             already mid-scene and it's not a natural moment for one), reply with exactly the \
-             single word: none"
+            "The picture is now part of the scene, exactly like anything else your character just \
+             said or did. Given it, how the conversation has actually been going, and your current \
+             state, decide for yourself whether continuing forward right now fits, or whether you \
+             were already mid-scene and this isn't a natural moment to. If it fits, continue in \
+             character -- using what's actually in the picture the way you'd naturally reference \
+             something you just showed someone, not describing or reviewing an image file. For \
+             example, if the user asked to see you relaxing with your cat, that continuation is \
+             something like \"See? Isn't he cute?\", a real next beat of dialogue. If it doesn't \
+             fit, reply with exactly the single word: none"
                 .to_string()
         }
     };
     let mut trigger = ChatMessage::text(
         "user",
         format!(
-            "[You just finished generating an image described as: {positive_prompt}] {instruction}"
+            "[Here's the picture you just shared, generated from: {positive_prompt}] {instruction}"
         ),
     );
     trigger.images = vec![image_data_url.to_string()];
 
-    let messages = vec![ChatMessage::text("system", system_content), trigger];
+    let trimmed = context::trim_to_budget(
+        context::estimate_tokens(&system_content),
+        history,
+        cfg.max_context_tokens as usize,
+    );
+    let mut messages = vec![ChatMessage::text("system", system_content)];
+    messages.extend(trimmed.messages);
+    messages.push(trigger);
+
     let reply = crate::llm::send_chat(
         &cfg.endpoint,
         &cfg.model,
@@ -588,6 +700,7 @@ pub async fn run_image_reaction_turn(
     )
     .await?;
 
+    let thinking = rules::extract_thinking_block(&reply);
     let reply = rules::strip_thinking_blocks(&reply);
     let state_block = rules::extract_state_block(&reply);
     if let Some(new_state) = &state_block {
@@ -600,21 +713,76 @@ pub async fn run_image_reaction_turn(
     if reaction_mode == comfyui::ReactionMode::Optional
         && stored_reply.trim().eq_ignore_ascii_case("none")
     {
-        return Ok(None);
+        return Ok(TurnReply {
+            text: None,
+            thinking,
+        });
     }
-    Ok(Some(stored_reply))
+    Ok(TurnReply {
+        text: Some(stored_reply),
+        thinking,
+    })
+}
+
+/// Runs turn 4 and persists the result, folding an actual request failure
+/// into `None` -- not worth surfacing as an error to a caller, only a log
+/// line (the answer turn has no "skip entirely" mode the way image
+/// reaction's `Never` does; it always attempts one, even on a failed
+/// search, so the persona can apologize in character -- see
+/// `run_search_answer_turn`'s doc comment). Shared by `run_full_web_search`
+/// (the CLI's one-shot path) and `main.rs`'s standalone `run_search_answer`
+/// command (the GUI's split-out second round-trip).
+pub async fn run_and_persist_search_answer(
+    cfg: &AppConfig,
+    session_id: &str,
+    query: &str,
+    results: &[searxng::SearchResult],
+    search_error: Option<&str>,
+) -> TurnReply {
+    match run_search_answer_turn(cfg, session_id, query, results, search_error).await {
+        Ok(TurnReply {
+            text: Some(text),
+            thinking,
+        }) => {
+            if let Err(e) = chat_session::append_assistant_message(session_id, &text) {
+                log::warn!("run_and_persist_search_answer: failed to save answer: {e}");
+            }
+            TurnReply {
+                text: Some(text),
+                thinking,
+            }
+        }
+        // The answer turn always attempts a reply (see this function's doc
+        // comment), so `text: None` here would mean `run_search_answer_turn`
+        // itself changed that contract -- kept for exhaustiveness, not
+        // because it's expected to run.
+        Ok(reply) => reply,
+        Err(e) => {
+            log::warn!("run_and_persist_search_answer: answer turn failed: {e}");
+            TurnReply {
+                text: None,
+                thinking: None,
+            }
+        }
+    }
 }
 
 /// The whole "a web search was requested" pipeline: search, then let the
-/// persona answer using the real results (turn 4). Shared by the GUI's
-/// `run_web_search` Tauri command and `chat_cli.rs`, same reasoning as
-/// `run_full_image_generation`.
+/// persona answer using the real results (turn 4), all in one call -- what
+/// the GUI used to do too, before splitting into two round-trips (see
+/// `run_and_persist_search_answer`'s doc comment). Still exactly what
+/// `chat_cli.rs` wants, same reasoning as `run_full_image_generation`.
 pub struct WebSearchResult {
     pub results: Vec<searxng::SearchResult>,
+    /// The search itself failing (network down, rate-limited, misconfigured
+    /// URL) is not the same as it succeeding with nothing relevant -- kept
+    /// separate so a caller can tell "0 results, nothing found" apart from
+    /// "0 results, the request never actually worked".
+    pub search_error: Option<String>,
     /// `None` only if the answer turn itself failed (network/LLM error) --
-    /// the search results are already real by the time this runs, so unlike
-    /// the image reaction there's no "considered decision not to answer"
-    /// case to distinguish.
+    /// distinct from `search_error`: even a failed *search* still gets an
+    /// answer turn, so the persona can apologize in character instead of a
+    /// raw technical error reaching the user.
     pub answer: Option<String>,
 }
 
@@ -624,33 +792,41 @@ pub async fn run_full_web_search(
     session_id: &str,
     query: &str,
 ) -> anyhow::Result<WebSearchResult> {
-    let results = searxng::search(searxng_cfg, query).await?;
-    let answer = match run_search_answer_turn(cfg, session_id, query, &results).await {
-        Ok(text) => {
-            if let Err(e) = chat_session::append_assistant_message(session_id, &text) {
-                log::warn!("run_full_web_search: failed to save answer: {e}");
-            }
-            Some(text)
-        }
+    let (results, search_error) = match searxng::search(searxng_cfg, query).await {
+        Ok(results) => (results, None),
         Err(e) => {
-            log::warn!("run_full_web_search: answer turn failed: {e}");
-            None
+            log::warn!("run_full_web_search: search itself failed: {e}");
+            (Vec::new(), Some(e.to_string()))
         }
     };
-    Ok(WebSearchResult { results, answer })
+    let answer =
+        run_and_persist_search_answer(cfg, session_id, query, &results, search_error.as_deref())
+            .await;
+    Ok(WebSearchResult {
+        results,
+        search_error,
+        answer: answer.text,
+    })
 }
 
 /// Turn 4 -- see the module doc comment. Same shape as
 /// `run_image_reaction_turn`: reuses `build_chat_system_content`, a real
 /// answer **is** a normal in-character reply, it just needs the real
-/// results as its trigger instead of the user's own words. No vision
-/// input this time -- it's text, not an image.
+/// results (or the fact that the search itself failed) as its trigger
+/// instead of the user's own words. No vision input this time -- it's
+/// text, not an image.
+///
+/// `search_error`, when set, means the search never actually ran (not just
+/// "found nothing") -- the trigger tells the model plainly so it apologizes
+/// for a real problem rather than treating an empty result list as "nothing
+/// relevant was found".
 pub async fn run_search_answer_turn(
     cfg: &AppConfig,
     session_id: &str,
     query: &str,
     results: &[searxng::SearchResult],
-) -> anyhow::Result<String> {
+    search_error: Option<&str>,
+) -> anyhow::Result<TurnReply> {
     let (meta, _) = chat_session::load_session(session_id)?;
     let persona_content = match &meta.persona {
         Some(name) => persona::load_persona(name).ok(),
@@ -663,23 +839,33 @@ pub async fn run_search_answer_turn(
         cfg.chat_state_max_tokens,
     );
 
-    let results_text = if results.is_empty() {
-        "(no results came back)".to_string()
+    let (situation, instruction) = if let Some(err) = search_error {
+        (
+            format!("The search itself failed with a real error, not just an empty result: {err}"),
+            "Apologize briefly, in character, and let the user know you couldn't search right now \
+             -- don't guess an answer or make anything up.",
+        )
+    } else if results.is_empty() {
+        (
+            "No results came back at all.".to_string(),
+            "Say so honestly, briefly, in character -- don't guess or make something up.",
+        )
     } else {
-        results
+        let list = results
             .iter()
             .enumerate()
             .map(|(i, r)| format!("{}. {} ({})\n{}", i + 1, r.title, r.url, r.content))
             .collect::<Vec<_>>()
-            .join("\n\n")
+            .join("\n\n");
+        (
+            format!("Here are the real results:\n\n{list}"),
+            "Answer the original question using these results, briefly, in character. If none of \
+             them actually help, say so honestly rather than guessing.",
+        )
     };
     let trigger = ChatMessage::text(
         "user",
-        format!(
-            "[You just searched the web for: {query}] Here are the real results:\n\n{results_text}\n\n\
-             Answer the original question using these results, briefly, in character. If none of \
-             them actually help, say so honestly rather than guessing."
-        ),
+        format!("[You just tried searching the web for: {query}] {situation}\n\n{instruction}"),
     );
 
     let messages = vec![ChatMessage::text("system", system_content), trigger];
@@ -692,16 +878,19 @@ pub async fn run_search_answer_turn(
     )
     .await?;
 
+    let thinking = rules::extract_thinking_block(&reply);
     let reply = rules::strip_thinking_blocks(&reply);
     let state_block = rules::extract_state_block(&reply);
     if let Some(new_state) = &state_block {
         chat_session::update_state(session_id, new_state)?;
     }
-    Ok(rules::strip_web_search_blocks(
-        &rules::strip_image_prompt_blocks(&rules::strip_ruleset_requests(
-            &rules::strip_state_blocks(&reply),
-        )),
-    ))
+    let stored_reply = rules::strip_web_search_blocks(&rules::strip_image_prompt_blocks(
+        &rules::strip_ruleset_requests(&rules::strip_state_blocks(&reply)),
+    ));
+    Ok(TurnReply {
+        text: Some(stored_reply),
+        thinking,
+    })
 }
 
 #[cfg(test)]

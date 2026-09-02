@@ -119,6 +119,33 @@ struct Choice {
 #[derive(Deserialize)]
 struct ResponseMessage {
     content: String,
+    /// Some OpenAI-compatible reasoning-model servers (vLLM, llama.cpp
+    /// server's `--reasoning-format`, LM Studio's reasoning models, etc.)
+    /// return the model's reasoning in this separate field instead of an
+    /// inline `<think>...</think>` tag inside `content` -- previously
+    /// dropped entirely here, since only `content` was ever read, which
+    /// silently discarded any real reasoning a backend like that produced
+    /// regardless of `chat_show_thinking`. Folded into `content` by
+    /// `fold_reasoning_into_content` below rather than plumbed through as
+    /// its own field, so `rules::extract_thinking_block`/
+    /// `strip_thinking_blocks` (which only ever look for the tag) keep
+    /// working unchanged no matter which shape the backend actually used.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+}
+
+/// Normalizes a `reasoning_content`-shaped response into the `<think>` tag
+/// convention the rest of the app already understands -- see
+/// `ResponseMessage::reasoning_content`'s doc comment. Only synthesizes a
+/// tag when `content` doesn't already have one of its own, in case a
+/// backend somehow sends both.
+fn fold_reasoning_into_content(content: String, reasoning_content: Option<String>) -> String {
+    match reasoning_content {
+        Some(reasoning) if !reasoning.trim().is_empty() && !content.contains("<think") => {
+            format!("<think>{reasoning}</think>{content}")
+        }
+        _ => content,
+    }
 }
 
 /// Talks to any OpenAI-compatible `/chat/completions` endpoint -- this is
@@ -157,7 +184,7 @@ pub async fn send_chat(
         .choices
         .into_iter()
         .next()
-        .map(|c| c.message.content)
+        .map(|c| fold_reasoning_into_content(c.message.content, c.message.reasoning_content))
         .unwrap_or_default())
 }
 
@@ -273,5 +300,38 @@ mod tests {
     #[test]
     fn base_host_is_none_for_garbage() {
         assert_eq!(base_host("not a url"), None);
+    }
+
+    #[test]
+    fn fold_reasoning_into_content_wraps_it_as_a_think_tag() {
+        assert_eq!(
+            fold_reasoning_into_content("The answer is 4.".to_string(), Some("2+2=4".to_string())),
+            "<think>2+2=4</think>The answer is 4."
+        );
+    }
+
+    #[test]
+    fn fold_reasoning_into_content_is_a_no_op_without_reasoning() {
+        assert_eq!(
+            fold_reasoning_into_content("just an answer".to_string(), None),
+            "just an answer"
+        );
+    }
+
+    #[test]
+    fn fold_reasoning_into_content_ignores_a_blank_reasoning_field() {
+        assert_eq!(
+            fold_reasoning_into_content("just an answer".to_string(), Some("   ".to_string())),
+            "just an answer"
+        );
+    }
+
+    #[test]
+    fn fold_reasoning_into_content_never_double_wraps_an_existing_tag() {
+        let content = "<think>already reasoned</think>done".to_string();
+        assert_eq!(
+            fold_reasoning_into_content(content.clone(), Some("more reasoning".to_string())),
+            content
+        );
     }
 }

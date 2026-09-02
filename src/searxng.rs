@@ -83,6 +83,20 @@ pub struct SearchResult {
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// `reqwest` sends none of these by default -- fine for the app's other
+/// HTTP clients (a local LLM endpoint, a local ComfyUI instance, neither of
+/// which cares), but SearXNG's own bot detection (`searx.botdetection`)
+/// checks each of these independently and blocks on the first one it finds
+/// missing, one at a time -- `http_user_agent`, then (without the crate's
+/// `gzip`/`deflate` features) `http_accept_encoding`, then
+/// `http_accept_language`. A real browser always sends all of these
+/// together, so they're set together here rather than getting fixed one
+/// discovered check at a time.
+const USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+const ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+const ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
+
 /// One query, `cfg.max_results` results back -- SearXNG's own ranking
 /// decides which ones, this only truncates the list, never re-sorts it.
 pub async fn search(cfg: &SearxngConfig, query: &str) -> anyhow::Result<Vec<SearchResult>> {
@@ -94,9 +108,12 @@ pub async fn search(cfg: &SearxngConfig, query: &str) -> anyhow::Result<Vec<Sear
     let base_url = cfg.base_url.trim().trim_end_matches('/');
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
+        .user_agent(USER_AGENT)
         .build()?;
     let mut request = client
         .get(format!("{base_url}/search"))
+        .header(reqwest::header::ACCEPT, ACCEPT)
+        .header(reqwest::header::ACCEPT_LANGUAGE, ACCEPT_LANGUAGE)
         .query(&[("q", query), ("format", "json")]);
     if !cfg.api_key.trim().is_empty() {
         request = request.bearer_auth(cfg.api_key.trim());

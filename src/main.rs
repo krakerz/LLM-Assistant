@@ -275,6 +275,15 @@ fn app_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// A short, content-addressed identifier for this exact build -- see
+/// `build.rs`'s `build_hash()` doc comment for how it's computed. Shown
+/// next to the version number in the Settings UI, so "is this actually the
+/// build I just rebuilt" never has to be guessed from a binary's mtime.
+#[tauri::command]
+fn app_build_hash() -> &'static str {
+    env!("BUILD_HASH")
+}
+
 #[tauri::command]
 fn load_general_rules() -> Result<String, String> {
     rules::load_general_or_init().map_err(|e| e.to_string())
@@ -770,16 +779,18 @@ async fn test_comfyui_generation(cfg: comfyui::ComfyUiConfig) -> Result<String, 
 /// (fast) text reply -- see `chat_turn::ChatTurnOutcome::image_prompt_requested`'s
 /// doc comment for why this is a separate, later call rather than part of
 /// that same turn.
+///
+/// Generation only -- no reaction (turn 3) -- so the GUI can show the
+/// finished image the instant it's ready instead of waiting on a second,
+/// separate LLM call it has no bearing on. `reaction_pending` tells the
+/// caller whether it's worth following up with `run_image_reaction` at all;
+/// `false` (`ReactionMode::Never`) means don't bother -- there's nothing
+/// coming.
 #[derive(serde::Serialize)]
 struct GeneratedImageResult {
     path: String,
     data_url: String,
-    /// The persona's in-character reaction to the image (turn 3 -- see
-    /// `chat_turn`'s module doc comment), if that call succeeded. `None`
-    /// rather than failing the whole command on a reaction error -- the
-    /// image itself already generated fine, and losing the commentary on
-    /// it isn't worth treating as an overall failure.
-    reaction: Option<String>,
+    reaction_pending: bool,
 }
 
 #[tauri::command]
@@ -788,15 +799,59 @@ async fn generate_comfyui_image(
     fields: comfyui::ImagePromptFields,
 ) -> Result<GeneratedImageResult, String> {
     let comfy_cfg = comfyui::load_or_init().map_err(|e| e.to_string())?;
-    let cfg = config::load_or_init().map_err(|e| e.to_string())?;
-    let result = chat_turn::run_full_image_generation(&cfg, &comfy_cfg, &session_id, &fields)
+    let image = chat_turn::generate_and_save_image(&comfy_cfg, &session_id, &fields)
         .await
         .map_err(|e| e.to_string())?;
     Ok(GeneratedImageResult {
-        path: result.path.display().to_string(),
-        data_url: result.data_url,
-        reaction: result.reaction,
+        path: image.path.display().to_string(),
+        data_url: image.data_url,
+        reaction_pending: comfy_cfg.reaction_mode != comfyui::ReactionMode::Never,
     })
+}
+
+/// A turn 3/4 reply plus its reasoning, if any -- see
+/// `chat_turn::TurnReply`'s doc comment. `thinking` is for the GUI's
+/// "thinking" placeholder only, same as turn 1's; never persisted.
+#[derive(serde::Serialize)]
+struct TurnReplyResult {
+    text: Option<String>,
+    thinking: Option<String>,
+}
+
+impl From<chat_turn::TurnReply> for TurnReplyResult {
+    fn from(reply: chat_turn::TurnReply) -> Self {
+        Self {
+            text: reply.text,
+            thinking: reply.thinking,
+        }
+    }
+}
+
+/// Turn 3, as its own round-trip -- called separately, after
+/// `generate_comfyui_image` already resolved, so the image shows up right
+/// away and only the reaction (which can take a real chunk of time on its
+/// own) sits behind a follow-up "thinking" indicator. `positive_prompt` and
+/// `image_data_url` are exactly what `generate_comfyui_image`'s caller
+/// already has on hand (the request's own prompt fields, that command's
+/// `data_url`), so nothing needs to be persisted or looked up again to
+/// bridge the two calls.
+#[tauri::command]
+async fn run_image_reaction(
+    session_id: String,
+    positive_prompt: String,
+    image_data_url: String,
+) -> Result<TurnReplyResult, String> {
+    let comfy_cfg = comfyui::load_or_init().map_err(|e| e.to_string())?;
+    let cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    Ok(chat_turn::run_and_persist_image_reaction(
+        &cfg,
+        &session_id,
+        &positive_prompt,
+        &image_data_url,
+        comfy_cfg.reaction_mode,
+    )
+    .await
+    .into())
 }
 
 /// Tests what's typed in the dialog, not what's saved -- same contract as
@@ -815,28 +870,57 @@ async fn test_searxng_search(
 /// The real web-search path a chat turn's ` ```web-search``` ` request goes
 /// through, once `send_chat_message` has already returned -- same reasoning
 /// as `generate_comfyui_image`.
+///
+/// Search only -- no answer (turn 4) -- same split as
+/// `generate_comfyui_image`/`run_image_reaction`, and for the same reason:
+/// the results are already final the moment the search itself returns, so
+/// there's no reason to make them wait on a second LLM call too.
 #[derive(serde::Serialize)]
 struct WebSearchCommandResult {
     results: Vec<searxng::SearchResult>,
-    /// `None` only if the answer turn itself failed -- see
-    /// `chat_turn::WebSearchResult`'s doc comment.
-    answer: Option<String>,
+    /// The search itself failing (vs. succeeding with nothing relevant) --
+    /// see `chat_turn::WebSearchResult`'s doc comment. Not shown to the
+    /// user directly; the answer turn already covers that in character.
+    search_error: Option<String>,
 }
 
 #[tauri::command]
-async fn run_web_search(
+async fn run_web_search(query: String) -> Result<WebSearchCommandResult, String> {
+    let searxng_cfg = searxng::load_or_init().map_err(|e| e.to_string())?;
+    let (results, search_error) = match searxng::search(&searxng_cfg, &query).await {
+        Ok(results) => (results, None),
+        Err(e) => {
+            log::warn!("run_web_search: search itself failed: {e}");
+            (Vec::new(), Some(e.to_string()))
+        }
+    };
+    Ok(WebSearchCommandResult {
+        results,
+        search_error,
+    })
+}
+
+/// Turn 4, as its own round-trip -- called separately, after `run_web_search`
+/// already resolved, same reasoning as `run_image_reaction`. `results` and
+/// `search_error` are exactly what `run_web_search`'s caller already has on
+/// hand from that command's own result.
+#[tauri::command]
+async fn run_search_answer(
     session_id: String,
     query: String,
-) -> Result<WebSearchCommandResult, String> {
-    let searxng_cfg = searxng::load_or_init().map_err(|e| e.to_string())?;
+    results: Vec<searxng::SearchResult>,
+    search_error: Option<String>,
+) -> Result<TurnReplyResult, String> {
     let cfg = config::load_or_init().map_err(|e| e.to_string())?;
-    let result = chat_turn::run_full_web_search(&cfg, &searxng_cfg, &session_id, &query)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(WebSearchCommandResult {
-        results: result.results,
-        answer: result.answer,
-    })
+    Ok(chat_turn::run_and_persist_search_answer(
+        &cfg,
+        &session_id,
+        &query,
+        &results,
+        search_error.as_deref(),
+    )
+    .await
+    .into())
 }
 
 /// Redisplays an already-saved generated image -- reopening a session calls
@@ -1025,7 +1109,9 @@ fn main() {
 
     init_logging();
     log::info!(
-        "LLM Assistant starting, config dir = {}",
+        "LLM Assistant starting, version={} build={}, config dir = {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("BUILD_HASH"),
         paths::app_config_dir().display()
     );
 
@@ -1118,10 +1204,12 @@ fn main() {
             save_searxng_config,
             test_searxng_search,
             run_web_search,
+            run_search_answer,
             pick_comfyui_output_dir,
             default_system_prompt,
             test_connection,
             app_version,
+            app_build_hash,
             load_general_rules,
             save_general_rules,
             default_general_rules,
@@ -1159,6 +1247,7 @@ fn main() {
             send_chat_message,
             test_comfyui_generation,
             generate_comfyui_image,
+            run_image_reaction,
             read_generated_image,
             save_generated_image_as,
             probe_vision_capability,

@@ -45,14 +45,14 @@ pub struct ComfyUiMapping {
     pub steps: String,
 }
 
-/// Whether turn 3 (`chat_turn::run_image_reaction_turn`) must always produce
-/// an in-character comment on a freshly generated image, gets to decide for
-/// itself -- based on how turn 1 just went and the session's own
-/// `state.md` -- whether a comment fits at all, or never runs at all.
-/// `Always` is the original, simpler behavior and stays the default so
+/// Whether turn 3 (`chat_turn::run_image_reaction_turn`) must always
+/// continue the conversation in character once a fresh image lands, gets to
+/// decide for itself -- based on how turn 1 just went and the session's own
+/// `state.md` -- whether continuing right now fits at all, or never runs at
+/// all. `Always` is the original, simpler behavior and stays the default so
 /// existing configs (missing this field entirely) don't change behavior.
 /// `Never` skips turn 3 entirely (no extra request at all), for anyone who
-/// just wants the image with no follow-up commentary.
+/// just wants the image with no follow-up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ReactionMode {

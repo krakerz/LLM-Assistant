@@ -226,9 +226,18 @@ async fn run_async(opts: Options) -> i32 {
                             .await
                             {
                                 Ok(result) => {
-                                    println!("[{} result(s) found]", result.results.len());
-                                    for r in &result.results {
-                                        println!("  - {} ({})", r.title, r.url);
+                                    // The search itself failing still gets
+                                    // an answer turn (an in-character
+                                    // apology) rather than short-circuiting
+                                    // -- see `search_error`'s doc comment.
+                                    match &result.search_error {
+                                        Some(err) => println!("[search itself failed: {err}]"),
+                                        None => {
+                                            println!("[{} result(s) found]", result.results.len());
+                                            for r in &result.results {
+                                                println!("  - {} ({})", r.title, r.url);
+                                            }
+                                        }
                                     }
                                     match &result.answer {
                                         Some(answer) => println!("\n{}", to_plain_text(answer)),
