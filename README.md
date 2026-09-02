@@ -149,5 +149,5 @@ Everything lives under `$XDG_CONFIG_HOME/llm-assistant` (usually
 ---
 
 Built with the help of AI (Claude Code), and tested against a local LM
-Studio setup running a Gemma-based uncensored model. Behavior with other
+Studio setup running `gemma-4-e2b-it-uncensored-max`. Behavior with other
 local models may vary.

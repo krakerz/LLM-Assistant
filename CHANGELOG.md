@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [1.13.2] — 2026-09-02
+
+### Fixed
+- The vision probe backing the image reaction turn's gate only ever ran once per app launch -- if the first model it checked had no vision support, `visionConfirmed` stayed `false` for the rest of the session even after switching to a model that does, silently skipping turn 3 for every image generated afterward. It now re-probes whenever the configured endpoint/model actually changes, not just on the first send
+
 ## [1.13.1] — 2026-09-02
 
 ### Fixed
