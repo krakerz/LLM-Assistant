@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [1.13.0] — 2026-09-02
+
+### Added
+- **Real web search.** A new Settings "Web Search" tab (SearXNG base URL, optional API key, max results per search) -- the model can now request an actual search with a ` ```web-search``` ` block, the app runs it for real against your SearXNG instance, and a follow-up message answers using the real results (same "can't know the outcome yet" pattern as image generation's reaction turn). The `other-tools` ruleset was renamed to `web-search` and its role changed to match: it now holds only content-policy guidance (what not to search for or return -- NSFW, politics, whatever you want filtered), the same way `image-generation-prompt` holds only tag preferences -- the URL/API key live in Settings, and the fence mechanics are app-guaranteed regardless of what the ruleset file says. Verified end-to-end against a real SearXNG instance: a genuine query came back with real results and a persona answer that correctly reflected them
+
+### Fixed
+- Every dialog in the app (Settings, persona/ruleset editors, rename, confirm, state quick-view, add-path) shared the same native `<dialog>`/`showModal()` gap the image preview turned out to have -- no real backdrop dimming, no real centering, masked everywhere else by being opaque and small. All converted to the same plain fixed-overlay pattern as the image preview, rather than leaving them relying on the same broken mechanism
+
+## [1.12.1] — 2026-09-02
+
+### Fixed
+- `--persona-chat`'s image generation printed "reaction turn failed -- see the log" whenever no reaction came back, even when nothing actually failed -- a "never comment" reaction mode never attempts one at all, and "decide for itself" can legitimately choose not to. Only an actual `Always`-mode failure says "failed" now; the other two say what really happened instead
+
 ## [1.12.0] — 2026-09-02
 
 ### Added

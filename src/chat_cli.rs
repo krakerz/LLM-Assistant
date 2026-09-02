@@ -16,7 +16,7 @@
 
 use crate::llm::ChatMessage;
 use crate::rules::to_plain_text;
-use crate::{chat_session, chat_turn, comfyui, config, persona};
+use crate::{chat_session, chat_turn, comfyui, config, persona, searxng};
 use std::io::{self, BufRead, Write};
 
 pub fn list_personas() {
@@ -186,16 +186,59 @@ async fn run_async(opts: Options) -> i32 {
                                 // hand afterward.
                                 Ok(result) => {
                                     println!("[image saved to: {}]", result.path.display());
-                                    if let Some(reaction) = &result.reaction {
-                                        println!("\n{}", to_plain_text(reaction));
-                                    } else {
-                                        println!("[reaction turn failed -- see the log]");
+                                    // A missing reaction isn't necessarily a
+                                    // failure -- `Never` never asks at all,
+                                    // and `Optional` can legitimately decide
+                                    // not to comment. Only `Always` coming
+                                    // back empty is an actual problem worth
+                                    // pointing at the log.
+                                    match (&result.reaction, comfy_cfg.reaction_mode) {
+                                        (Some(reaction), _) => {
+                                            println!("\n{}", to_plain_text(reaction))
+                                        }
+                                        (None, comfyui::ReactionMode::Never) => {}
+                                        (None, comfyui::ReactionMode::Optional) => {
+                                            println!(
+                                                "[no reaction this time -- the persona decided not to comment, or the request failed; see the log]"
+                                            );
+                                        }
+                                        (None, comfyui::ReactionMode::Always) => {
+                                            println!("[reaction turn failed -- see the log]");
+                                        }
                                     }
                                 }
                                 Err(e) => println!("[image generation failed: {e}]"),
                             }
                         }
                         Err(e) => println!("[could not load ComfyUI config: {e}]"),
+                    }
+                }
+                if let Some(query) = &outcome.web_search_requested {
+                    println!("\n[searching the web for: {query}...]");
+                    match searxng::load_or_init() {
+                        Ok(searxng_cfg) => {
+                            match chat_turn::run_full_web_search(
+                                &cfg,
+                                &searxng_cfg,
+                                &session_id,
+                                query,
+                            )
+                            .await
+                            {
+                                Ok(result) => {
+                                    println!("[{} result(s) found]", result.results.len());
+                                    for r in &result.results {
+                                        println!("  - {} ({})", r.title, r.url);
+                                    }
+                                    match &result.answer {
+                                        Some(answer) => println!("\n{}", to_plain_text(answer)),
+                                        None => println!("[answer turn failed -- see the log]"),
+                                    }
+                                }
+                                Err(e) => println!("[web search failed: {e}]"),
+                            }
+                        }
+                        Err(e) => println!("[could not load SearXNG config: {e}]"),
                     }
                 }
                 if let Some(summary) = &outcome.summary {

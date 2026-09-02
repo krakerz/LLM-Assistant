@@ -482,6 +482,45 @@ pub fn strip_image_prompt_blocks(text: &str) -> String {
     collapse_blank_runs(&out).trim().to_string()
 }
 
+/// The read side of the "search the web" contract -- a ` ```web-search ```
+/// ` fence with a single `query: ...` line, same `key: value` shape as
+/// `extract_image_prompt_request` but with just the one field. `None` if
+/// the fence is absent or its query is empty.
+pub fn extract_web_search_request(text: &str) -> Option<String> {
+    let marker = "```web-search\n";
+    let start = text.find(marker)? + marker.len();
+    let end = text[start..].find("```")?;
+    let body = &text[start..start + end];
+    for line in body.lines() {
+        let (key, value) = line.split_once(':')?;
+        if key.trim() == "query" {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Removes every ` ```web-search ``` ` block from `text` for display, same
+/// reasoning as `strip_image_prompt_blocks`.
+pub fn strip_web_search_blocks(text: &str) -> String {
+    let mut out = text.to_string();
+    loop {
+        let marker = "```web-search\n";
+        let Some(pos) = out.find(marker) else {
+            break;
+        };
+        let body_start = pos + marker.len();
+        let Some(end_rel) = out[body_start..].find("```") else {
+            break;
+        };
+        out.replace_range(pos..body_start + end_rel + 3, "");
+    }
+    collapse_blank_runs(&out).trim().to_string()
+}
+
 /// The two tags reasoning-capable models are actually seen using in the
 /// wild for their own chain-of-thought, wrapped around it in the plain
 /// `content` string rather than in some separate API field -- which is the
@@ -768,6 +807,13 @@ pub fn build_dispatch_system_content(
             out.push_str(crate::comfyui::IMAGE_PROMPT_PROTOCOL);
             out.push_str("\n\n");
         }
+        // Same reasoning, for the same reason: `web-search` now holds only
+        // content-policy guidance (what not to search for/return), never
+        // the fence mechanics -- those can't depend on file content either.
+        if name == crate::ruleset::WEB_SEARCH_RULESET_NAME {
+            out.push_str(crate::searxng::WEB_SEARCH_PROTOCOL);
+            out.push_str("\n\n");
+        }
         out.push_str(content);
     }
     append_state_block(&mut out, state, state_max_tokens);
@@ -1000,7 +1046,7 @@ mod tests {
                     hint: Some("use this for images".to_string()),
                 },
                 crate::ruleset::RulesetSummary {
-                    name: "other-tools".to_string(),
+                    name: "web-search".to_string(),
                     hint: None,
                 },
             ],
@@ -1008,7 +1054,7 @@ mod tests {
         );
         assert!(out.contains("image-generation-prompt"));
         assert!(out.contains("use this for images"));
-        assert!(out.contains("other-tools"));
+        assert!(out.contains("web-search"));
         assert!(out.contains("```ruleset"));
     }
 
@@ -1026,12 +1072,12 @@ mod tests {
             0,
             &[],
             &[(
-                "other-tools".to_string(),
-                "SearXNG URL: http://example".to_string(),
+                "web-search".to_string(),
+                "Never return NSFW results".to_string(),
             )],
         );
-        assert!(out.contains("Loaded ruleset: other-tools"));
-        assert!(out.contains("SearXNG URL: http://example"));
+        assert!(out.contains("Loaded ruleset: web-search"));
+        assert!(out.contains("Never return NSFW results"));
     }
 
     #[test]
@@ -1055,11 +1101,30 @@ mod tests {
     }
 
     #[test]
+    fn build_dispatch_system_content_injects_the_web_search_protocol_regardless_of_file_content() {
+        // Same guard, for the same reason, as the image-prompt one above --
+        // `web-search` holds only content-policy guidance now, never the
+        // fence mechanics.
+        let out = build_dispatch_system_content(
+            None,
+            "",
+            0,
+            &[],
+            &[(
+                crate::ruleset::WEB_SEARCH_RULESET_NAME.to_string(),
+                "Never return NSFW results".to_string(),
+            )],
+        );
+        assert!(out.contains("```web-search"));
+        assert!(out.contains("Never return NSFW results"));
+    }
+
+    #[test]
     fn extract_ruleset_request_reads_the_name() {
-        let reply = "Sure, let me check.\n```ruleset other-tools\n```\nOne moment.";
+        let reply = "Sure, let me check.\n```ruleset web-search\n```\nOne moment.";
         assert_eq!(
             extract_ruleset_request(reply).as_deref(),
-            Some("other-tools")
+            Some("web-search")
         );
     }
 
@@ -1070,7 +1135,7 @@ mod tests {
 
     #[test]
     fn strip_ruleset_requests_hides_it_from_display() {
-        let reply = "Here's what happened.\n```ruleset other-tools\n```\nAnything else?";
+        let reply = "Here's what happened.\n```ruleset web-search\n```\nAnything else?";
         let display = strip_ruleset_requests(reply);
         assert!(!display.contains("```ruleset"), "{display}");
         assert!(display.contains("Here's what happened."));
@@ -1125,6 +1190,43 @@ mod tests {
     fn strip_image_prompt_blocks_is_a_no_op_without_one() {
         let reply = "just a normal reply";
         assert_eq!(strip_image_prompt_blocks(reply), reply);
+    }
+
+    #[test]
+    fn extract_web_search_request_reads_the_query() {
+        let reply =
+            "One moment.\n```web-search\nquery: current weather in Jakarta\n```\nSearching...";
+        assert_eq!(
+            extract_web_search_request(reply).as_deref(),
+            Some("current weather in Jakarta")
+        );
+    }
+
+    #[test]
+    fn extract_web_search_request_is_none_without_a_query_line() {
+        let reply = "```web-search\nsomething_else: whatever\n```";
+        assert_eq!(extract_web_search_request(reply), None);
+    }
+
+    #[test]
+    fn extract_web_search_request_is_none_for_a_plain_reply() {
+        assert_eq!(extract_web_search_request("just an answer"), None);
+    }
+
+    #[test]
+    fn strip_web_search_blocks_hides_it_from_display() {
+        let reply = "Let me check.\n```web-search\nquery: cat facts\n```\nOne sec.";
+        let display = strip_web_search_blocks(reply);
+        assert!(!display.contains("```web-search"), "{display}");
+        assert!(!display.contains("query:"), "{display}");
+        assert!(display.contains("Let me check."));
+        assert!(display.contains("One sec."));
+    }
+
+    #[test]
+    fn strip_web_search_blocks_is_a_no_op_without_one() {
+        let reply = "just a normal reply";
+        assert_eq!(strip_web_search_blocks(reply), reply);
     }
 
     #[test]

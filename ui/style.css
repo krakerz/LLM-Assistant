@@ -399,7 +399,27 @@ details.bubble.thinking > .bubble.assistant {
   font: inherit;
 }
 
-dialog {
+/* Plain fixed overlays, not native <dialog>/showModal() -- see the longer
+   comment on `.image-preview-overlay` further down for why: this webview's
+   <dialog> doesn't actually provide the top-layer/backdrop/auto-centering
+   behavior the spec promises, which the image preview exposed first (fully
+   transparent, so there was nothing left to hide the gap). Every dialog in
+   the app shares this same pattern now instead of relying on that. */
+.app-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.app-dialog-overlay[hidden] {
+  display: none;
+}
+
+.app-dialog-inner {
   background: var(--panel);
   color: var(--text);
   border: 1px solid var(--border);
@@ -409,22 +429,18 @@ dialog {
   font-size: var(--ui-font-size);
 }
 
-dialog::backdrop {
-  background: rgba(0, 0, 0, 0.55);
-}
-
-dialog h3 {
+.app-dialog-inner h3 {
   margin-top: 0;
 }
 
-dialog .explain {
+.app-dialog-inner .explain {
   color: var(--muted);
   font-size: 13px;
 }
 
 /* Same amber as the sudo callout: the two places where the app tells the user
    something it cannot fix for them. */
-dialog .explain.warn {
+.app-dialog-inner .explain.warn {
   color: #e0b35c;
 }
 
@@ -487,7 +503,7 @@ dialog .explain.warn {
 
 /* Wider than the base dialog: labels here grew into full explanatory
    sentences, and at 560px nearly every one wraps across nine or ten lines. */
-#settingsDialog {
+#settingsDialog .app-dialog-inner {
   width: min(760px, 92vw);
   max-height: 85vh;
   overflow-y: auto;
@@ -549,7 +565,7 @@ dialog .explain.warn {
   border-bottom-color: var(--accent);
 }
 
-dialog .cmd {
+.app-dialog-inner .cmd {
   background: #0f1116;
   border: 1px solid var(--border);
   border-radius: 6px;

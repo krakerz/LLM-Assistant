@@ -11,7 +11,7 @@
 //! is shown alongside its name in the availability note as a concrete
 //! trigger condition (e.g. "use this when the user asks for an image").
 //! Added after a real session where a small local model, told only the bare
-//! names "image-generation-prompt"/"other-tools", never once connected a
+//! names "image-generation-prompt"/"web-search", never once connected a
 //! direct "generate me a beach image" request to either -- an abstract
 //! "request one if a task calls for it" instruction asks the model to
 //! reason its way to relevance, which is exactly the kind of indirect
@@ -21,10 +21,10 @@
 //! ruleset without one still works exactly as before, just without a hint.
 //!
 //! Two ruleset slots always exist -- `image-generation-prompt` (for the
-//! ComfyUI integration) and `other-tools` (free-form, e.g. a SearXNG URL for
-//! web browsing) -- both ship *blank*, and both have their hint guaranteed
-//! by the app regardless of file content (`IMAGE_GENERATION_HINT`/
-//! `OTHER_TOOLS_HINT`), after the same real regression happened to each:
+//! ComfyUI integration) and `web-search` (content-policy guidance for the
+//! `searxng` web search tool) -- both ship *blank*, and both have their hint
+//! guaranteed by the app regardless of file content (`IMAGE_GENERATION_HINT`/
+//! `WEB_SEARCH_HINT`), after the same real regression happened to each:
 //! a user filling the file in with their own real content, dropping the
 //! `> ...` hint line in the process, silently lost the trigger condition
 //! that made dispatch ever request it. The ruleset editor's "see an
@@ -130,38 +130,42 @@ Any field left out keeps whatever value the workflow already has \
 configured for it -- only include the ones you actually want to fix.";
 
 /// The second (and, so far, last) ruleset name the app treats as special --
-/// same reasoning as `IMAGE_GENERATION_RULESET_NAME`. Added after the exact
-/// same regression happened to this one too: replacing its content with a
-/// real SearXNG address (dropping the `> ...` first line in the process)
-/// silently lost its hint, and dispatch stopped ever requesting it even for
-/// direct "search the web for X" requests.
-pub const OTHER_TOOLS_RULESET_NAME: &str = "other-tools";
+/// same reasoning as `IMAGE_GENERATION_RULESET_NAME`. Renamed from
+/// "other-tools" once its role narrowed from "free-form notes about tools
+/// that aren't wired in" to specifically "the real web search tool's
+/// content-policy guidance" -- `searxng` made web search an
+/// actually-executed pseudo-tool rather than reference text, so the name
+/// should say what it's actually for. The URL/API key/result count live in
+/// Settings' "Web Search" tab (`searxng::SearxngConfig`), not this file, and
+/// the fence mechanics (`searxng::WEB_SEARCH_PROTOCOL`) are app-guaranteed
+/// the same way `comfyui::IMAGE_PROMPT_PROTOCOL` is. This file's only job
+/// now is what a search should never return -- NSFW results, political
+/// topics, whatever the user wants filtered.
+pub const WEB_SEARCH_RULESET_NAME: &str = "web-search";
 
 /// Guaranteed by `list_rulesets` regardless of file content -- see
-/// `OTHER_TOOLS_RULESET_NAME`'s doc comment.
-pub const OTHER_TOOLS_HINT: &str = "Use this when the user asks you to search or browse the \
-web, or mentions a tool you don't have direct instructions for.";
+/// `WEB_SEARCH_RULESET_NAME`'s doc comment.
+pub const WEB_SEARCH_HINT: &str = "Use this the moment the user asks something that needs \
+current or real-world information you don't already know -- news, prices, who/what/when \
+questions, anything you'd otherwise have to guess at. Request a real web search immediately \
+rather than answering from memory or making something up.";
 
 /// Reference-only, shown by the ruleset editor's "see an example" popup --
 /// never written to disk. See `IMAGE_GENERATION_EXAMPLE`'s doc comment for
-/// why: this file is free-form (there's no fixed field list the way image
-/// generation has), but it still needs *some* worked example to show
-/// someone what "fill this in yourself" actually looks like in practice.
-pub const OTHER_TOOLS_EXAMPLE: &str = "\
-- Web search: a SearXNG instance at http://localhost:8080 -- describe how to query it (e.g. \
-`<url>/search?q=...&format=json`) once you have one running.
-- Anything else you want to give the model standing instructions for that isn't built into the \
-app -- an API endpoint, a CLI tool it should know about, a convention specific to your setup.
-
-Nothing here is wired into the app automatically; it's reference material for you to point the \
-model at.";
+/// why: the mechanics are guaranteed by the app regardless of what this
+/// file says, so there's nothing mechanical left for the seed to restate --
+/// this is purely content-policy guidance now, so the example shows that.
+pub const WEB_SEARCH_EXAMPLE: &str = "\
+- Never return NSFW content in a search result or summary, even if the search itself turns some up
+- Don't search for or discuss political topics -- decline and steer the conversation elsewhere instead
+- Prefer summarizing search results in your own words over quoting them at length";
 
 /// Example content for the ruleset editor's "see an example" popup, if this
 /// ruleset has one -- `None` means that link/button stays hidden for it.
 pub fn example_for(name: &str) -> Option<&'static str> {
     match name {
         IMAGE_GENERATION_RULESET_NAME => Some(IMAGE_GENERATION_EXAMPLE),
-        OTHER_TOOLS_RULESET_NAME => Some(OTHER_TOOLS_EXAMPLE),
+        WEB_SEARCH_RULESET_NAME => Some(WEB_SEARCH_EXAMPLE),
         _ => None,
     }
 }
@@ -173,9 +177,9 @@ pub fn list_rulesets() -> anyhow::Result<Vec<RulesetSummary>> {
     if !image_gen.exists() {
         fs::write(&image_gen, "")?;
     }
-    let other_tools = ruleset_path(OTHER_TOOLS_RULESET_NAME);
-    if !other_tools.exists() {
-        fs::write(&other_tools, "")?;
+    let web_search = ruleset_path(WEB_SEARCH_RULESET_NAME);
+    if !web_search.exists() {
+        fs::write(&web_search, "")?;
     }
 
     let mut names: Vec<String> = fs::read_dir(&dir)?
@@ -197,13 +201,13 @@ pub fn list_rulesets() -> anyhow::Result<Vec<RulesetSummary>> {
         .map(|name| {
             // Both built-in rulesets always get their guaranteed hint,
             // regardless of what their file says -- see
-            // `IMAGE_GENERATION_HINT`'s and `OTHER_TOOLS_HINT`'s doc
+            // `IMAGE_GENERATION_HINT`'s and `WEB_SEARCH_HINT`'s doc
             // comments for why this can't be allowed to depend on file
             // content the way an arbitrary user-created ruleset's hint does.
             let hint = if name == IMAGE_GENERATION_RULESET_NAME {
                 Some(IMAGE_GENERATION_HINT.to_string())
-            } else if name == OTHER_TOOLS_RULESET_NAME {
-                Some(OTHER_TOOLS_HINT.to_string())
+            } else if name == WEB_SEARCH_RULESET_NAME {
+                Some(WEB_SEARCH_HINT.to_string())
             } else {
                 fs::read_to_string(ruleset_path(&name))
                     .ok()
@@ -257,7 +261,7 @@ mod tests {
             names,
             vec![
                 "image-generation-prompt".to_string(),
-                "other-tools".to_string()
+                "web-search".to_string()
             ]
         );
         // Blank by default -- see `IMAGE_GENERATION_EXAMPLE`'s doc comment
@@ -279,11 +283,11 @@ mod tests {
             "{:?}",
             image_gen.hint
         );
-        let other_tools = summaries.iter().find(|r| r.name == "other-tools").unwrap();
+        let web_search = summaries.iter().find(|r| r.name == "web-search").unwrap();
         assert!(
-            other_tools.hint.as_deref().unwrap().contains("search"),
+            web_search.hint.as_deref().unwrap().contains("search"),
             "{:?}",
-            other_tools.hint
+            web_search.hint
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -317,31 +321,27 @@ mod tests {
             Some(IMAGE_GENERATION_EXAMPLE)
         );
         assert_eq!(
-            example_for(OTHER_TOOLS_RULESET_NAME),
-            Some(OTHER_TOOLS_EXAMPLE)
+            example_for(WEB_SEARCH_RULESET_NAME),
+            Some(WEB_SEARCH_EXAMPLE)
         );
         assert_eq!(example_for("some-made-up-name"), None);
     }
 
     #[test]
-    fn list_rulesets_keeps_the_other_tools_hint_even_if_the_file_loses_it() {
+    fn list_rulesets_keeps_the_web_search_hint_even_if_the_file_loses_it() {
         // The exact real-world regression, a second time: replacing this
-        // one's content with a real SearXNG address (dropping the `> ...`
-        // first line along with it) must not lose the hint that makes the
-        // model request it in the first place.
-        let dir = scratch("other-tools-hint-survives-edit");
+        // one's content with real content-policy guidance (dropping the
+        // `> ...` first line along with it) must not lose the hint that
+        // makes the model request it in the first place.
+        let dir = scratch("web-search-hint-survives-edit");
         list_rulesets().unwrap(); // seeds it first
-        update_ruleset(
-            OTHER_TOOLS_RULESET_NAME,
-            "SearXNG URL: http://localhost:8080",
-        )
-        .unwrap();
+        update_ruleset(WEB_SEARCH_RULESET_NAME, "Never return NSFW results").unwrap();
         let summaries = list_rulesets().unwrap();
-        let other_tools = summaries
+        let web_search = summaries
             .iter()
-            .find(|r| r.name == OTHER_TOOLS_RULESET_NAME)
+            .find(|r| r.name == WEB_SEARCH_RULESET_NAME)
             .unwrap();
-        assert_eq!(other_tools.hint.as_deref(), Some(OTHER_TOOLS_HINT));
+        assert_eq!(web_search.hint.as_deref(), Some(WEB_SEARCH_HINT));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -362,7 +362,7 @@ mod tests {
     fn load_reads_back_seeded_content() {
         let dir = scratch("load");
         list_rulesets().unwrap(); // seeds the two default files -- both blank
-        assert_eq!(load_ruleset("other-tools").unwrap(), "");
+        assert_eq!(load_ruleset("web-search").unwrap(), "");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -370,10 +370,10 @@ mod tests {
     fn update_overwrites_a_seeded_rulesets_content() {
         let dir = scratch("update");
         list_rulesets().unwrap(); // seeds the two default files
-        update_ruleset("other-tools", "SearXNG URL: http://localhost:8080").unwrap();
+        update_ruleset("web-search", "Never return NSFW results").unwrap();
         assert_eq!(
-            load_ruleset("other-tools").unwrap(),
-            "SearXNG URL: http://localhost:8080"
+            load_ruleset("web-search").unwrap(),
+            "Never return NSFW results"
         );
         let _ = fs::remove_dir_all(&dir);
     }

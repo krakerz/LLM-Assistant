@@ -13,6 +13,10 @@
 //!    returns a generated image (`main.rs`'s `generate_comfyui_image`,
 //!    which can be seconds to minutes after 1/2 already returned) -- not
 //!    part of `run_chat_turn` at all.
+//! 4. `run_search_answer_turn` -- the same shape as 3, but for a real
+//!    `searxng` web search instead of an image: fired once real results
+//!    come back, feeding them to the model for an answer grounded in what
+//!    was actually found rather than a guess.
 //!
 //! This three-way split is a deliberate departure from "one LLM request per
 //! call, no auto-continue chain": a real session showed one completion
@@ -28,7 +32,7 @@
 
 use crate::config::AppConfig;
 use crate::llm::ChatMessage;
-use crate::{chat_session, comfyui, context, persona, rules, ruleset};
+use crate::{chat_session, comfyui, context, persona, rules, ruleset, searxng};
 
 pub struct ChatTurnOutcome {
     pub reply: String,
@@ -51,6 +55,11 @@ pub struct ChatTurnOutcome {
     /// (` ```image-prompt ``` `), if any. Generation itself happens later,
     /// separately -- see the module doc comment.
     pub image_prompt_requested: Option<comfyui::ImagePromptFields>,
+    /// A web search the dispatch pass requested this turn
+    /// (` ```web-search ``` `), if any -- the query itself. The actual
+    /// search and answer happen later, separately, same reasoning as
+    /// `image_prompt_requested`.
+    pub web_search_requested: Option<String>,
     pub dropped: usize,
     pub condensed: usize,
     pub summarized: usize,
@@ -170,8 +179,8 @@ pub async fn run_chat_turn(
     // well-behaved model has no reason to emit either fence here. Stripped
     // in case one shows up anyway; never acted on -- that's the dispatch
     // pass's job below.
-    let stored_reply = rules::strip_image_prompt_blocks(&rules::strip_ruleset_requests(
-        &rules::strip_state_blocks(&reply),
+    let stored_reply = rules::strip_web_search_blocks(&rules::strip_image_prompt_blocks(
+        &rules::strip_ruleset_requests(&rules::strip_state_blocks(&reply)),
     ));
 
     let mut full_history = trimmed
@@ -215,6 +224,7 @@ pub async fn run_chat_turn(
         ruleset_loaded: dispatch.ruleset_loaded,
         ruleset_error: dispatch.ruleset_error,
         image_prompt_requested: dispatch.image_prompt_requested,
+        web_search_requested: dispatch.web_search_requested,
         dropped: trimmed.dropped,
         condensed: trimmed.condensed,
         summarized: trimmed.summarized,
@@ -273,6 +283,7 @@ struct DispatchOutcome {
     ruleset_loaded: Option<String>,
     ruleset_error: Option<String>,
     image_prompt_requested: Option<comfyui::ImagePromptFields>,
+    web_search_requested: Option<String>,
 }
 
 impl DispatchOutcome {
@@ -281,6 +292,7 @@ impl DispatchOutcome {
             ruleset_loaded: None,
             ruleset_error: None,
             image_prompt_requested: None,
+            web_search_requested: None,
         }
     }
 }
@@ -364,6 +376,10 @@ async fn run_dispatch_turn(
             .or_else(|| extract_mistagged_image_prompt(&dispatch_reply, &loaded_rulesets));
         if let Some(fields) = image_request {
             outcome.image_prompt_requested = Some(fields);
+            return outcome;
+        }
+        if let Some(query) = rules::extract_web_search_request(&dispatch_reply) {
+            outcome.web_search_requested = Some(query);
             return outcome;
         }
         let ruleset_request = rules::extract_ruleset_request(&dispatch_reply)
@@ -577,8 +593,8 @@ pub async fn run_image_reaction_turn(
     if let Some(new_state) = &state_block {
         chat_session::update_state(session_id, new_state)?;
     }
-    let stored_reply = rules::strip_image_prompt_blocks(&rules::strip_ruleset_requests(
-        &rules::strip_state_blocks(&reply),
+    let stored_reply = rules::strip_web_search_blocks(&rules::strip_image_prompt_blocks(
+        &rules::strip_ruleset_requests(&rules::strip_state_blocks(&reply)),
     ));
 
     if reaction_mode == comfyui::ReactionMode::Optional
@@ -587,6 +603,105 @@ pub async fn run_image_reaction_turn(
         return Ok(None);
     }
     Ok(Some(stored_reply))
+}
+
+/// The whole "a web search was requested" pipeline: search, then let the
+/// persona answer using the real results (turn 4). Shared by the GUI's
+/// `run_web_search` Tauri command and `chat_cli.rs`, same reasoning as
+/// `run_full_image_generation`.
+pub struct WebSearchResult {
+    pub results: Vec<searxng::SearchResult>,
+    /// `None` only if the answer turn itself failed (network/LLM error) --
+    /// the search results are already real by the time this runs, so unlike
+    /// the image reaction there's no "considered decision not to answer"
+    /// case to distinguish.
+    pub answer: Option<String>,
+}
+
+pub async fn run_full_web_search(
+    cfg: &AppConfig,
+    searxng_cfg: &searxng::SearxngConfig,
+    session_id: &str,
+    query: &str,
+) -> anyhow::Result<WebSearchResult> {
+    let results = searxng::search(searxng_cfg, query).await?;
+    let answer = match run_search_answer_turn(cfg, session_id, query, &results).await {
+        Ok(text) => {
+            if let Err(e) = chat_session::append_assistant_message(session_id, &text) {
+                log::warn!("run_full_web_search: failed to save answer: {e}");
+            }
+            Some(text)
+        }
+        Err(e) => {
+            log::warn!("run_full_web_search: answer turn failed: {e}");
+            None
+        }
+    };
+    Ok(WebSearchResult { results, answer })
+}
+
+/// Turn 4 -- see the module doc comment. Same shape as
+/// `run_image_reaction_turn`: reuses `build_chat_system_content`, a real
+/// answer **is** a normal in-character reply, it just needs the real
+/// results as its trigger instead of the user's own words. No vision
+/// input this time -- it's text, not an image.
+pub async fn run_search_answer_turn(
+    cfg: &AppConfig,
+    session_id: &str,
+    query: &str,
+    results: &[searxng::SearchResult],
+) -> anyhow::Result<String> {
+    let (meta, _) = chat_session::load_session(session_id)?;
+    let persona_content = match &meta.persona {
+        Some(name) => persona::load_persona(name).ok(),
+        None => None,
+    };
+    let state = chat_session::read_state(session_id);
+    let system_content = rules::build_chat_system_content(
+        persona_content.as_deref(),
+        &state,
+        cfg.chat_state_max_tokens,
+    );
+
+    let results_text = if results.is_empty() {
+        "(no results came back)".to_string()
+    } else {
+        results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| format!("{}. {} ({})\n{}", i + 1, r.title, r.url, r.content))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    let trigger = ChatMessage::text(
+        "user",
+        format!(
+            "[You just searched the web for: {query}] Here are the real results:\n\n{results_text}\n\n\
+             Answer the original question using these results, briefly, in character. If none of \
+             them actually help, say so honestly rather than guessing."
+        ),
+    );
+
+    let messages = vec![ChatMessage::text("system", system_content), trigger];
+    let reply = crate::llm::send_chat(
+        &cfg.endpoint,
+        &cfg.model,
+        &cfg.api_key,
+        cfg.chat_temperature,
+        &messages,
+    )
+    .await?;
+
+    let reply = rules::strip_thinking_blocks(&reply);
+    let state_block = rules::extract_state_block(&reply);
+    if let Some(new_state) = &state_block {
+        chat_session::update_state(session_id, new_state)?;
+    }
+    Ok(rules::strip_web_search_blocks(
+        &rules::strip_image_prompt_blocks(&rules::strip_ruleset_requests(
+            &rules::strip_state_blocks(&reply),
+        )),
+    ))
 }
 
 #[cfg(test)]
@@ -600,7 +715,7 @@ mod tests {
                 hint: None,
             },
             ruleset::RulesetSummary {
-                name: "other-tools".to_string(),
+                name: "web-search".to_string(),
                 hint: None,
             },
         ]
