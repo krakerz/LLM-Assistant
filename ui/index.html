@@ -139,6 +139,15 @@
     </div>
   </dialog>
 
+  <dialog id="imagePreviewDialog" class="image-preview-dialog">
+    <img id="imagePreviewImg" alt="Generated image preview" />
+    <p id="imagePreviewSaveResult" class="explain"></p>
+    <div class="dialog-actions">
+      <button id="imagePreviewCloseBtn" type="button">Close</button>
+      <button id="imagePreviewSaveBtn" type="button">Save…</button>
+    </div>
+  </dialog>
+
   <dialog id="chatStateDialog">
     <h3>Remembered state for this chat</h3>
     <pre id="chatStateContent" class="cmd"></pre>
@@ -367,6 +376,7 @@
         <select id="cfgComfyReactionMode">
           <option value="always">Always comment on it in character</option>
           <option value="optional">Decide based on the reply and its state whether a comment fits</option>
+          <option value="none">Never comment -- just show the image</option>
         </select>
       </label>
 

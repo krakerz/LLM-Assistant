@@ -20,10 +20,18 @@
 //! convention-based (not a required frontmatter field) so an existing
 //! ruleset without one still works exactly as before, just without a hint.
 //!
-//! Two seed files ship so there's always something to request: an
-//! image-generation-prompt ruleset (for the ComfyUI integration) and a
-//! free-form "other tools" ruleset (e.g. a SearXNG URL for web browsing,
-//! filled in by the user).
+//! Two ruleset slots always exist -- `image-generation-prompt` (for the
+//! ComfyUI integration) and `other-tools` (free-form, e.g. a SearXNG URL for
+//! web browsing) -- both ship *blank*, and both have their hint guaranteed
+//! by the app regardless of file content (`IMAGE_GENERATION_HINT`/
+//! `OTHER_TOOLS_HINT`), after the same real regression happened to each:
+//! a user filling the file in with their own real content, dropping the
+//! `> ...` hint line in the process, silently lost the trigger condition
+//! that made dispatch ever request it. The ruleset editor's "see an
+//! example" popup (`example_for`) shows what the file *could* contain
+//! without that ever being written to disk, so an empty file stays a
+//! deliberate, stable state rather than something to "fix" back to a
+//! template.
 
 use crate::paths::{app_config_dir, sanitize_filename};
 use std::fs;
@@ -121,27 +129,41 @@ pub const IMAGE_GENERATION_EXAMPLE: &str = "\
 Any field left out keeps whatever value the workflow already has \
 configured for it -- only include the ones you actually want to fix.";
 
-pub const SEED_OTHER_TOOLS: &str = "\
-> Use this when the user asks you to search or browse the web, or mentions a tool you don't have direct instructions for.
-# Other tools
+/// The second (and, so far, last) ruleset name the app treats as special --
+/// same reasoning as `IMAGE_GENERATION_RULESET_NAME`. Added after the exact
+/// same regression happened to this one too: replacing its content with a
+/// real SearXNG address (dropping the `> ...` first line in the process)
+/// silently lost its hint, and dispatch stopped ever requesting it even for
+/// direct "search the web for X" requests.
+pub const OTHER_TOOLS_RULESET_NAME: &str = "other-tools";
 
-Free-form notes about extra tools/services available outside this app's
-built-in commands. Fill this in yourself -- for example:
+/// Guaranteed by `list_rulesets` regardless of file content -- see
+/// `OTHER_TOOLS_RULESET_NAME`'s doc comment.
+pub const OTHER_TOOLS_HINT: &str = "Use this when the user asks you to search or browse the \
+web, or mentions a tool you don't have direct instructions for.";
 
-- Web search: a SearXNG instance at <URL not set> -- describe how to query
-  it (e.g. `<url>/search?q=...&format=json`) once you have one running.
+/// Reference-only, shown by the ruleset editor's "see an example" popup --
+/// never written to disk. See `IMAGE_GENERATION_EXAMPLE`'s doc comment for
+/// why: this file is free-form (there's no fixed field list the way image
+/// generation has), but it still needs *some* worked example to show
+/// someone what "fill this in yourself" actually looks like in practice.
+pub const OTHER_TOOLS_EXAMPLE: &str = "\
+- Web search: a SearXNG instance at http://localhost:8080 -- describe how to query it (e.g. \
+`<url>/search?q=...&format=json`) once you have one running.
+- Anything else you want to give the model standing instructions for that isn't built into the \
+app -- an API endpoint, a CLI tool it should know about, a convention specific to your setup.
 
-Nothing here is wired into the app automatically; it's reference material
-for you to point the model at.
-";
+Nothing here is wired into the app automatically; it's reference material for you to point the \
+model at.";
 
 /// Example content for the ruleset editor's "see an example" popup, if this
 /// ruleset has one -- `None` means that link/button stays hidden for it.
-/// Only `image-generation-prompt` has one today; a freeform doc like
-/// `other-tools` doesn't need a separate example since its own seed
-/// content already reads as one.
 pub fn example_for(name: &str) -> Option<&'static str> {
-    (name == IMAGE_GENERATION_RULESET_NAME).then_some(IMAGE_GENERATION_EXAMPLE)
+    match name {
+        IMAGE_GENERATION_RULESET_NAME => Some(IMAGE_GENERATION_EXAMPLE),
+        OTHER_TOOLS_RULESET_NAME => Some(OTHER_TOOLS_EXAMPLE),
+        _ => None,
+    }
 }
 
 pub fn list_rulesets() -> anyhow::Result<Vec<RulesetSummary>> {
@@ -151,9 +173,9 @@ pub fn list_rulesets() -> anyhow::Result<Vec<RulesetSummary>> {
     if !image_gen.exists() {
         fs::write(&image_gen, "")?;
     }
-    let other_tools = ruleset_path("other-tools");
+    let other_tools = ruleset_path(OTHER_TOOLS_RULESET_NAME);
     if !other_tools.exists() {
-        fs::write(&other_tools, SEED_OTHER_TOOLS)?;
+        fs::write(&other_tools, "")?;
     }
 
     let mut names: Vec<String> = fs::read_dir(&dir)?
@@ -173,13 +195,15 @@ pub fn list_rulesets() -> anyhow::Result<Vec<RulesetSummary>> {
     Ok(names
         .into_iter()
         .map(|name| {
-            // The one built-in ruleset always gets its guaranteed hint,
-            // regardless of what its file says -- see
-            // `IMAGE_GENERATION_HINT`'s doc comment for why this can't be
-            // allowed to depend on file content the way an arbitrary
-            // user-created ruleset's hint does.
+            // Both built-in rulesets always get their guaranteed hint,
+            // regardless of what their file says -- see
+            // `IMAGE_GENERATION_HINT`'s and `OTHER_TOOLS_HINT`'s doc
+            // comments for why this can't be allowed to depend on file
+            // content the way an arbitrary user-created ruleset's hint does.
             let hint = if name == IMAGE_GENERATION_RULESET_NAME {
                 Some(IMAGE_GENERATION_HINT.to_string())
+            } else if name == OTHER_TOOLS_RULESET_NAME {
+                Some(OTHER_TOOLS_HINT.to_string())
             } else {
                 fs::read_to_string(ruleset_path(&name))
                     .ok()
@@ -255,6 +279,12 @@ mod tests {
             "{:?}",
             image_gen.hint
         );
+        let other_tools = summaries.iter().find(|r| r.name == "other-tools").unwrap();
+        assert!(
+            other_tools.hint.as_deref().unwrap().contains("search"),
+            "{:?}",
+            other_tools.hint
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -281,13 +311,38 @@ mod tests {
     }
 
     #[test]
-    fn example_for_is_only_offered_for_image_generation() {
+    fn example_for_is_offered_for_both_built_in_rulesets_only() {
         assert_eq!(
             example_for(IMAGE_GENERATION_RULESET_NAME),
             Some(IMAGE_GENERATION_EXAMPLE)
         );
-        assert_eq!(example_for("other-tools"), None);
+        assert_eq!(
+            example_for(OTHER_TOOLS_RULESET_NAME),
+            Some(OTHER_TOOLS_EXAMPLE)
+        );
         assert_eq!(example_for("some-made-up-name"), None);
+    }
+
+    #[test]
+    fn list_rulesets_keeps_the_other_tools_hint_even_if_the_file_loses_it() {
+        // The exact real-world regression, a second time: replacing this
+        // one's content with a real SearXNG address (dropping the `> ...`
+        // first line along with it) must not lose the hint that makes the
+        // model request it in the first place.
+        let dir = scratch("other-tools-hint-survives-edit");
+        list_rulesets().unwrap(); // seeds it first
+        update_ruleset(
+            OTHER_TOOLS_RULESET_NAME,
+            "SearXNG URL: http://localhost:8080",
+        )
+        .unwrap();
+        let summaries = list_rulesets().unwrap();
+        let other_tools = summaries
+            .iter()
+            .find(|r| r.name == OTHER_TOOLS_RULESET_NAME)
+            .unwrap();
+        assert_eq!(other_tools.hint.as_deref(), Some(OTHER_TOOLS_HINT));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -306,8 +361,8 @@ mod tests {
     #[test]
     fn load_reads_back_seeded_content() {
         let dir = scratch("load");
-        list_rulesets().unwrap(); // seeds the two default files
-        assert_eq!(load_ruleset("other-tools").unwrap(), SEED_OTHER_TOOLS);
+        list_rulesets().unwrap(); // seeds the two default files -- both blank
+        assert_eq!(load_ruleset("other-tools").unwrap(), "");
         let _ = fs::remove_dir_all(&dir);
     }
 

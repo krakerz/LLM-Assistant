@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [1.12.0] — 2026-09-02
+
+### Added
+- A third "after generating an image" option: never comment at all, just show the image
+- Clicking a generated image now pops up a quick-view preview, with a Save button to copy it wherever you actually want it kept
+
+### Changed
+- `state.md`'s instructions are much stricter about not silently dropping a previously tracked field, and explicitly call out physical/appearance state (worn clothing, equipment, position) as something to track and update the instant it changes, the same as any other stat. If a field genuinely no longer applies, the instruction is now to set its value to `none`/`null` rather than deleting the line -- the field itself should never just disappear
+
+### Fixed
+- The default `state.md` token cap (500) was small enough that a richly detailed character state could silently get truncated before it ever reached the model -- the next reply could then only "restate everything" from what was left, permanently losing whatever got cut, which is exactly how a 5-field state could shrink to 3 over a few turns with nothing in the conversation asking for that. Raised to 2000
+
 ## [1.11.0] — 2026-09-02
 
 ### Added
@@ -20,6 +32,10 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 - The `image-generation-prompt` ruleset ships blank again -- a "see an example" link in the ruleset editor instead shows a reference template covering every recognized field (`checkpoint`, `width`, `height`, `sampler`, `scheduler`, `cfg`, `steps`, not just `positive`/`negative`), without writing any of it into the actual file. What you type there is entirely up to you
+- `other-tools` now gets the exact same treatment as `image-generation-prompt`: ships blank, its own hint (`OTHER_TOOLS_HINT`) is guaranteed by the app regardless of file content, and its own "see an example" popup
+
+### Fixed
+- `other-tools` could lose its ability to ever be requested the same way `image-generation-prompt` once did -- filling the file in with a real SearXNG address (dropping the `> ...` hint line along with it) silently meant dispatch never requested it again, even for a direct "search the web for X". Confirmed live: a fresh chat asking to check the internet now correctly loads it
 - Image Gen settings: a "After generating an image, the persona should" option -- always comment on it in character (the original behavior, still the default), or decide for itself, based on how the reply just went and the session's own `state.md`, whether an in-character comment actually fits right now
 
 ### Changed

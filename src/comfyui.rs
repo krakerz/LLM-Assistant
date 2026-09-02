@@ -46,17 +46,23 @@ pub struct ComfyUiMapping {
 }
 
 /// Whether turn 3 (`chat_turn::run_image_reaction_turn`) must always produce
-/// an in-character comment on a freshly generated image, or gets to decide
-/// for itself -- based on how turn 1 just went and the session's own
-/// `state.md` -- whether a comment fits at all. `Always` is the original,
-/// simpler behavior and stays the default so existing configs (missing this
-/// field entirely) don't change behavior.
+/// an in-character comment on a freshly generated image, gets to decide for
+/// itself -- based on how turn 1 just went and the session's own
+/// `state.md` -- whether a comment fits at all, or never runs at all.
+/// `Always` is the original, simpler behavior and stays the default so
+/// existing configs (missing this field entirely) don't change behavior.
+/// `Never` skips turn 3 entirely (no extra request at all), for anyone who
+/// just wants the image with no follow-up commentary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ReactionMode {
     #[default]
     Always,
     Optional,
+    /// Wire value `"none"`, not the `snake_case`-derived `"never"` -- matches
+    /// the Settings dropdown's own option value and how this was asked for.
+    #[serde(rename = "none")]
+    Never,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -563,5 +569,28 @@ mod tests {
     fn render_filename_falls_back_to_png_without_a_source_extension() {
         let name = render_filename("{session}", "sess", "no-extension-filename");
         assert!(name.ends_with(".png"));
+    }
+
+    #[test]
+    fn reaction_mode_wire_values_match_the_settings_dropdown() {
+        // The Settings UI's <select> option values are literal "always" /
+        // "optional" / "none" -- a mismatch here would silently fail to
+        // deserialize a saved config instead of loudly erroring.
+        assert_eq!(
+            serde_json::from_str::<ReactionMode>("\"always\"").unwrap(),
+            ReactionMode::Always
+        );
+        assert_eq!(
+            serde_json::from_str::<ReactionMode>("\"optional\"").unwrap(),
+            ReactionMode::Optional
+        );
+        assert_eq!(
+            serde_json::from_str::<ReactionMode>("\"none\"").unwrap(),
+            ReactionMode::Never
+        );
+        assert_eq!(
+            serde_json::to_string(&ReactionMode::Never).unwrap(),
+            "\"none\""
+        );
     }
 }

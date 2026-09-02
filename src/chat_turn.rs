@@ -400,27 +400,33 @@ pub async fn run_full_image_generation(
     let data_url = comfyui::read_as_data_url(&path)?;
 
     let positive = fields.positive.as_deref().unwrap_or("an image");
-    let reaction = match run_image_reaction_turn(
-        cfg,
-        session_id,
-        positive,
-        &data_url,
-        comfy_cfg.reaction_mode,
-    )
-    .await
-    {
-        Ok(Some(text)) => {
-            if let Err(e) = chat_session::append_assistant_message(session_id, &text) {
-                log::warn!("run_full_image_generation: failed to save reaction: {e}");
+    // `Never` skips the extra request entirely -- there's nothing to decide,
+    // unlike `Optional`'s own considered "none" from inside the call itself.
+    let reaction = if comfy_cfg.reaction_mode == comfyui::ReactionMode::Never {
+        None
+    } else {
+        match run_image_reaction_turn(
+            cfg,
+            session_id,
+            positive,
+            &data_url,
+            comfy_cfg.reaction_mode,
+        )
+        .await
+        {
+            Ok(Some(text)) => {
+                if let Err(e) = chat_session::append_assistant_message(session_id, &text) {
+                    log::warn!("run_full_image_generation: failed to save reaction: {e}");
+                }
+                Some(text)
             }
-            Some(text)
-        }
-        // `Optional` mode's own considered choice not to comment -- not a
-        // failure, nothing to log or persist.
-        Ok(None) => None,
-        Err(e) => {
-            log::warn!("run_full_image_generation: reaction turn failed: {e}");
-            None
+            // `Optional` mode's own considered choice not to comment -- not a
+            // failure, nothing to log or persist.
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!("run_full_image_generation: reaction turn failed: {e}");
+                None
+            }
         }
     };
 
@@ -466,7 +472,13 @@ pub async fn run_image_reaction_turn(
     );
 
     let instruction = match reaction_mode {
-        comfyui::ReactionMode::Always => "React to it, briefly, in character.".to_string(),
+        // `Never` is intercepted by the caller (`run_full_image_generation`)
+        // before this function is ever reached -- treated the same as
+        // `Always` here only so the match stays exhaustive, not because
+        // this arm is expected to run.
+        comfyui::ReactionMode::Always | comfyui::ReactionMode::Never => {
+            "React to it, briefly, in character.".to_string()
+        }
         comfyui::ReactionMode::Optional => {
             "Given how the conversation has just gone and your current state, decide for \
              yourself whether an in-character comment on it actually fits right now. If it \

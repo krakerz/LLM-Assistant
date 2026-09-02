@@ -953,6 +953,19 @@ select {
   border-radius: 8px;
   display: block;
   margin-top: 6px;
+  cursor: zoom-in;
+}
+
+.image-preview-dialog {
+  max-width: min(90vw, 900px);
+}
+
+.image-preview-dialog img {
+  display: block;
+  max-width: 100%;
+  max-height: 75vh;
+  border-radius: 8px;
+  margin: 0 auto;
 }
 
 .comfy-test-image {
