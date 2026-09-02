@@ -137,7 +137,10 @@ it: say you no longer have it rather than describing file contents you cannot se
 pub const CHAT_PROTOCOL_PROMPT: &str = "If you want something to reliably persist for the rest of \
 this conversation -- a stat, a fact, a relationship status, anything your character sheet says to \
 keep track of -- put the COMPLETE current version of it in a single fenced ```state code block \
-somewhere in your reply, for example:\n\n```state\nHP: 85/100\nTrust in the user: growing\n```\n\n\
+somewhere in your reply, for example:\n\n```state\n**HP** : 85/100\n**Trust in the user** : growing\n```\n\n\
+Format every field as `**field name** : value` -- the name always bold, then a space, a colon, a \
+space, then the value, one field per line. Bolding the name is what makes it visually unambiguous \
+as a field label rather than prose, so it's easier for you to reliably reparse turn over turn.\n\n\
 This replaces everything you wrote in your last ```state block, so restate everything you still \
 want remembered, not just what changed -- anything you leave out is gone. It is never shown to the \
 user as part of your reply, so don't reference it as if they can see it. Include this block in \
@@ -152,9 +155,9 @@ physical state or appearance -- worn clothing, equipment, position, anything vis
 one moment to the next -- track it exactly like any other stat, and update it the instant it changes \
 (armor gets unequipped, an outfit changes, and so on), not just when the conversation happens to be \
 about it. Keep each field a short line, not a paragraph -- a compact block is what actually keeps this \
-reliable turn over turn. Write it as plain text only -- never wrap any part of it in `//...//` or \
-`||...||`; that formatting is for your reply's own narration/dialogue and has no meaning inside this \
-block, so it never belongs here even by habit.\n\n\
+reliable turn over turn. Other than the field name's own `**...**` bold, write it as plain text -- \
+never wrap any part of a line in `//...//` or `||...||`; that formatting is for your reply's own \
+narration/dialogue and has no meaning inside this block, so it never belongs here even by habit.\n\n\
 Separately: some requests (like generating an image) are handled by a different part of this app, \
 outside this reply entirely -- you have no way to know here whether that actually happened or \
 succeeded. If the user asks for something like that, acknowledge the request naturally and stay in \
@@ -201,6 +204,14 @@ dialogue -- never on their own as a separator, dash, aside, or for any other pur
 asterisks or a leading period instead. A marker you open must be closed before you move on to the \
 next thing; an unclosed or stray marker is worse than none, since it can't be told apart from \
 plain text.\n\n\
+The two kinds must strictly alternate -- narration, then dialogue, then narration, then dialogue, \
+as many times as the reply actually needs, never two of the same kind back to back. If more \
+narration is needed right after some dialogue, still close the dialogue first and open a fresh \
+`//...//` for it rather than folding it into the next line unmarked; the same applies in reverse. \
+Never let a second thought, a beat, or a reaction sit between two `||...||` blocks (or two \
+`//...//` blocks) without its own marker -- there is no such thing as plain, unwrapped text \
+between two markers, and no such thing as two narration or two dialogue blocks touching with \
+nothing of the other kind between them.\n\n\
 Be unambiguous about whose action or perspective each piece of narration describes. \"You\" \
 always means the real person you're talking to -- the human actually typing, never yourself or \
 your own character. Narrate your own character's actions in the third person by name (or first \
@@ -309,14 +320,53 @@ pub fn extract_state_block(text: &str) -> Option<String> {
 /// line). Since a genuine field separator is exactly what got used in its
 /// place, replacing with a newline (not just deleting the marker) is what
 /// actually recovers the intended structure, not just hides the mistake.
+///
+/// Also a backstop for `**field name** : value`, the same reasoning as the
+/// narration markers above: a real session confirmed the model can just
+/// skip the bold instruction on a given turn even in a build that has it
+/// (small local models don't reliably follow every formatting rule every
+/// single time), so this is enforced mechanically rather than trusted to
+/// always be followed.
 fn sanitize_state_content(raw: &str) -> String {
     raw.replace("//", "\n")
         .replace("||", "\n")
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
+        .map(enforce_bold_field_name)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Caps how much of a line counts as a candidate field name -- long enough
+/// for anything real (`state.md` field names are short by design, per
+/// `CHAT_PROTOCOL_PROMPT`), short enough that an ordinary sentence with a
+/// colon somewhere in its *value* (a time, a URL, a ratio) doesn't get
+/// mistaken for one and get its front half wrongly bolded.
+const MAX_FIELD_NAME_LEN: usize = 40;
+
+/// Rewrites a plain `field name: value` line into `**field name** : value`
+/// -- see `sanitize_state_content`'s doc comment. Already-bold lines
+/// (`**...`) and lines with no colon in their first `MAX_FIELD_NAME_LEN`
+/// characters (nothing that looks like a field label) are left untouched.
+fn enforce_bold_field_name(line: &str) -> String {
+    if line.starts_with("**") {
+        return line.to_string();
+    }
+    let Some(colon) = line
+        .char_indices()
+        .take(MAX_FIELD_NAME_LEN)
+        .find(|&(_, c)| c == ':')
+        .map(|(i, _)| i)
+    else {
+        return line.to_string();
+    };
+    let name = line[..colon].trim();
+    let value = line[colon + 1..].trim();
+    if name.is_empty() {
+        return line.to_string();
+    }
+    format!("**{name}** : {value}")
 }
 
 /// Removes every ` ```state ` block from `text` for display -- the model is
@@ -927,7 +977,10 @@ mod tests {
     #[test]
     fn extract_state_block_reads_the_content() {
         let reply = "Sure!\n```state\nHP: 85/100\n```\nDone.";
-        assert_eq!(extract_state_block(reply).as_deref(), Some("HP: 85/100"));
+        assert_eq!(
+            extract_state_block(reply).as_deref(),
+            Some("**HP** : 85/100")
+        );
     }
 
     #[test]
@@ -940,7 +993,7 @@ mod tests {
             "```state\nAction: waits for the request.// User Action: asks for a photo.\n```";
         assert_eq!(
             extract_state_block(reply).as_deref(),
-            Some("Action: waits for the request.\nUser Action: asks for a photo.")
+            Some("**Action** : waits for the request.\n**User Action** : asks for a photo.")
         );
     }
 
@@ -949,12 +1002,61 @@ mod tests {
         // A single `/` (e.g. an HP fraction) is not the `//` marker and
         // must survive untouched.
         let reply = "```state\nHP: 85/100\n```";
-        assert_eq!(extract_state_block(reply).as_deref(), Some("HP: 85/100"));
+        assert_eq!(
+            extract_state_block(reply).as_deref(),
+            Some("**HP** : 85/100")
+        );
     }
 
     #[test]
     fn extract_state_block_is_none_when_absent() {
         assert_eq!(extract_state_block("just a normal reply"), None);
+    }
+
+    #[test]
+    fn extract_state_block_bolds_a_plain_field_name() {
+        // The model is told to always write `**field name** : value`
+        // (`CHAT_PROTOCOL_PROMPT`), but a real session showed it can still
+        // skip that and fall back to plain `field name: value` on a given
+        // turn -- enforced mechanically here rather than trusted.
+        let reply = "```state\nMind: cheerful\n```";
+        assert_eq!(
+            extract_state_block(reply).as_deref(),
+            Some("**Mind** : cheerful")
+        );
+    }
+
+    #[test]
+    fn extract_state_block_leaves_an_already_bold_field_name_alone() {
+        let reply = "```state\n**Mind** : cheerful\n```";
+        assert_eq!(
+            extract_state_block(reply).as_deref(),
+            Some("**Mind** : cheerful")
+        );
+    }
+
+    #[test]
+    fn extract_state_block_leaves_a_colonless_line_alone() {
+        let reply = "```state\njust a stray line with no field structure at all\n```";
+        assert_eq!(
+            extract_state_block(reply).as_deref(),
+            Some("just a stray line with no field structure at all")
+        );
+    }
+
+    #[test]
+    fn extract_state_block_does_not_bold_a_late_colon_in_a_long_line() {
+        // A colon that only shows up deep into an ordinary sentence (a
+        // time, a URL, a ratio) isn't a field label -- past
+        // `MAX_FIELD_NAME_LEN`, the line is left alone rather than wrongly
+        // treating everything before it as the "field name".
+        let reply = "```state\nthis is a long sentence with no real field label anywhere near the start: some value\n```";
+        assert_eq!(
+            extract_state_block(reply).as_deref(),
+            Some(
+                "this is a long sentence with no real field label anywhere near the start: some value"
+            )
+        );
     }
 
     #[test]
