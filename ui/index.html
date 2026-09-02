@@ -82,7 +82,8 @@
     </div>
   </div>
 
-  <dialog id="newPersonaDialog">
+  <div id="newPersonaDialog" class="app-dialog-overlay" hidden>
+   <div class="app-dialog-inner">
     <h3 id="newPersonaDialogTitle">New persona</h3>
     <label>Name
       <input id="newPersonaName" type="text" placeholder="e.g. Aria the Shopkeeper" />
@@ -94,9 +95,11 @@
       <button id="newPersonaCancelBtn" type="button">Cancel</button>
       <button id="newPersonaSaveBtn" type="button">Save</button>
     </div>
-  </dialog>
+   </div>
+  </div>
 
-  <dialog id="renameSessionDialog">
+  <div id="renameSessionDialog" class="app-dialog-overlay" hidden>
+   <div class="app-dialog-inner">
     <h3>Rename chat</h3>
     <label>Title
       <input id="renameSessionInput" type="text" />
@@ -105,9 +108,11 @@
       <button id="renameSessionCancelBtn" type="button">Cancel</button>
       <button id="renameSessionSaveBtn" type="button">Save</button>
     </div>
-  </dialog>
+   </div>
+  </div>
 
-  <dialog id="rulesetDialog">
+  <div id="rulesetDialog" class="app-dialog-overlay" hidden>
+   <div class="app-dialog-inner">
     <h3>Edit rulesets</h3>
     <p class="explain">
       Reference docs the model isn't shown by default -- only their names -- and pulls into the
@@ -128,16 +133,19 @@
       <button id="rulesetCloseBtn" type="button">Close</button>
       <button id="rulesetSaveBtn" type="button">Save</button>
     </div>
-  </dialog>
+   </div>
+  </div>
 
-  <dialog id="rulesetExampleDialog">
+  <div id="rulesetExampleDialog" class="app-dialog-overlay" hidden>
+   <div class="app-dialog-inner">
     <h3>Example</h3>
     <p class="explain">Reference only -- this isn't written to your ruleset. Copy whatever's useful into it yourself.</p>
     <pre id="rulesetExampleContent" class="ruleset-example-pre"></pre>
     <div class="dialog-actions">
       <button id="rulesetExampleCloseBtn" type="button">Close</button>
     </div>
-  </dialog>
+   </div>
+  </div>
 
   <!-- A plain overlay, not a <dialog>, on purpose -- see the CSS comment on
        `.image-preview-overlay` for why. -->
@@ -156,15 +164,18 @@
     </div>
   </div>
 
-  <dialog id="chatStateDialog" class="chat-state-dialog">
+  <div id="chatStateDialog" class="app-dialog-overlay" hidden>
+   <div class="app-dialog-inner chat-state-dialog">
     <h3>Remembered state for this chat</h3>
     <pre id="chatStateContent" class="cmd chat-state-content"></pre>
     <div class="dialog-actions">
       <button id="chatStateCloseBtn" type="button">Close</button>
     </div>
-  </dialog>
+   </div>
+  </div>
 
-  <dialog id="confirmDialog">
+  <div id="confirmDialog" class="app-dialog-overlay" hidden>
+   <div class="app-dialog-inner">
     <h3>This command needs your approval</h3>
     <p id="confirmContext" class="confirm-context"></p>
     <p class="explain">
@@ -182,9 +193,11 @@
       <button id="denyBtn" type="button">Deny</button>
       <button id="approveBtn" type="button">Run it</button>
     </div>
-  </dialog>
+   </div>
+  </div>
 
-  <dialog id="settingsDialog">
+  <div id="settingsDialog" class="app-dialog-overlay" hidden>
+   <div class="app-dialog-inner">
     <h3>Settings</h3>
 
     <div class="tabs">
@@ -192,6 +205,7 @@
       <button type="button" class="tab-btn" data-tab="chat">Chat</button>
       <button type="button" class="tab-btn" data-tab="fileops">File Operations</button>
       <button type="button" class="tab-btn" data-tab="imagegen">Image Gen</button>
+      <button type="button" class="tab-btn" data-tab="websearch">Web Search</button>
     </div>
 
     <div class="tab-panel" data-panel="general">
@@ -395,13 +409,39 @@
       <img id="testComfyGenerationImg" class="comfy-test-image" hidden />
     </div>
 
+    <div class="tab-panel" data-panel="websearch" hidden>
+      <p class="explain">
+        Runs a real web search through a self-hosted SearXNG instance when the model requests one
+        (see the "web-search" ruleset, the 🧩 button in chat mode -- it holds only content-policy
+        guidance, like what not to search for or return; the search mechanics themselves are
+        handled here).
+      </p>
+      <label>SearXNG base URL
+        <input id="cfgSearxngBaseUrl" type="text" placeholder="http://127.0.0.1:8080" />
+      </label>
+      <label>API key (optional -- only if your instance requires one)
+        <input id="cfgSearxngApiKey" type="password" placeholder="leave blank if not needed" />
+      </label>
+      <label>Max results the model sees per search
+        <input id="cfgSearxngMaxResults" type="number" min="1" max="20" />
+      </label>
+
+      <div class="path-row">
+        <button id="testSearxngSearchBtn" type="button">Test search</button>
+        <span id="testSearxngSearchResult" class="explain"></span>
+      </div>
+      <pre id="testSearxngSearchResults" class="cmd" hidden></pre>
+    </div>
+
     <div class="dialog-actions">
       <button id="settingsCloseBtn" type="button">Close</button>
       <button id="settingsSaveBtn" type="button">Save</button>
     </div>
-  </dialog>
+   </div>
+  </div>
 
-  <dialog id="addPathDialog">
+  <div id="addPathDialog" class="app-dialog-overlay" hidden>
+   <div class="app-dialog-inner">
     <h3>Add a readable folder</h3>
     <p class="explain">
       The assistant can read (but not modify) this folder for reference, even though it's outside
@@ -425,7 +465,8 @@
       <button id="addPathCancelBtn" type="button">Cancel</button>
       <button id="addPathConfirmBtn" type="button">Grant read access</button>
     </div>
-  </dialog>
+   </div>
+  </div>
 
   <script src="main.js"></script>
 </body>

@@ -15,6 +15,7 @@ mod persona;
 mod rules;
 mod ruleset;
 mod sandbox;
+mod searxng;
 
 use config::{AppConfig, GrantedPath};
 use llm::ChatMessage;
@@ -200,6 +201,19 @@ fn get_comfyui_config() -> Result<comfyui::ComfyUiConfig, String> {
 fn save_comfyui_config(cfg: comfyui::ComfyUiConfig) -> Result<(), String> {
     log::info!("save_comfyui_config: base_url={}", cfg.base_url);
     comfyui::save(&cfg).map_err(|e| e.to_string())
+}
+
+/// Same reasoning as `get_comfyui_config`/`save_comfyui_config` -- its own
+/// file, not `config.toml`.
+#[tauri::command]
+fn get_searxng_config() -> Result<searxng::SearxngConfig, String> {
+    searxng::load_or_init().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_searxng_config(cfg: searxng::SearxngConfig) -> Result<(), String> {
+    log::info!("save_searxng_config: base_url={}", cfg.base_url);
+    searxng::save(&cfg).map_err(|e| e.to_string())
 }
 
 /// Picker for the ComfyUI output-directory setting; same
@@ -682,6 +696,7 @@ struct SendChatMessageResult {
     ruleset_loaded: Option<String>,
     ruleset_error: Option<String>,
     image_prompt_requested: Option<comfyui::ImagePromptFields>,
+    web_search_requested: Option<String>,
     dropped: usize,
     condensed: usize,
     summarized: usize,
@@ -708,6 +723,7 @@ async fn send_chat_message(
         ruleset_loaded: outcome.ruleset_loaded,
         ruleset_error: outcome.ruleset_error,
         image_prompt_requested: outcome.image_prompt_requested,
+        web_search_requested: outcome.web_search_requested,
         dropped: outcome.dropped,
         condensed: outcome.condensed,
         summarized: outcome.summarized,
@@ -780,6 +796,46 @@ async fn generate_comfyui_image(
         path: result.path.display().to_string(),
         data_url: result.data_url,
         reaction: result.reaction,
+    })
+}
+
+/// Tests what's typed in the dialog, not what's saved -- same contract as
+/// `test_comfyui_generation`. Returns the raw results so a wrong URL/API
+/// key is visible immediately rather than only failing silently later.
+#[tauri::command]
+async fn test_searxng_search(
+    cfg: searxng::SearxngConfig,
+) -> Result<Vec<searxng::SearchResult>, String> {
+    log::info!("test_searxng_search: base_url={}", cfg.base_url);
+    searxng::search(&cfg, "test query")
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The real web-search path a chat turn's ` ```web-search``` ` request goes
+/// through, once `send_chat_message` has already returned -- same reasoning
+/// as `generate_comfyui_image`.
+#[derive(serde::Serialize)]
+struct WebSearchCommandResult {
+    results: Vec<searxng::SearchResult>,
+    /// `None` only if the answer turn itself failed -- see
+    /// `chat_turn::WebSearchResult`'s doc comment.
+    answer: Option<String>,
+}
+
+#[tauri::command]
+async fn run_web_search(
+    session_id: String,
+    query: String,
+) -> Result<WebSearchCommandResult, String> {
+    let searxng_cfg = searxng::load_or_init().map_err(|e| e.to_string())?;
+    let cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let result = chat_turn::run_full_web_search(&cfg, &searxng_cfg, &session_id, &query)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(WebSearchCommandResult {
+        results: result.results,
+        answer: result.answer,
     })
 }
 
@@ -1058,6 +1114,10 @@ fn main() {
             save_config,
             get_comfyui_config,
             save_comfyui_config,
+            get_searxng_config,
+            save_searxng_config,
+            test_searxng_search,
+            run_web_search,
             pick_comfyui_output_dir,
             default_system_prompt,
             test_connection,

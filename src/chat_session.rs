@@ -406,13 +406,13 @@ mod tests {
         let dir = scratch("rulesets");
         let session = create_session(None).unwrap();
         assert!(read_loaded_rulesets(&session.id).is_empty());
-        add_loaded_ruleset(&session.id, "other-tools").unwrap();
+        add_loaded_ruleset(&session.id, "web-search").unwrap();
         add_loaded_ruleset(&session.id, "image-generation-prompt").unwrap();
-        add_loaded_ruleset(&session.id, "other-tools").unwrap(); // no-op, already loaded
+        add_loaded_ruleset(&session.id, "web-search").unwrap(); // no-op, already loaded
         assert_eq!(
             read_loaded_rulesets(&session.id),
             vec![
-                "other-tools".to_string(),
+                "web-search".to_string(),
                 "image-generation-prompt".to_string()
             ]
         );
