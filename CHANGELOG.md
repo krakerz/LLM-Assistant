@@ -26,6 +26,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - A state block field written onto the same line as the next one, separated only by a stray `//` instead of a newline, would leak that formatting straight into `state.md` (the model's own `//action//` narration habit bleeding into what's supposed to be plain structured text) -- now explicitly told not to use that formatting there, and mechanically split back into two lines as a backstop either way
 - The generated-image preview, once actually screen-recorded, turned out to have no backdrop dimming, wasn't centered, and had its buttons floating at the window's corners instead of the image's -- this webview's `<dialog>`/`showModal()` doesn't actually provide the top-layer/backdrop/auto-centering behavior the spec promises, which every other (opaque, content-sized) dialog in this app happened to mask. Rebuilt as a plain fixed-position overlay instead of a native `<dialog>`, sidestepping that gap entirely rather than working around it
 - The preview's Save button was a colorful 💾 emoji next to a plain white ✕ -- now a monochrome line-icon SVG (`currentColor`), matching the close button's style
+- The remembered-state quick-view popup was cramped -- fixed at the default dialog width with no wrapping, so any normal descriptive line (not just short `key: value` stats) needed horizontal scrolling to read. Wider, and the content now wraps and scrolls vertically instead
 
 ## [1.11.0] — 2026-09-02
 
