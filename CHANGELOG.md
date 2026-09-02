@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [1.12.0] — 2026-09-02
+
+### Added
+- A third "after generating an image" option: never comment at all, just show the image
+- Clicking a generated image now pops up a quick-view preview, with a Save button to copy it wherever you actually want it kept
+
+### Changed
+- `state.md`'s instructions are much stricter about not silently dropping a previously tracked field, and explicitly call out physical/appearance state (worn clothing, equipment, position) as something to track and update the instant it changes, the same as any other stat. If a field genuinely no longer applies, the instruction is now to set its value to `none`/`null` rather than deleting the line -- the field itself should never just disappear
+
+### Fixed
+- The default `state.md` token cap (500) was small enough that a richly detailed character state could silently get truncated before it ever reached the model -- the next reply could then only "restate everything" from what was left, permanently losing whatever got cut, which is exactly how a 5-field state could shrink to 3 over a few turns with nothing in the conversation asking for that. Raised to 2000
+
+### Added
+- A one-time, cheap follow-up request if a reply skips its mandatory ` ```state``` ` block -- asks for *only* the missing block (not a full retry of the reply itself), so an "always include this" instruction a small model occasionally skips anyway now has an actual mechanical backstop instead of just hoping it's followed
+- The "memories updated" indicator is now icon-only (📝, hover for what it means) instead of a full text bubble
+
+### Fixed
+- A reply could satisfy "never claim an image result happened" technically while still asserting one was coming with a placeholder line like `(an image appears here)` -- a real example, seen right below a message that *did* generate successfully. The instruction now explicitly covers placeholder/announcement phrasing too, not just describing invented contents
+- The generated-image preview popup had the same padding as every other dialog, squeezed to a fixed width regardless of the image's actual size or orientation, with Save/Close in a separate button bar below it. It now hugs the image's own aspect ratio (capped to the viewport, at its own resolution rather than shrunk into a thumbnail-sized box), with Save (now an icon, not a text button) and an X-to-close floating directly on top of the image instead
+- A state block field written onto the same line as the next one, separated only by a stray `//` instead of a newline, would leak that formatting straight into `state.md` (the model's own `//action//` narration habit bleeding into what's supposed to be plain structured text) -- now explicitly told not to use that formatting there, and mechanically split back into two lines as a backstop either way
+- The generated-image preview, once actually screen-recorded, turned out to have no backdrop dimming, wasn't centered, and had its buttons floating at the window's corners instead of the image's -- this webview's `<dialog>`/`showModal()` doesn't actually provide the top-layer/backdrop/auto-centering behavior the spec promises, which every other (opaque, content-sized) dialog in this app happened to mask. Rebuilt as a plain fixed-position overlay instead of a native `<dialog>`, sidestepping that gap entirely rather than working around it
+- The preview's Save button was a colorful 💾 emoji next to a plain white ✕ -- now a monochrome line-icon SVG (`currentColor`), matching the close button's style
+
 ## [1.11.0] — 2026-09-02
 
 ### Added
@@ -19,7 +42,11 @@ All notable changes to this project are documented here. The format follows [Kee
 - Chat mode's system messages next to the narration toggle are clearer about what's actually happening: "loaded ruleset" now reads as an in-progress step rather than a finished fact (loading one is only ever a means to using it a moment later), with an explicit note when nothing further happens that turn; the image-generating placeholder now says it can take a while; "persistent state updated" is now "memories updated" (GUI and CLI)
 
 ### Added
-- The `image-generation-prompt` ruleset's seed placeholder now shows an example line for every recognized field (`checkpoint`, `width`, `height`, `sampler`, `scheduler`, `cfg`, `steps`), not just `positive`/`negative` -- the mechanical field list is otherwise Rust-only and never shown to a person editing the file through the GUI. Clearing the file back to empty through the editor restores this placeholder rather than leaving it permanently blank
+- The `image-generation-prompt` ruleset ships blank again -- a "see an example" link in the ruleset editor instead shows a reference template covering every recognized field (`checkpoint`, `width`, `height`, `sampler`, `scheduler`, `cfg`, `steps`, not just `positive`/`negative`), without writing any of it into the actual file. What you type there is entirely up to you
+- `other-tools` now gets the exact same treatment as `image-generation-prompt`: ships blank, its own hint (`OTHER_TOOLS_HINT`) is guaranteed by the app regardless of file content, and its own "see an example" popup
+
+### Fixed
+- `other-tools` could lose its ability to ever be requested the same way `image-generation-prompt` once did -- filling the file in with a real SearXNG address (dropping the `> ...` hint line along with it) silently meant dispatch never requested it again, even for a direct "search the web for X". Confirmed live: a fresh chat asking to check the internet now correctly loads it
 - Image Gen settings: a "After generating an image, the persona should" option -- always comment on it in character (the original behavior, still the default), or decide for itself, based on how the reply just went and the session's own `state.md`, whether an in-character comment actually fits right now
 
 ### Changed

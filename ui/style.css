@@ -183,6 +183,7 @@ button:disabled {
 }
 
 .bubble {
+  position: relative;
   max-width: 78%;
   padding: 8px 12px;
   border-radius: 10px;
@@ -557,6 +558,18 @@ dialog .cmd {
   font-family: ui-monospace, monospace;
 }
 
+.ruleset-example-pre {
+  background: #0f1116;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  white-space: pre-wrap;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
 .checkbox-row {
   display: flex;
   align-items: flex-start;
@@ -886,15 +899,21 @@ select {
   flex-direction: column;
 }
 
-/* Same amber "the app is telling you something worth reading" family as the
-   sudo callout and the summarizer bubble, but quieter -- a state update is
-   routine, not a warning. */
-.bubble.state-updated {
-  align-self: center;
-  color: var(--muted);
-  font-size: 12px;
-  background: none;
-  font-style: italic;
+/* Overlaid on the bubble it belongs to, bottom-right corner -- a state
+   update is routine, not something worth its own line. Hover shows what it
+   means. */
+.state-updated-badge {
+  position: absolute;
+  bottom: 4px;
+  right: 8px;
+  font-size: 11px;
+  line-height: 1;
+  opacity: 0.55;
+  cursor: default;
+}
+
+.state-updated-badge:hover {
+  opacity: 1;
 }
 
 .chat-attachments {
@@ -941,6 +960,110 @@ select {
   border-radius: 8px;
   display: block;
   margin-top: 6px;
+  cursor: zoom-in;
+}
+
+/* A plain fixed-position overlay, NOT a native <dialog>/showModal() --
+   this webview's <dialog> support turned out not to actually render the
+   top-layer/::backdrop/auto-centering behavior the spec promises (every
+   other dialog in this app is opaque and roughly content-sized, which
+   happened to mask the exact same underlying gap: no real backdrop dimming,
+   no real centering, just whatever position a plain block element lands
+   at). A fully transparent, image-only popup has nothing left to hide that
+   behind, which is what made it visible here. A hand-rolled overlay sidesteps
+   the whole native-dialog rendering path and is fully deterministic instead
+   of depending on it. */
+.image-preview-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.image-preview-overlay[hidden] {
+  display: none;
+}
+
+.image-preview-inner {
+  position: relative;
+  display: block;
+  line-height: 0;
+  border-radius: 14px;
+  overflow: hidden;
+  max-width: 90vw;
+  max-height: 90vh;
+}
+
+.image-preview-overlay img {
+  display: block;
+  max-width: 90vw;
+  max-height: 90vh;
+  width: auto;
+  height: auto;
+}
+
+.image-preview-close,
+.image-preview-save {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  backdrop-filter: blur(4px);
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: 50%;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.image-preview-save svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.image-preview-close:hover,
+.image-preview-save:hover {
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+}
+
+.image-preview-close {
+  top: 10px;
+  right: 10px;
+}
+
+.image-preview-save {
+  bottom: 12px;
+  right: 12px;
+}
+
+.image-preview-save-result {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 12px;
+  backdrop-filter: blur(4px);
+}
+
+.image-preview-save-result:empty {
+  display: none;
 }
 
 .comfy-test-image {

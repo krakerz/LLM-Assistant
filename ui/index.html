@@ -116,6 +116,11 @@
     <label>Ruleset
       <select id="rulesetSelect"></select>
     </label>
+    <p id="rulesetExampleRow" class="explain" hidden>
+      Blank by default, so nothing extra applies until you type something --
+      <button id="rulesetExampleBtn" type="button" class="link-btn">see an example</button>
+      of what you can put here.
+    </p>
     <label>Content
       <textarea id="rulesetContent" rows="12"></textarea>
     </label>
@@ -124,6 +129,32 @@
       <button id="rulesetSaveBtn" type="button">Save</button>
     </div>
   </dialog>
+
+  <dialog id="rulesetExampleDialog">
+    <h3>Example</h3>
+    <p class="explain">Reference only -- this isn't written to your ruleset. Copy whatever's useful into it yourself.</p>
+    <pre id="rulesetExampleContent" class="ruleset-example-pre"></pre>
+    <div class="dialog-actions">
+      <button id="rulesetExampleCloseBtn" type="button">Close</button>
+    </div>
+  </dialog>
+
+  <!-- A plain overlay, not a <dialog>, on purpose -- see the CSS comment on
+       `.image-preview-overlay` for why. -->
+  <div id="imagePreviewOverlay" class="image-preview-overlay" hidden>
+    <div class="image-preview-inner">
+      <img id="imagePreviewImg" alt="Generated image preview" />
+      <button id="imagePreviewCloseBtn" type="button" class="image-preview-close" title="Close">✕</button>
+      <button id="imagePreviewSaveBtn" type="button" class="image-preview-save" title="Save…">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z" />
+          <path d="M17 21v-8H7v8" />
+          <path d="M7 3v5h8" />
+        </svg>
+      </button>
+      <p id="imagePreviewSaveResult" class="image-preview-save-result"></p>
+    </div>
+  </div>
 
   <dialog id="chatStateDialog">
     <h3>Remembered state for this chat</h3>
@@ -353,6 +384,7 @@
         <select id="cfgComfyReactionMode">
           <option value="always">Always comment on it in character</option>
           <option value="optional">Decide based on the reply and its state whether a comment fits</option>
+          <option value="none">Never comment -- just show the image</option>
         </select>
       </label>
 

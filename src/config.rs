@@ -124,8 +124,16 @@ fn default_memory_max_tokens() -> u32 {
     800
 }
 
+/// 500 (2000 chars) turned out too small for a real richly-tracked
+/// character state -- once a state block exceeded it, `rules::append_state_block`
+/// silently cut off the tail before it ever reached the model, so the next
+/// reply could only "restate everything" from what it could still see,
+/// permanently losing whatever got cut. 2000 (8000 chars) gives generous
+/// headroom for a state that's meant to hold a lot -- a full character
+/// sheet's worth of tracked fields -- while still being a fraction of the
+/// default `max_context_tokens` budget.
 fn default_chat_state_max_tokens() -> u32 {
-    500
+    2000
 }
 
 fn default_chat_show_thinking() -> bool {

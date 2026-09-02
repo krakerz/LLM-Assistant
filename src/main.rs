@@ -626,6 +626,13 @@ fn update_ruleset(name: String, content: String) -> Result<(), String> {
     ruleset::update_ruleset(&name, &content).map_err(|e| e.to_string())
 }
 
+/// Backs the ruleset editor's "see an example" link -- `None` (and the
+/// link stays hidden) for a ruleset with no example content of its own.
+#[tauri::command]
+fn get_ruleset_example(name: String) -> Option<String> {
+    ruleset::example_for(&name).map(|s| s.to_string())
+}
+
 // --- Chat mode: sessions ---
 
 #[tauri::command]
@@ -781,6 +788,41 @@ async fn generate_comfyui_image(
 #[tauri::command]
 fn read_generated_image(path: String) -> Result<String, String> {
     comfyui::read_as_data_url(std::path::Path::new(&path)).map_err(|e| e.to_string())
+}
+
+/// Backs the image preview popup's "Save" button -- the image is already on
+/// disk (under the configured output folder), this just copies it wherever
+/// the user actually wants a copy. `Ok(None)` means the user cancelled the
+/// dialog, not an error. Same non-blocking picker pattern as
+/// `pick_folder_path`; `save_file` needs no `.pick_folder`-vs-`.pick_file`
+/// distinction since it always returns a single destination.
+#[tauri::command]
+async fn save_generated_image_as(app: AppHandle, path: String) -> Result<Option<String>, String> {
+    let source = std::path::PathBuf::from(&path);
+    let default_name = source
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("image.png")
+        .to_string();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut builder = app.dialog().file().set_file_name(&default_name);
+    if let Some(window) = app.get_webview_window("main") {
+        builder = builder.set_parent(&window);
+    }
+    builder.save_file(move |dest| {
+        let _ = tx.send(dest);
+    });
+    let dest = rx.await.map_err(|e| {
+        log::error!("save_generated_image_as: picker channel closed unexpectedly: {e}");
+        "Save dialog closed unexpectedly".to_string()
+    })?;
+    let Some(dest) = dest else {
+        return Ok(None);
+    };
+    let dest_path = std::path::PathBuf::from(dest.to_string());
+    fs::copy(&source, &dest_path).map_err(|e| e.to_string())?;
+    Ok(Some(dest_path.display().to_string()))
 }
 
 /// Passive, best-effort hint for whether the configured model supports
@@ -1047,6 +1089,7 @@ fn main() {
             list_rulesets,
             get_ruleset_content,
             update_ruleset,
+            get_ruleset_example,
             list_chat_sessions,
             create_chat_session,
             load_chat_session,
@@ -1057,6 +1100,7 @@ fn main() {
             test_comfyui_generation,
             generate_comfyui_image,
             read_generated_image,
+            save_generated_image_as,
             probe_vision_capability,
             test_vision_support,
         ])
