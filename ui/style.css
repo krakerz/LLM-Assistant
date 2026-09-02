@@ -558,6 +558,23 @@ dialog .cmd {
   font-family: ui-monospace, monospace;
 }
 
+/* Wider than the default dialog box, and the content wraps/scrolls
+   vertically instead of needing horizontal scrolling for every long
+   descriptive line -- a state block reads more like prose (clothing
+   descriptions, etc.) than short key: value pairs, so cramming it into the
+   default 560px width made this feel a lot more cramped than every other
+   dialog. */
+.chat-state-dialog {
+  width: min(720px, 90vw);
+}
+
+.chat-state-content {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
 .ruleset-example-pre {
   background: #0f1116;
   border: 1px solid var(--border);
