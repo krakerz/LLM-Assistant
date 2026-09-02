@@ -140,10 +140,30 @@ pub async fn run_chat_turn(
     let reply = rules::strip_thinking_blocks(&reply);
 
     let state_block = rules::extract_state_block(&reply);
-    let state_updated = state_block.is_some();
-    if let Some(new_state) = &state_block {
+    let state_updated = if let Some(new_state) = &state_block {
         chat_session::update_state(session_id, new_state)?;
-    }
+        true
+    } else {
+        // The model skipped the mandatory ```state``` block -- one cheap,
+        // targeted follow-up asking for *only* that, rather than
+        // regenerating the whole reply (which would risk changing its
+        // voice/content on a retry). Only ever costs an extra request in
+        // this failure case; a well-behaved reply never reaches it.
+        match run_state_catchup_turn(cfg, session_id, persona_content.as_deref(), &reply).await {
+            Ok(Some(new_state)) => {
+                chat_session::update_state(session_id, &new_state)?;
+                true
+            }
+            Ok(None) => {
+                log::warn!("run_chat_turn: state catch-up produced no usable state block either");
+                false
+            }
+            Err(e) => {
+                log::warn!("run_chat_turn: state catch-up request failed: {e}");
+                false
+            }
+        }
+    };
 
     // Defensive only -- turn 1's system prompt no longer mentions rulesets
     // at all (see `rules::build_chat_system_content`'s doc comment), so a
@@ -201,6 +221,52 @@ pub async fn run_chat_turn(
         summary: trimmed.summary,
         rewritten_history: trimmed.rewritten_history,
     })
+}
+
+/// Cheap safety net for turn 1 skipping its mandatory ` ```state``` ` block
+/// -- small models forgetting an "always include this" instruction is the
+/// recurring failure mode this whole turn/dispatch/reaction split exists to
+/// guard against (see the module doc comment), and the state block is no
+/// exception. Asks for *only* the missing block, given the reply that was
+/// just generated and the old state, rather than regenerating the whole
+/// reply (which would risk changing its voice or content on a retry).
+/// `Ok(None)` if even this narrowly-scoped follow-up didn't produce a
+/// usable block -- treated the same as "nothing to update this turn", not a
+/// hard failure.
+async fn run_state_catchup_turn(
+    cfg: &AppConfig,
+    session_id: &str,
+    persona_content: Option<&str>,
+    last_reply: &str,
+) -> anyhow::Result<Option<String>> {
+    let state = chat_session::read_state(session_id);
+    let mut system_content = String::from(
+        "Your last reply was missing its mandatory ```state``` block. Given that reply, your \
+         persona (if any) and your previous state below, output ONLY the complete, current \
+         ```state``` block now -- restate every field, updated wherever the reply implies \
+         something changed. Nothing else: no reply, no commentary, just the one fenced block.",
+    );
+    if let Some(persona) = persona_content {
+        system_content.push_str("\n\n");
+        system_content.push_str(persona);
+    }
+    if !state.trim().is_empty() {
+        system_content.push_str("\n\n## Your previous state\n");
+        system_content.push_str(state.trim());
+    }
+    let messages = vec![
+        ChatMessage::text("system", system_content),
+        ChatMessage::text("user", format!("Your last reply was:\n{last_reply}")),
+    ];
+    let reply = crate::llm::send_chat(
+        &cfg.endpoint,
+        &cfg.model,
+        &cfg.api_key,
+        DISPATCH_TEMPERATURE,
+        &messages,
+    )
+    .await?;
+    Ok(rules::extract_state_block(&reply))
 }
 
 struct DispatchOutcome {

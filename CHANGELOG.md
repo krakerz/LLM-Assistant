@@ -16,6 +16,17 @@ All notable changes to this project are documented here. The format follows [Kee
 ### Fixed
 - The default `state.md` token cap (500) was small enough that a richly detailed character state could silently get truncated before it ever reached the model -- the next reply could then only "restate everything" from what was left, permanently losing whatever got cut, which is exactly how a 5-field state could shrink to 3 over a few turns with nothing in the conversation asking for that. Raised to 2000
 
+### Added
+- A one-time, cheap follow-up request if a reply skips its mandatory ` ```state``` ` block -- asks for *only* the missing block (not a full retry of the reply itself), so an "always include this" instruction a small model occasionally skips anyway now has an actual mechanical backstop instead of just hoping it's followed
+- The "memories updated" indicator is now icon-only (📝, hover for what it means) instead of a full text bubble
+
+### Fixed
+- A reply could satisfy "never claim an image result happened" technically while still asserting one was coming with a placeholder line like `(an image appears here)` -- a real example, seen right below a message that *did* generate successfully. The instruction now explicitly covers placeholder/announcement phrasing too, not just describing invented contents
+- The generated-image preview popup had the same padding as every other dialog, squeezed to a fixed width regardless of the image's actual size or orientation, with Save/Close in a separate button bar below it. It now hugs the image's own aspect ratio (capped to the viewport, at its own resolution rather than shrunk into a thumbnail-sized box), with Save (now an icon, not a text button) and an X-to-close floating directly on top of the image instead
+- A state block field written onto the same line as the next one, separated only by a stray `//` instead of a newline, would leak that formatting straight into `state.md` (the model's own `//action//` narration habit bleeding into what's supposed to be plain structured text) -- now explicitly told not to use that formatting there, and mechanically split back into two lines as a backstop either way
+- The generated-image preview, once actually screen-recorded, turned out to have no backdrop dimming, wasn't centered, and had its buttons floating at the window's corners instead of the image's -- this webview's `<dialog>`/`showModal()` doesn't actually provide the top-layer/backdrop/auto-centering behavior the spec promises, which every other (opaque, content-sized) dialog in this app happened to mask. Rebuilt as a plain fixed-position overlay instead of a native `<dialog>`, sidestepping that gap entirely rather than working around it
+- The preview's Save button was a colorful 💾 emoji next to a plain white ✕ -- now a monochrome line-icon SVG (`currentColor`), matching the close button's style
+
 ## [1.11.0] — 2026-09-02
 
 ### Added

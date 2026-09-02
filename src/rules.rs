@@ -152,14 +152,18 @@ physical state or appearance -- worn clothing, equipment, position, anything vis
 one moment to the next -- track it exactly like any other stat, and update it the instant it changes \
 (armor gets unequipped, an outfit changes, and so on), not just when the conversation happens to be \
 about it. Keep each field a short line, not a paragraph -- a compact block is what actually keeps this \
-reliable turn over turn.\n\n\
+reliable turn over turn. Write it as plain text only -- never wrap any part of it in `//...//` or \
+`||...||`; that formatting is for your reply's own narration/dialogue and has no meaning inside this \
+block, so it never belongs here even by habit.\n\n\
 Separately: some requests (like generating an image) are handled by a different part of this app, \
 outside this reply entirely -- you have no way to know here whether that actually happened or \
 succeeded. If the user asks for something like that, acknowledge the request naturally and stay in \
-character, but never narrate, describe, or claim the result as if it already happened (for example, \
-never write something like \"an image is generated showing...\") -- the real result, if any, \
-appears on its own afterward. Describing a result yourself only produces a fake one no one asked \
-for.";
+character, but never narrate, describe, or claim the result as if it already happened -- not by \
+describing its contents (\"an image is generated showing...\"), and not with a placeholder standing \
+in for it either (\"(an image appears here)\", \"[image below]\", or anything else asserting one is \
+about to appear) -- the real result, if any, appears on its own afterward, already in its own place; \
+you never need to reference, announce, or point at it yourself. Describing or gesturing at a result \
+yourself only produces a fake one no one asked for.";
 
 /// Forces every reply into the same narration/dialogue split
 /// `ui/main.js`'s `renderChatText` renders as separate blocks (see the
@@ -294,7 +298,25 @@ pub fn extract_state_block(text: &str) -> Option<String> {
     let marker = "```state\n";
     let start = text.find(marker)? + marker.len();
     let end = text[start..].find("```")?;
-    Some(text[start..start + end].trim().to_string())
+    Some(sanitize_state_content(text[start..start + end].trim()))
+}
+
+/// Defensive backstop for `CHAT_PROTOCOL_PROMPT`'s "write it as plain text,
+/// never `//...//`/`||...||`" rule -- a real session showed the model bleed
+/// its reply's own narration formatting into the state block anyway, using
+/// a stray `//` as an ad-hoc field separator instead of a newline (e.g.
+/// `"...the request.// User Action: ..."`, two fields run together onto one
+/// line). Since a genuine field separator is exactly what got used in its
+/// place, replacing with a newline (not just deleting the marker) is what
+/// actually recovers the intended structure, not just hides the mistake.
+fn sanitize_state_content(raw: &str) -> String {
+    raw.replace("//", "\n")
+        .replace("||", "\n")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Removes every ` ```state ` block from `text` for display -- the model is
@@ -859,6 +881,28 @@ mod tests {
     #[test]
     fn extract_state_block_reads_the_content() {
         let reply = "Sure!\n```state\nHP: 85/100\n```\nDone.";
+        assert_eq!(extract_state_block(reply).as_deref(), Some("HP: 85/100"));
+    }
+
+    #[test]
+    fn extract_state_block_splits_a_stray_marker_used_as_a_field_separator() {
+        // The exact real-world regression: the model used a bare `//` as an
+        // ad-hoc separator between two fields instead of a newline, run
+        // together onto one line -- recovered as two separate lines rather
+        // than left with the marker (or the run-on) intact.
+        let reply =
+            "```state\nAction: waits for the request.// User Action: asks for a photo.\n```";
+        assert_eq!(
+            extract_state_block(reply).as_deref(),
+            Some("Action: waits for the request.\nUser Action: asks for a photo.")
+        );
+    }
+
+    #[test]
+    fn extract_state_block_leaves_a_single_slash_alone() {
+        // A single `/` (e.g. an HP fraction) is not the `//` marker and
+        // must survive untouched.
+        let reply = "```state\nHP: 85/100\n```";
         assert_eq!(extract_state_block(reply).as_deref(), Some("HP: 85/100"));
     }
 
