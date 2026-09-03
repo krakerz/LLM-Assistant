@@ -293,6 +293,13 @@
         restarting the app) still shows it. Off by default — otherwise it's only visible for the
         turn it arrived on. Has no effect if the option above is off.
       </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="cfgChatStreamReplies" />
+        Show a reply's own text growing live as it's generated, instead of only once it's complete.
+        On by default. Turning this off doesn't stop reasoning from streaming into the "Thinking"
+        box above if the option above is on — only the reply's own bubble goes back to waiting for
+        the full text.
+      </label>
     </div>
 
     <div class="tab-panel" data-panel="fileops" hidden>

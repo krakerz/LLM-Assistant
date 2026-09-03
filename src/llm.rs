@@ -188,6 +188,137 @@ pub async fn send_chat(
         .unwrap_or_default())
 }
 
+/// One chunk's worth of a streaming reply -- either regular reply text or,
+/// for a backend that uses the separate `reasoning_content` delta field
+/// (see `ResponseMessage::reasoning_content`'s doc comment), its reasoning.
+/// A backend that instead embeds an inline `<think>...</think>` tag in its
+/// regular content stream has no equivalent live signal here -- that tag
+/// only gets extracted/hidden once `send_chat_streaming` returns and the
+/// caller runs the same whole-string extraction `send_chat` already
+/// relies on. Known, accepted limitation, not solved by this type.
+pub enum ChatDelta<'a> {
+    Content(&'a str),
+    Reasoning(&'a str),
+}
+
+#[derive(Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    delta: StreamDelta,
+}
+
+#[derive(Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+}
+
+/// Reads one already-decoded, newline-stripped SSE line and returns its
+/// payload if it's a real `data:` line worth parsing -- `None` for a blank
+/// line, a `:`-prefixed keep-alive comment, or any other SSE field this app
+/// doesn't use (`event:`, `id:`, `retry:`). Pulled out as its own pure
+/// function specifically so the framing logic (not the JSON payload it
+/// carries) has real unit test coverage, independent of a live network
+/// stream.
+fn sse_data_line(line: &str) -> Option<&str> {
+    let payload = line.strip_prefix("data:")?.trim();
+    (!payload.is_empty()).then_some(payload)
+}
+
+/// Streaming sibling of `send_chat` -- same request shape (`stream: true`
+/// instead of `false`), same eventual return contract (a fully folded
+/// string via the same `fold_reasoning_into_content` `send_chat` already
+/// uses, so callers built around `send_chat`'s return value don't need to
+/// change), but calls `on_delta` once per parsed SSE chunk as it arrives so
+/// a caller can forward partial text live. `on_delta` is a plain sync
+/// callback, not async -- both real callers (a Tauri `Channel::send`, an
+/// axum `mpsc::UnboundedSender::send`) are themselves synchronous, and
+/// `+ Send` since both run this inside a spawned task.
+pub async fn send_chat_streaming(
+    endpoint: &str,
+    model: &str,
+    api_key: &str,
+    temperature: f32,
+    messages: &[ChatMessage],
+    mut on_delta: impl FnMut(ChatDelta<'_>) + Send,
+) -> anyhow::Result<String> {
+    let client = reqwest::Client::new();
+    let req = ChatRequest {
+        model,
+        messages: messages.iter().map(to_wire).collect(),
+        temperature,
+        stream: true,
+    };
+    let mut builder = client.post(endpoint).json(&req);
+    if !api_key.trim().is_empty() {
+        builder = builder.bearer_auth(api_key);
+    }
+
+    let resp = builder.send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("LLM endpoint returned {status}: {body}");
+    }
+
+    let mut content_acc = String::new();
+    let mut reasoning_acc = String::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut byte_stream = resp.bytes_stream();
+
+    // Buffers raw bytes (not text) across polls, decoding only once a
+    // complete `\n`-terminated line is assembled -- a `String::from_utf8`
+    // per network chunk would risk mangling a multi-byte UTF-8 character
+    // split across two chunks. Assumes one `data:` line per SSE event, true
+    // for every backend this app targets (OpenAI/vLLM/Ollama/llama.cpp/LM
+    // Studio) -- real SSE allows multi-line events, deliberately not
+    // handled, since none of those actually send one.
+    use tokio_stream::StreamExt as _;
+    'outer: while let Some(chunk) = byte_stream.next().await {
+        buf.extend_from_slice(&chunk?);
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
+            let line = line.trim_end_matches(['\r', '\n']);
+            let Some(payload) = sse_data_line(line) else {
+                continue;
+            };
+            if payload == "[DONE]" {
+                break 'outer;
+            }
+            let parsed: StreamChunk = match serde_json::from_str(payload) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("send_chat_streaming: skipping unparsable chunk ({e}): {payload}");
+                    continue;
+                }
+            };
+            for choice in parsed.choices {
+                if let Some(piece) = choice.delta.content.filter(|s| !s.is_empty()) {
+                    on_delta(ChatDelta::Content(&piece));
+                    content_acc.push_str(&piece);
+                }
+                if let Some(piece) = choice.delta.reasoning_content.filter(|s| !s.is_empty()) {
+                    on_delta(ChatDelta::Reasoning(&piece));
+                    reasoning_acc.push_str(&piece);
+                }
+            }
+        }
+    }
+
+    Ok(fold_reasoning_into_content(
+        content_acc,
+        (!reasoning_acc.is_empty()).then_some(reasoning_acc),
+    ))
+}
+
 // --- Vision capability probes (best-effort, backend-specific hints only) ---
 //
 // Neither of these is authoritative -- they're each one specific backend's
@@ -280,6 +411,41 @@ pub async fn probe_vision_capability(endpoint: &str, model: &str) -> Option<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_data_line_reads_the_payload() {
+        assert_eq!(
+            sse_data_line(r#"data: {"choices":[]}"#),
+            Some(r#"{"choices":[]}"#)
+        );
+    }
+
+    #[test]
+    fn sse_data_line_recognizes_the_done_sentinel() {
+        assert_eq!(sse_data_line("data: [DONE]"), Some("[DONE]"));
+    }
+
+    #[test]
+    fn sse_data_line_is_none_for_a_blank_line() {
+        assert_eq!(sse_data_line(""), None);
+    }
+
+    #[test]
+    fn sse_data_line_is_none_for_an_empty_data_field() {
+        assert_eq!(sse_data_line("data:"), None);
+        assert_eq!(sse_data_line("data: "), None);
+    }
+
+    #[test]
+    fn sse_data_line_is_none_for_a_keep_alive_comment() {
+        assert_eq!(sse_data_line(": keep-alive"), None);
+    }
+
+    #[test]
+    fn sse_data_line_is_none_for_an_unused_sse_field() {
+        assert_eq!(sse_data_line("event: message"), None);
+        assert_eq!(sse_data_line("id: 42"), None);
+    }
 
     #[test]
     fn base_host_strips_the_path() {

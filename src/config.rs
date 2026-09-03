@@ -110,6 +110,17 @@ pub struct AppConfig {
     /// only wants the spoken lines.
     #[serde(default = "default_chat_hide_narration")]
     pub chat_hide_narration: bool,
+    /// Client-side only, same as `chat_hide_narration` -- the backend call
+    /// is always the streaming one (`send_chat_message_streaming`/
+    /// `h_send_chat_message_streaming`) either way, so a live reasoning
+    /// delta can still fill in `chat_show_thinking`'s placeholder as it
+    /// arrives regardless of this setting. This just controls whether the
+    /// reply's own text is also shown growing live in its own bubble (on
+    /// by default) or kept hidden behind the placeholder until the whole
+    /// reply is ready, the pre-streaming behavior, for anyone who finds the
+    /// live growing text distracting rather than reassuring.
+    #[serde(default = "default_chat_stream_replies")]
+    pub chat_stream_replies: bool,
 }
 
 fn default_confirm_fade_after() -> u32 {
@@ -146,6 +157,10 @@ fn default_chat_persist_thinking() -> bool {
 
 fn default_chat_hide_narration() -> bool {
     false
+}
+
+fn default_chat_stream_replies() -> bool {
+    true
 }
 
 /// 8000 turned out tight once accounted for: `CHAT_PROTOCOL_PROMPT` +
@@ -198,6 +213,7 @@ impl Default for AppConfig {
             chat_show_thinking: default_chat_show_thinking(),
             chat_persist_thinking: default_chat_persist_thinking(),
             chat_hide_narration: default_chat_hide_narration(),
+            chat_stream_replies: default_chat_stream_replies(),
         }
     }
 }

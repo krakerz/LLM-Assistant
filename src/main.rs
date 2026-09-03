@@ -722,7 +722,7 @@ fn get_chat_raw_state(session_id: String) -> String {
 /// Keeps a session's title on `chat_session::DEFAULT_TITLE` from growing
 /// unbounded -- the leading slice of the first message is plenty to
 /// recognize a chat in the session list.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone)]
 struct SendChatMessageResult {
     reply: String,
     thinking: Option<String>,
@@ -733,12 +733,28 @@ struct SendChatMessageResult {
     rewritten_history: Option<Vec<ChatMessage>>,
 }
 
+impl From<chat_turn::ChatTurnOutcome> for SendChatMessageResult {
+    fn from(outcome: chat_turn::ChatTurnOutcome) -> Self {
+        SendChatMessageResult {
+            reply: outcome.reply,
+            thinking: outcome.thinking,
+            dropped: outcome.dropped,
+            condensed: outcome.condensed,
+            summarized: outcome.summarized,
+            summary: outcome.summary,
+            rewritten_history: outcome.rewritten_history,
+        }
+    }
+}
+
 /// Thin wrapper around `chat_turn::run_chat_turn` (turn 1 only -- see its
 /// module doc comment), the logic shared with the `--persona-chat` CLI
 /// (`chat_cli.rs`) -- this command just loads config and maps the error
 /// type Tauri expects. Dispatch and state-update are a separate follow-up
 /// call (`run_turn_followup` below) the frontend fires only after showing
-/// this reply.
+/// this reply. Superseded in the GUI by `send_chat_message_streaming`
+/// below -- kept as-is since `chat_cli.rs` still needs a plain,
+/// non-streaming call.
 #[tauri::command]
 async fn send_chat_message(
     session_id: String,
@@ -748,15 +764,63 @@ async fn send_chat_message(
     let outcome = chat_turn::run_chat_turn(&cfg, &session_id, history)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(SendChatMessageResult {
-        reply: outcome.reply,
-        thinking: outcome.thinking,
-        dropped: outcome.dropped,
-        condensed: outcome.condensed,
-        summarized: outcome.summarized,
-        summary: outcome.summary,
-        rewritten_history: outcome.rewritten_history,
-    })
+    Ok(outcome.into())
+}
+
+/// One event sent over `send_chat_message_streaming`'s channel per parsed
+/// SSE chunk, plus a final `Done`/`Error` closing the stream -- mirrors
+/// `server.rs`'s own `ChatStreamEvent` (independently defined, same
+/// DTO-per-transport convention already used throughout this codebase),
+/// so `ui/main.js` needs exactly one `onEvent` shape for both transports.
+#[derive(serde::Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ChatStreamEvent {
+    Content { text: String },
+    Reasoning { text: String },
+    Done { result: SendChatMessageResult },
+    Error { message: String },
+}
+
+/// Streaming sibling of `send_chat_message` -- turn 1 only, same scope as
+/// its module doc comment. The `Result` return only covers a failure
+/// *before* streaming starts (config load); once `run_chat_turn_streaming`
+/// is running, a failure becomes an `Error` channel event instead of an
+/// `Err` return, since the frontend is already mid-stream by then and a
+/// channel event is the only way left to tell it.
+#[tauri::command]
+async fn send_chat_message_streaming(
+    session_id: String,
+    history: Vec<ChatMessage>,
+    channel: tauri::ipc::Channel<ChatStreamEvent>,
+) -> Result<(), String> {
+    let cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let mut on_delta = |delta: llm::ChatDelta<'_>| {
+        let event = match delta {
+            llm::ChatDelta::Content(text) => ChatStreamEvent::Content {
+                text: text.to_string(),
+            },
+            llm::ChatDelta::Reasoning(text) => ChatStreamEvent::Reasoning {
+                text: text.to_string(),
+            },
+        };
+        // The webview may already be gone (window closed mid-stream) --
+        // the request still completes and persists normally either way,
+        // there's just no one left to show it to.
+        let _ = channel.send(event);
+    };
+    match chat_turn::run_chat_turn_streaming(&cfg, &session_id, history, &mut on_delta).await {
+        Ok(outcome) => {
+            let _ = channel.send(ChatStreamEvent::Done {
+                result: outcome.into(),
+            });
+        }
+        Err(e) => {
+            let _ = channel.send(ChatStreamEvent::Error {
+                message: e.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Turn 2 as its own round-trip -- called by the frontend only after
@@ -1351,6 +1415,7 @@ fn main() {
             get_chat_state,
             get_chat_raw_state,
             send_chat_message,
+            send_chat_message_streaming,
             run_turn_followup,
             test_comfyui_generation,
             generate_comfyui_image,

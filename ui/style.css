@@ -213,6 +213,16 @@ button:disabled {
   border: 1px solid var(--border);
 }
 
+/* createLiveReplyBubble (main.js) appends this before the first streamed
+   chunk arrives -- genuinely empty at that point (no text node at all, not
+   just an empty string), so it rendered as an empty padded pill for however
+   long the request took to produce its first token. `:empty` stops matching
+   the instant a chunk actually sets `.textContent`, so this only ever hides
+   the true "nothing yet" gap, never real (even single-character) content. */
+.bubble.assistant.chat-transient:empty {
+  display: none;
+}
+
 .bubble.system {
   align-self: center;
   color: var(--muted);
@@ -537,30 +547,41 @@ details.bubble.thinking > .bubble.assistant {
   overflow-y: auto;
 }
 
+/* Active tab is a full filled chip (accent-tinted background + accent
+   text) rather than just an underline -- easier to spot at a glance,
+   especially at the smaller sizes these run at, and reads the same in both
+   the Tauri GUI and `--server`'s browser client (no native-widget styling
+   involved either way, so nothing to diverge). `.chat-state-tab` below
+   (the "Remembered state" dialog's Summary/Raw JSON tabs) intentionally
+   matches this look -- kept as its own selector rather than merged into
+   this one, since it's wired up by its own click handler in main.js, not
+   the shared `wireTabs` these two use, and merging the selectors would
+   only save a few lines at the cost of two unrelated systems now needing
+   to agree on markup. */
 .tabs {
   display: flex;
   gap: 4px;
   border-bottom: 1px solid var(--border);
   margin-bottom: 12px;
+  padding-bottom: 4px;
 }
 
 .tab-btn {
   background: none;
   border: none;
-  border-radius: 0;
-  border-bottom: 2px solid transparent;
-  padding: 6px 4px;
+  border-radius: 6px;
+  padding: 6px 12px;
   color: var(--muted);
 }
 
 .tab-btn:hover {
-  background: none;
+  background: rgba(125, 211, 252, 0.08);
   color: var(--text);
 }
 
 .tab-btn.active {
-  color: var(--text);
-  border-bottom-color: var(--accent);
+  background: rgba(125, 211, 252, 0.18);
+  color: var(--accent);
 }
 
 /* Rules/Commands, nested one level inside the File Operations tab -- same
@@ -571,26 +592,26 @@ details.bubble.thinking > .bubble.assistant {
   gap: 4px;
   border-bottom: 1px solid var(--border);
   margin: 18px 0 12px;
+  padding-bottom: 4px;
 }
 
 .subtab-btn {
   background: none;
   border: none;
-  border-radius: 0;
-  border-bottom: 2px solid transparent;
-  padding: 4px 4px;
+  border-radius: 6px;
+  padding: 4px 10px;
   color: var(--muted);
   font-size: 13px;
 }
 
 .subtab-btn:hover {
-  background: none;
+  background: rgba(125, 211, 252, 0.08);
   color: var(--text);
 }
 
 .subtab-btn.active {
-  color: var(--text);
-  border-bottom-color: var(--accent);
+  background: rgba(125, 211, 252, 0.18);
+  color: var(--accent);
 }
 
 .app-dialog-inner .cmd {
@@ -619,30 +640,35 @@ details.bubble.thinking > .bubble.assistant {
   overflow-y: auto;
 }
 
+/* Matches .tab-btn's look (see its own comment) -- a separate selector
+   since these two tabs are wired by their own click handler, not the
+   shared `wireTabs` .tab-btn/.subtab-btn use. */
 .chat-state-tabs {
   display: flex;
   gap: 4px;
   margin-bottom: 8px;
   border-bottom: 1px solid var(--border);
+  padding-bottom: 4px;
 }
 
 .chat-state-tab {
   background: none;
   border: none;
-  border-bottom: 2px solid transparent;
+  border-radius: 6px;
   color: var(--muted);
-  padding: 6px 10px;
+  padding: 6px 12px;
   cursor: pointer;
   font-size: 13px;
 }
 
 .chat-state-tab:hover {
-  color: var(--fg);
+  background: rgba(125, 211, 252, 0.08);
+  color: var(--text);
 }
 
 .chat-state-tab.active {
-  color: var(--fg);
-  border-bottom-color: var(--accent, var(--fg));
+  background: rgba(125, 211, 252, 0.18);
+  color: var(--accent);
 }
 
 .ruleset-example-pre {
