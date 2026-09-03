@@ -21,8 +21,8 @@ mod server;
 use config::{AppConfig, GrantedPath};
 use llm::ChatMessage;
 use simplelog::{
-    ColorChoice, CombinedLogger, Config as LogConfig, LevelFilter, TermLogger, TerminalMode,
-    WriteLogger,
+    ColorChoice, CombinedLogger, Config as LogConfig, ConfigBuilder as LogConfigBuilder,
+    LevelFilter, TermLogger, TerminalMode, WriteLogger,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -70,6 +70,23 @@ fn resolve_cli_root() -> Option<PathBuf> {
     }
 }
 
+/// Local wall-clock time in every log line instead of simplelog's UTC
+/// default -- friendlier to read at a glance against "when did I actually
+/// send that message" than doing the offset math by hand. Built once and
+/// shared by both loggers below so the terminal and the file never disagree
+/// with each other. Falls back to UTC (simplelog's own default) if `time`'s
+/// local-offset detection fails, which it can on some platforms in a
+/// multi-threaded process -- not fatal, just less convenient, and the only
+/// place this gets reported is `eprintln!` since the logger itself isn't
+/// initialized yet at this point.
+fn log_config() -> LogConfig {
+    let mut builder = LogConfigBuilder::new();
+    if builder.set_time_offset_to_local().is_err() {
+        eprintln!("could not determine the local time zone -- log timestamps will be UTC");
+    }
+    builder.build()
+}
+
 fn init_logging() {
     let log_dir = paths::app_log_dir();
     let _ = fs::create_dir_all(&log_dir);
@@ -81,14 +98,14 @@ fn init_logging() {
     // Stderr, not Mixed: headless prints its result to stdout.
     let term = TermLogger::new(
         LevelFilter::Info,
-        LogConfig::default(),
+        log_config(),
         TerminalMode::Stderr,
         ColorChoice::Auto,
     );
 
     match log_file {
         Ok(file) => {
-            let file_logger = WriteLogger::new(LevelFilter::Debug, LogConfig::default(), file);
+            let file_logger = WriteLogger::new(LevelFilter::Debug, log_config(), file);
             let _ = CombinedLogger::init(vec![term, file_logger]);
             log::info!("logging to {}", log_dir.join("app.log").display());
         }
@@ -693,6 +710,15 @@ fn get_chat_state(session_id: String) -> String {
     chat_session::read_state(&session_id)
 }
 
+/// Same as `get_chat_state`, but the raw `state.json` source of truth
+/// instead of the derived `state.md` summary -- the quick-view dialog's
+/// "raw" tab, since the compact summary alone can't show precise fields
+/// without duplicating what the raw view already does.
+#[tauri::command]
+fn get_chat_raw_state(session_id: String) -> String {
+    chat_session::read_raw_state(&session_id)
+}
+
 /// Keeps a session's title on `chat_session::DEFAULT_TITLE` from growing
 /// unbounded -- the leading slice of the first message is plenty to
 /// recognize a chat in the session list.
@@ -760,11 +786,7 @@ impl From<chat_turn::TurnFollowupOutcome> for TurnFollowupResult {
             ruleset_error: outcome.ruleset_error,
             image_prompt_requested: outcome.image_prompt_requested,
             web_search_requested: outcome.web_search_requested,
-            // Always true today: `run_turn_followup` unconditionally spawns
-            // one (`outcome.state_update_handle` is dropped here, unused --
-            // there is no "did it spawn" question for this particular
-            // outcome type, only for `TurnReply` below, where it's optional).
-            state_update_dispatched: true,
+            state_update_dispatched: outcome.state_update_handle.is_some(),
         }
     }
 }
@@ -1182,9 +1204,12 @@ fn main() {
     // `--persona-chat` is chat mode's own CLI, entirely separate from
     // operation mode's folder-based dispatch below: no folder, ever, and
     // none of operation mode's rules/memory apply. Checked before the
-    // rules-logging and memory-init steps below, which are both irrelevant
-    // noise for a pure chat-mode invocation (rules::log_loaded_rules alone
-    // dumps the whole protocol prompt to the log at INFO level).
+    // memory-init step below, which is irrelevant noise for a pure
+    // chat-mode invocation. (The general/command rules dump to app.log no
+    // longer needs the same care -- `rules::build_system_content` only logs
+    // it lazily, the first time operation mode's system prompt is actually
+    // built, which a chat-only invocation never triggers regardless of
+    // order.)
     if args.iter().any(|a| a == "--list-personas") {
         chat_cli::list_personas();
         return;
@@ -1204,8 +1229,8 @@ fn main() {
     }
 
     // Same reasoning as `--persona-chat` above: chat mode only, headless,
-    // no window ever created -- checked before operation mode's
-    // rules-logging/memory-init noise. `--bind`/`--port` are ad hoc,
+    // no window ever created -- checked before operation mode's memory-init
+    // noise. `--bind`/`--port` are ad hoc,
     // per-run overrides (same spirit as `--persona`/`--session` above),
     // never written back to `server.json`; the password is never a CLI
     // flag at all -- see `server::ServerConfig`'s doc comment for why --
@@ -1222,10 +1247,6 @@ fn main() {
         }
         return;
     }
-
-    // Once at startup, so app.log shows what's in effect without spamming.
-    let startup_cfg = config::load_or_init().unwrap_or_default();
-    rules::log_loaded_rules(startup_cfg.disable_builtin_rules);
 
     // Before the headless dispatch: a headless run is a session too. Not
     // gated on `memory_enabled` -- config is hot-reloaded, so the setting can
@@ -1328,6 +1349,7 @@ fn main() {
             rename_chat_session,
             delete_chat_session,
             get_chat_state,
+            get_chat_raw_state,
             send_chat_message,
             run_turn_followup,
             test_comfyui_generation,

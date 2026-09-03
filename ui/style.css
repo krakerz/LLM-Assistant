@@ -316,6 +316,23 @@ details.bubble.summary pre {
   padding: 6px;
 }
 
+/* The live, not-yet-known-to-have-content state -- see
+   createChatThinkingPlaceholder's doc comment in main.js for why this is
+   deliberately plain (no `details`/disclosure triangle) and compact
+   (left-aligned like a normal bubble, not full-width) rather than the
+   bigger expandable form below, which only a call that actually got
+   reasoning back ever upgrades into. */
+.bubble.thinking-pending {
+  align-self: flex-start;
+  background: none;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  padding: 6px 12px;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: default;
+}
+
 details.bubble.thinking {
   align-self: stretch;
   background: none;
@@ -600,6 +617,32 @@ details.bubble.thinking > .bubble.assistant {
   word-break: break-word;
   max-height: 60vh;
   overflow-y: auto;
+}
+
+.chat-state-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.chat-state-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.chat-state-tab:hover {
+  color: var(--fg);
+}
+
+.chat-state-tab.active {
+  color: var(--fg);
+  border-bottom-color: var(--accent, var(--fg));
 }
 
 .ruleset-example-pre {
@@ -960,13 +1003,22 @@ select {
   flex-direction: column;
 }
 
-/* Overlaid on the bubble it belongs to, bottom-right corner -- triggering a
-   memory update is routine, not something worth its own line. Hover shows
-   what it means. */
+/* Replaces the bubble in `chat-log` (see appendStateDispatchedIndicator in
+   main.js) so the badge has a flex row to sit beside instead of overlaid on
+   top of the bubble's own content. `align-self: flex-start` matches
+   `.bubble.assistant`'s own alignment -- the only role this ever wraps. */
+.bubble-with-indicator {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  align-self: flex-start;
+  max-width: 100%;
+}
+
+/* Triggering a memory update is routine, not something worth its own line.
+   Hover shows what it means. */
 .state-updated-badge {
-  position: absolute;
-  bottom: 4px;
-  right: 8px;
+  flex-shrink: 0;
   font-size: 11px;
   line-height: 1;
   opacity: 0.55;

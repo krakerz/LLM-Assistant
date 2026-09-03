@@ -1,6 +1,7 @@
 use crate::paths::app_config_dir;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Once;
 
 /// The mechanical contract the app's own code assumes -- always sent, never
 /// editable, unaffected by `disable_builtin_rules`. Judgment-call guidance
@@ -125,6 +126,25 @@ in for it either (\"(an image appears here)\", \"[image below]\", or anything el
 about to appear) -- the real result, if any, appears on its own afterward, already in its own place; \
 you never need to reference, announce, or point at it yourself. Describing or gesturing at a result \
 yourself only produces a fake one no one asked for.";
+
+/// Guards against a persona's own "Internal Stats Engine" section (field
+/// names, percentages, level thresholds -- written to brief the *separate*
+/// `CHAT_STATE_UPDATE_PROMPT` turn) leaking into this turn's visible reply.
+/// A real session showed the model writing `_Arousal_ is 70%` straight into
+/// in-character narration: nothing here told it that bookkeeping is a
+/// different, invisible mechanism, so it read the persona's stat
+/// description as prose to continue rather than data to act on silently.
+/// Same shape as `CHAT_TOOL_RESULT_GUARD_PROMPT` -- both exist because
+/// something the persona/app tracks behind the scenes must never surface as
+/// if it were part of the scene itself.
+pub const CHAT_STATE_LEAK_GUARD_PROMPT: &str =
+    "Your character sheet may describe internal stats, meters, or levels it tracks for memory \
+purposes (a percentage, a named level, a threshold like \"at 85% she does X\") -- that tracking \
+happens invisibly in a separate step, never in this reply. Let those stats shape your behavior, \
+tone, and what you choose to do naturally, but never state their literal field name or numeric \
+value in the narration or dialogue itself -- never write something like \"_Arousal_ is 70%\" or \
+\"her Trust level rises to 40\". Show the effect, not the bookkeeping: write only what someone \
+actually in the scene would say or perceive.";
 
 /// The dedicated state-update turn's own instructions (see
 /// `chat_turn::run_state_update_turn`'s doc comment for why this replaced
@@ -662,6 +682,7 @@ pub fn build_system_content(
     command: &str,
     root: Option<&std::path::Path>,
 ) -> String {
+    log_rules_once(general, command, cfg.disable_builtin_rules);
     let mut out = format!(
         "{}\n\n{}\n\n{}",
         build_system_rules(general, command, cfg.disable_builtin_rules),
@@ -820,9 +841,10 @@ pub fn plain_field_listing(fields: &[StateField]) -> String {
 
 /// Chat mode's whole system message for the user-facing reply (turn 1 of
 /// the turn/dispatch/reaction/state-update split -- see
-/// `chat_turn::run_chat_turn`'s doc comment): `CHAT_NARRATION_PROMPT` and
-/// the tool-result guard, then the persona's own content (if one is
-/// loaded), then the session's current `state.md` summary (read-only
+/// `chat_turn::run_chat_turn`'s doc comment): `CHAT_NARRATION_PROMPT`, the
+/// tool-result guard, and the state-leak guard, then the persona's own
+/// content (if one is loaded), then the session's current `state.md` summary
+/// (read-only
 /// context -- this turn is never asked to write a new one; that's
 /// `chat_turn::run_state_update_turn`'s own dedicated job now). No root
 /// note, no rules.md/command-rules.md -- those are operation-mode concepts
@@ -843,6 +865,8 @@ pub fn build_chat_system_content(
     let mut out = CHAT_NARRATION_PROMPT.to_string();
     out.push_str("\n\n");
     out.push_str(CHAT_TOOL_RESULT_GUARD_PROMPT);
+    out.push_str("\n\n");
+    out.push_str(CHAT_STATE_LEAK_GUARD_PROMPT);
     if let Some(persona) = persona {
         out.push_str("\n\n");
         out.push_str(persona);
@@ -940,23 +964,35 @@ pub fn build_dispatch_system_content(
     out
 }
 
-/// Once at startup, not in `load_*_or_init` (which run every turn), so a
-/// stale edit or a reset that didn't take is visible without spamming.
-pub fn log_loaded_rules(disable_builtin_rules: bool) {
-    log::info!("protocol prompt (always in effect, not editable):\n{PROTOCOL_PROMPT}");
-    let sent_or_not = if disable_builtin_rules {
-        "on disk, but NOT sent -- disable_builtin_rules is set"
-    } else {
-        "sent"
-    };
-    match load_general_or_init() {
-        Ok(r) => log::info!("general rules ({} bytes, {sent_or_not}):\n{r}", r.len()),
-        Err(e) => log::warn!("failed to load general rules for startup log: {e}"),
-    }
-    match load_command_or_init() {
-        Ok(r) => log::info!("command rules ({} bytes, {sent_or_not}):\n{r}", r.len()),
-        Err(e) => log::warn!("failed to load command rules for startup log: {e}"),
-    }
+static RULES_LOGGED: Once = Once::new();
+
+/// Logs the protocol prompt plus the general/command rules actually in
+/// effect -- once per process, and lazily, the first time operation mode's
+/// system prompt is actually built (`build_system_content`'s only caller
+/// besides tests), not unconditionally at GUI startup the way this used to
+/// work. That used to dump the full text of both rules files into app.log
+/// on every single launch regardless of whether operation mode (as opposed
+/// to persona chat, which never touches this at all) was even used that
+/// session -- pure bloat for a chat-only session. Still "once, so a stale
+/// edit or a reset that didn't take is visible without spamming", just
+/// deferred until there's an actual reason to look at it.
+fn log_rules_once(general: &str, command: &str, disable_builtin_rules: bool) {
+    RULES_LOGGED.call_once(|| {
+        log::info!("protocol prompt (always in effect, not editable):\n{PROTOCOL_PROMPT}");
+        let sent_or_not = if disable_builtin_rules {
+            "on disk, but NOT sent -- disable_builtin_rules is set"
+        } else {
+            "sent"
+        };
+        log::info!(
+            "general rules ({} bytes, {sent_or_not}):\n{general}",
+            general.len()
+        );
+        log::info!(
+            "command rules ({} bytes, {sent_or_not}):\n{command}",
+            command.len()
+        );
+    });
 }
 
 #[cfg(test)]
@@ -1151,6 +1187,7 @@ mod tests {
         let out = build_chat_system_content(Some("You are Aria, a shopkeeper."), "HP: 90", 0);
         assert!(out.contains(CHAT_NARRATION_PROMPT));
         assert!(out.contains(CHAT_TOOL_RESULT_GUARD_PROMPT));
+        assert!(out.contains(CHAT_STATE_LEAK_GUARD_PROMPT));
         assert!(out.contains("You are Aria, a shopkeeper."));
         assert!(out.contains("HP: 90"));
     }

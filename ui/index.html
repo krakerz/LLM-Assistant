@@ -196,6 +196,10 @@
       sent a message, this may still show the previous turn's state for a
       few seconds. Use Refresh rather than reopening.
     </p>
+    <div class="chat-state-tabs" role="tablist">
+      <button type="button" class="chat-state-tab active" data-tab="summary">Summary</button>
+      <button type="button" class="chat-state-tab" data-tab="raw">Raw JSON</button>
+    </div>
     <pre id="chatStateContent" class="cmd chat-state-content"></pre>
     <div class="dialog-actions">
       <button id="chatStateRefreshBtn" type="button">Refresh</button>

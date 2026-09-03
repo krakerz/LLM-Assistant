@@ -650,6 +650,10 @@ async fn h_get_chat_state(Json(req): Json<SessionIdRequest>) -> Response {
     Json(chat_session::read_state(&req.session_id)).into_response()
 }
 
+async fn h_get_chat_raw_state(Json(req): Json<SessionIdRequest>) -> Response {
+    Json(chat_session::read_raw_state(&req.session_id)).into_response()
+}
+
 #[derive(Serialize)]
 struct SendChatMessageResponse {
     reply: String,
@@ -714,9 +718,7 @@ impl From<chat_turn::TurnFollowupOutcome> for TurnFollowupResponse {
             ruleset_error: outcome.ruleset_error,
             image_prompt_requested: outcome.image_prompt_requested,
             web_search_requested: outcome.web_search_requested,
-            // Always true today: `run_turn_followup` unconditionally spawns
-            // one (`outcome.state_update_handle` is dropped here, unused).
-            state_update_dispatched: true,
+            state_update_dispatched: outcome.state_update_handle.is_some(),
         }
     }
 }
@@ -844,6 +846,7 @@ fn api_router() -> Router {
         .route("/rename_chat_session", post(h_rename_chat_session))
         .route("/delete_chat_session", post(h_delete_chat_session))
         .route("/get_chat_state", post(h_get_chat_state))
+        .route("/get_chat_raw_state", post(h_get_chat_raw_state))
         .route("/send_chat_message", post(h_send_chat_message))
         .route("/run_turn_followup", post(h_run_turn_followup))
         .route("/read_generated_image", post(h_read_generated_image))

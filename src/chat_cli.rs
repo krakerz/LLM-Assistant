@@ -187,7 +187,9 @@ async fn run_async(opts: Options) -> i32 {
                     &turn1.reply,
                 )
                 .await;
-                pending_state_updates.push(outcome.state_update_handle);
+                if let Some(handle) = outcome.state_update_handle {
+                    pending_state_updates.push(handle);
+                }
                 if let Some(name) = &outcome.ruleset_loaded {
                     println!("\n[loaded ruleset: {name}]");
                 }

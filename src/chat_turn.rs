@@ -8,14 +8,23 @@
 //!    else in this list runs inside this call or blocks its return.
 //! 2. `run_turn_followup` -- called separately, after the frontend has
 //!    already shown turn 1's reply (`main.rs`'s own `run_turn_followup`
-//!    Tauri command). Runs two independent things concurrently: the
-//!    dispatch decision (`run_dispatch_turn`, deciding whether the exchange
-//!    calls for a ruleset/tool and firing it) and the state-update turn
-//!    (`run_state_update_turn`, spawned detached via `spawn_state_update`
-//!    -- its own completion, never awaited by anything, so it can't add
-//!    latency to whatever dispatch decides). Only dispatch's result is
-//!    actually returned; state-update's success or failure is logged, not
-//!    surfaced.
+//!    Tauri command). Awaits the state-update turn's raw-JSON half
+//!    (`run_state_json_turn`) *before* dispatch (`run_dispatch_turn`),
+//!    deliberately sequential rather than concurrent: dispatch's own
+//!    completion is what writes the `` ```image-prompt``` `` fence when
+//!    that ruleset is already loaded, and it needs *this* turn's fresh
+//!    state to describe the character accurately, not last turn's --
+//!    confirmed as a real gap in an earlier, fully-concurrent version of
+//!    this call, and worth the added wait now that it's deliberately masked
+//!    (the GUI shows a "thinking" placeholder for exactly this step, purely
+//!    cosmetic -- there's no real model reasoning behind it, just something
+//!    to tell the user a process is running instead of showing nothing).
+//!    Once the raw JSON is written, the slower narrative-summarize half
+//!    (`finish_state_update`) is spawned detached -- nothing downstream
+//!    needs *that* to be fresh, only the raw JSON dispatch is about to read,
+//!    so there's nothing to gain from waiting on it too. Only dispatch's
+//!    result is actually returned; state-update's success or failure is
+//!    logged, not surfaced.
 //! 3. `run_image_reaction_turn` -- triggered later, once ComfyUI actually
 //!    returns a generated image (`main.rs`'s `generate_comfyui_image`,
 //!    which can be seconds to minutes after 1/2 already returned) -- not
@@ -67,11 +76,13 @@ pub struct ChatTurnOutcome {
 }
 
 /// Turn 2's result -- see the module doc comment for why this is no longer
-/// part of `ChatTurnOutcome`. State-update's own outcome is deliberately
-/// not part of this shape at all: it's a detached background task with
-/// nothing awaiting it (see `spawn_state_update`), so there's no moment at
-/// which "did state change this turn" could be reported accurately without
-/// re-introducing the latency this split exists to remove.
+/// part of `ChatTurnOutcome`. State-update's own full completion is still
+/// not part of this shape: only its raw-JSON half is awaited before this
+/// returns (dispatch needs it fresh), and the slower narrative-summarize
+/// half stays a detached background task with nothing awaiting it, so
+/// there's still no moment at which "has state *fully* finished updating
+/// this turn" could be reported without re-introducing the exact latency
+/// this whole split exists to avoid for that half specifically.
 pub struct TurnFollowupOutcome {
     /// A ruleset the dispatch pass requested this turn
     /// (` ```ruleset <name> ``` `) that existed and is now loaded for the
@@ -90,9 +101,13 @@ pub struct TurnFollowupOutcome {
     /// search and answer happen later, separately, same reasoning as
     /// `image_prompt_requested`.
     pub web_search_requested: Option<String>,
-    /// See `TurnReply::state_update_handle`'s doc comment -- same reasoning,
-    /// same "GUI/`--server` drop it, `chat_cli.rs` drains it" contract.
-    pub state_update_handle: tokio::task::JoinHandle<()>,
+    /// `None` only if the raw-JSON half itself failed or produced nothing
+    /// usable (logged, not surfaced) -- otherwise `Some`, covering just the
+    /// detached narrative-summarize half (the raw-JSON half already
+    /// finished by the time this outcome exists at all, since it's awaited
+    /// before dispatch runs). Same "GUI/`--server` drop it, `chat_cli.rs`
+    /// drains it" contract as `TurnReply::state_update_handle`.
+    pub state_update_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 const AUTO_TITLE_MAX_CHARS: usize = 40;
@@ -269,9 +284,13 @@ async fn run_state_json_turn(
 /// The whole dedicated state-update turn: raw JSON first, then the derived
 /// `state.md` summary -- see the module doc comment and
 /// `rules::is_precise_field`'s doc comment for the fidelity-drift reasoning
-/// behind splitting fields this way. Never fails outward -- every error is
-/// logged and simply means state doesn't change this round, same "not a
-/// hard failure of anything the user is waiting on" contract as dispatch.
+/// behind splitting fields this way. Always runs both halves back to back
+/// (unlike `run_turn_followup`'s own use of these same two pieces, which
+/// awaits only the first) -- turns 3/4 have nothing downstream in the same
+/// round that needs the raw JSON fresher than "eventually," so there's no
+/// reason to split them here. Never fails outward -- every error is logged
+/// and simply means state doesn't change this round, same "not a hard
+/// failure of anything the user is waiting on" contract as dispatch.
 pub async fn run_state_update_turn(
     cfg: &AppConfig,
     session_id: &str,
@@ -293,8 +312,17 @@ pub async fn run_state_update_turn(
         log::warn!("run_state_update_turn: failed to write state.json: {e}");
         return;
     }
+    finish_state_update(cfg, session_id, &raw_json).await;
+}
 
-    let fields = rules::parse_state_fields(&raw_json);
+/// The narrative-summarize half of state-update, split out of
+/// `run_state_update_turn` so `run_turn_followup` can await the raw-JSON
+/// half alone (dispatch needs it fresh) while spawning just this slower
+/// half detached (nothing needs *it* fresh -- see the module doc comment).
+/// `raw_json` is the value already just written to `state.json`, not
+/// re-read from disk, since the caller already has it on hand either way.
+async fn finish_state_update(cfg: &AppConfig, session_id: &str, raw_json: &str) {
+    let fields = rules::parse_state_fields(raw_json);
     let (precise, narrative) = rules::partition_state_fields(fields);
     let narrative_summary = if narrative.is_empty() {
         String::new()
@@ -325,7 +353,7 @@ pub async fn run_state_update_turn(
                 // summarize call itself failed -- fall back to a plain
                 // mechanical listing rather than lose that information.
                 log::warn!(
-                    "run_state_update_turn: summarize call failed, falling back to a plain listing: {e}"
+                    "finish_state_update: summarize call failed, falling back to a plain listing: {e}"
                 );
                 rules::plain_field_listing(&narrative)
             }
@@ -333,7 +361,7 @@ pub async fn run_state_update_turn(
     };
     let markdown = rules::build_state_markdown(&precise, &narrative_summary);
     if let Err(e) = chat_session::update_state(session_id, &markdown) {
-        log::warn!("run_state_update_turn: failed to write state.md: {e}");
+        log::warn!("finish_state_update: failed to write state.md: {e}");
     }
 }
 
@@ -356,6 +384,20 @@ fn spawn_state_update(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         run_state_update_turn(&cfg, &session_id, persona_content.as_deref(), &last_reply).await;
+    })
+}
+
+/// Same reasoning and same CLI-drain contract as `spawn_state_update`, just
+/// for `finish_state_update` alone -- used by `run_turn_followup`, which
+/// awaits the raw-JSON half itself and only spawns this slower, narrative
+/// half detached.
+fn spawn_finish_state_update(
+    cfg: AppConfig,
+    session_id: String,
+    raw_json: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        finish_state_update(&cfg, &session_id, &raw_json).await;
     })
 }
 
@@ -390,6 +432,12 @@ async fn run_dispatch_turn(
     last_user_message: &str,
     last_assistant_reply: &str,
 ) -> DispatchOutcome {
+    // At INFO, not DEBUG -- unlike the raw-reply log further down (only
+    // useful once something's already gone wrong), whether dispatch ran at
+    // all this turn is worth seeing in the plain log, not just when
+    // debugging: it's the app's own record of every "did the model decide
+    // to use a tool this turn" check, silent turns included.
+    log::info!("dispatch turn: evaluating session {session_id}");
     let mut outcome = DispatchOutcome::none();
     let state = chat_session::read_raw_state(session_id);
     // Offering `web-search` when SearXNG has no `base_url` set would just
@@ -517,12 +565,31 @@ pub async fn run_turn_followup(
     last_user_message: &str,
     last_assistant_reply: &str,
 ) -> TurnFollowupOutcome {
-    let state_update_handle = spawn_state_update(
-        cfg.clone(),
-        session_id.to_string(),
-        persona_content.map(|s| s.to_string()),
-        last_assistant_reply.to_string(),
-    );
+    // Awaited before dispatch, not spawned alongside it -- see the module
+    // doc comment for why dispatch specifically needs this turn's fresh
+    // raw JSON rather than last turn's.
+    let state_update_handle =
+        match run_state_json_turn(cfg, session_id, persona_content, last_assistant_reply).await {
+            Ok(Some(raw_json)) => match chat_session::update_raw_state(session_id, &raw_json) {
+                Ok(()) => Some(spawn_finish_state_update(
+                    cfg.clone(),
+                    session_id.to_string(),
+                    raw_json,
+                )),
+                Err(e) => {
+                    log::warn!("run_turn_followup: failed to write state.json: {e}");
+                    None
+                }
+            },
+            Ok(None) => {
+                log::warn!("run_turn_followup: produced no usable state JSON this turn");
+                None
+            }
+            Err(e) => {
+                log::warn!("run_turn_followup: state JSON request failed: {e}");
+                None
+            }
+        };
     let dispatch = run_dispatch_turn(
         cfg,
         session_id,
