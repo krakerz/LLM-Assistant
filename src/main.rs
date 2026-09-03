@@ -16,6 +16,7 @@ mod rules;
 mod ruleset;
 mod sandbox;
 mod searxng;
+mod server;
 
 use config::{AppConfig, GrantedPath};
 use llm::ChatMessage;
@@ -979,7 +980,7 @@ async fn probe_vision_capability(endpoint: String, model: String) -> Option<bool
 /// an outright error. Hand-built (raw scanlines + zlib + PNG chunk framing,
 /// no image crate needed for something this small) and round-trip verified
 /// -- decoded, decompressed, and pixel-checked -- before being embedded here.
-const VISION_TEST_IMAGE_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR42mP4z8AARAwQCgAf7gP9Y167WwAAAABJRU5ErkJggg==";
+pub(crate) const VISION_TEST_IMAGE_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR42mP4z8AARAwQCgAf7gP9Y167WwAAAABJRU5ErkJggg==";
 
 /// Sends the test image plus a one-word question, mirroring
 /// `test_connection`'s honesty: the raw reply or the raw error, never a
@@ -1039,7 +1040,7 @@ fn print_help() {
         env!("CARGO_PKG_VERSION")
     );
     println!("\nUSAGE:");
-    let usage: [(&str, &str); 8] = [
+    let usage: [(&str, &str); 9] = [
         ("llm-assistant", "Launch the GUI, no folder preloaded"),
         (
             "llm-assistant <folder>",
@@ -1065,14 +1066,18 @@ fn print_help() {
             "llm-assistant --list-sessions",
             "List chat mode sessions, for use with --session",
         ),
+        (
+            "llm-assistant --server [--bind <addr>] [--port <n>]",
+            "Headless: serve chat mode only over HTTP -- no GUI, no folder, no file ops",
+        ),
         ("llm-assistant --help | -h", "Show this help"),
     ];
     for (cmd, desc) in usage {
-        println!("    {cmd:<34} {desc}");
+        println!("    {cmd:<50} {desc}");
     }
     println!("\nConfig, rules, and logs live under $XDG_CONFIG_HOME/llm-assistant");
     println!("(usually ~/.config/llm-assistant):");
-    let files: [(&str, &str); 4] = [
+    let files: [(&str, &str); 5] = [
         (
             "config.toml",
             "endpoint, model, temperature, granted paths, ...",
@@ -1080,6 +1085,10 @@ fn print_help() {
         (
             "rules.md",
             "the working rules read before your system prompt",
+        ),
+        (
+            "server.json",
+            "--server's bind/port defaults and password (empty = unauthenticated)",
         ),
         ("logs/app.log", "internal debug log"),
         (
@@ -1137,6 +1146,26 @@ fn main() {
             persona,
             session_id,
         });
+    }
+
+    // Same reasoning as `--persona-chat` above: chat mode only, headless,
+    // no window ever created -- checked before operation mode's
+    // rules-logging/memory-init noise. `--bind`/`--port` are ad hoc,
+    // per-run overrides (same spirit as `--persona`/`--session` above),
+    // never written back to `server.json`; the password is never a CLI
+    // flag at all -- see `server::ServerConfig`'s doc comment for why --
+    // only ever read from that file.
+    if args.iter().any(|a| a == "--server") {
+        let cfg = server::load_or_init().unwrap_or_default();
+        let bind = flag_value(&args, "--bind").unwrap_or(cfg.bind);
+        let port = flag_value(&args, "--port")
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(cfg.port);
+        let rt = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
+        if let Err(e) = rt.block_on(server::run(bind, port, cfg.password)) {
+            log::error!("web server exited with error: {e}");
+        }
+        return;
     }
 
     // Once at startup, so app.log shows what's in effect without spamming.
