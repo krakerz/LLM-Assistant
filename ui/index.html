@@ -6,14 +6,37 @@
 <title>LLM Assistant</title>
 <link rel="stylesheet" href="style.css" />
 </head>
-<body>
+<body class="app-not-ready">
+  <!-- Only shown outside Tauri, and only when `--server`'s server.json has a
+       password set -- replaces relying on the browser's own native Basic
+       Auth prompt, which some browsers render inconsistently (or not at
+       all) for a plain top-level page load. See `ensureAuthenticated` in
+       main.js. -->
+  <div id="loginOverlay" class="app-dialog-overlay" hidden>
+   <div class="app-dialog-inner">
+    <h3>Password required</h3>
+    <label>Password
+      <input id="loginPassword" type="password" autocomplete="current-password" />
+    </label>
+    <p id="loginError" class="explain warn"></p>
+    <div class="dialog-actions">
+      <button id="loginSubmitBtn" type="button">Log in</button>
+    </div>
+   </div>
+  </div>
+
   <div class="app-shell">
     <nav id="modeRail" class="mode-rail">
       <button id="chatModeBtn" class="mode-rail-btn active" title="Chat">💬</button>
       <button id="fileOpsModeBtn" class="mode-rail-btn" title="File Operations">📁</button>
       <div class="mode-rail-bottom">
         <button id="settingsBtn" class="mode-rail-btn" title="Settings">⚙</button>
-        <span id="appVersion" class="app-version"></span>
+        <!-- Just the version, never the build hash -- that's what actually
+             made this text wide enough to stretch the whole rail. The full
+             "vX.Y.Z (hash)" shows in Settings instead, for both the desktop
+             app and the browser. Populated by main.js; starts hidden so
+             there's nothing to see before that first happens. -->
+        <span id="railVersion" class="rail-version" hidden></span>
       </div>
     </nav>
 
@@ -435,6 +458,7 @@
     </div>
 
     <div class="dialog-actions">
+      <span id="appVersion" class="app-version"></span>
       <button id="settingsCloseBtn" type="button">Close</button>
       <button id="settingsSaveBtn" type="button">Save</button>
     </div>

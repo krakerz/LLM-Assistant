@@ -316,6 +316,15 @@ async fn run_dispatch_turn(
 ) -> DispatchOutcome {
     let mut outcome = DispatchOutcome::none();
     let state = chat_session::read_state(session_id);
+    // Offering `web-search` when SearXNG has no `base_url` set would just
+    // lead the model to request a search that's guaranteed to fail (turn 4
+    // still answers in character, apologizing for the error, but that's a
+    // wasted round trip for something this cheap to rule out up front) --
+    // so it's left off the list entirely rather than relying on the model
+    // to somehow infer "available" doesn't really mean available yet.
+    let searxng_configured = searxng::load_or_init()
+        .map(|cfg| !cfg.base_url.trim().is_empty())
+        .unwrap_or(false);
 
     for _ in 0..MAX_DISPATCH_ATTEMPTS {
         let loaded_names = chat_session::read_loaded_rulesets(session_id);
@@ -323,6 +332,7 @@ async fn run_dispatch_turn(
             .unwrap_or_default()
             .into_iter()
             .filter(|r| !loaded_names.contains(&r.name))
+            .filter(|r| searxng_configured || r.name != ruleset::WEB_SEARCH_RULESET_NAME)
             .collect();
         let loaded_rulesets: Vec<(String, String)> = loaded_names
             .iter()

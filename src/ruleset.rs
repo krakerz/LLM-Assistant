@@ -144,11 +144,20 @@ configured for it -- only include the ones you actually want to fix.";
 pub const WEB_SEARCH_RULESET_NAME: &str = "web-search";
 
 /// Guaranteed by `list_rulesets` regardless of file content -- see
-/// `WEB_SEARCH_RULESET_NAME`'s doc comment.
+/// `WEB_SEARCH_RULESET_NAME`'s doc comment. The direct phrasing examples were
+/// added after a real session: the user, mid-roleplay, asked "can you find
+/// me an info for X?" and the dispatch pass answered "none" -- the model
+/// stayed in character and had the persona narrate "let me check my
+/// information base" instead of actually requesting a search, exactly the
+/// failure this hint now calls out by name rather than leaving to inference.
 pub const WEB_SEARCH_HINT: &str = "Use this the moment the user asks something that needs \
 current or real-world information you don't already know -- news, prices, who/what/when \
-questions, anything you'd otherwise have to guess at. Request a real web search immediately \
-rather than answering from memory or making something up.";
+questions, anything you'd otherwise have to guess at. This includes direct phrasing like \
+\"find me some info/information on X\", \"look up X\", \"search for X\", or \"can you check X \
+for me\" -- treat these exactly like a real search request, even if they interrupt an unrelated \
+topic or come mid-roleplay. Request a real web search immediately rather than answering from \
+memory, making something up, or -- the easy mistake here -- just having the persona narrate \
+\"let me look that up\" in character without actually requesting one.";
 
 /// Reference-only, shown by the ruleset editor's "see an example" popup --
 /// never written to disk. See `IMAGE_GENERATION_EXAMPLE`'s doc comment for

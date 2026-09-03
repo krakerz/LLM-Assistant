@@ -1,6 +1,6 @@
 [package]
 name = "llm-assistant"
-version = "1.14.0"
+version = "1.14.1"
 description = "Chat-driven local file assistant, sandboxed to a chosen folder"
 edition = "2021"
 rust-version = "1.77"
