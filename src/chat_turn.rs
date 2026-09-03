@@ -146,50 +146,20 @@ const MAX_DISPATCH_ATTEMPTS: u32 = 2;
 /// and the state-update turn (turn 2, see module doc comment) are a
 /// separate follow-up call the caller fires only after showing this reply,
 /// not something awaited here.
-pub async fn run_chat_turn(
+/// Everything after obtaining the raw reply string -- thinking extraction,
+/// defensive fence-stripping, history persistence, building the outcome.
+/// Shared by `run_chat_turn` and `run_chat_turn_streaming` so this logic
+/// exists exactly once regardless of how the reply text was actually
+/// obtained.
+fn finish_chat_turn(
     cfg: &AppConfig,
     session_id: &str,
     history: Vec<ChatMessage>,
+    trimmed: context::FitOutcome,
+    raw_reply: String,
 ) -> anyhow::Result<ChatTurnOutcome> {
-    let (meta, _) = chat_session::load_session(session_id)?;
-    let persona_content = match &meta.persona {
-        Some(name) => persona::load_persona(name).ok(),
-        None => None,
-    };
-    let state = chat_session::read_state(session_id);
-    let system_content = rules::build_chat_system_content(
-        persona_content.as_deref(),
-        &state,
-        cfg.chat_state_max_tokens,
-    );
-
-    let summarizer = cfg.summarize_before_dropping.then(|| context::Summarizer {
-        endpoint: &cfg.endpoint,
-        model: &cfg.model,
-        api_key: &cfg.api_key,
-    });
-    let trimmed = context::fit_to_budget(
-        context::estimate_tokens(&system_content),
-        history.clone(),
-        cfg.max_context_tokens as usize,
-        summarizer,
-    )
-    .await;
-
-    let mut messages = vec![ChatMessage::text("system", system_content)];
-    messages.extend(trimmed.messages);
-
-    let reply = crate::llm::send_chat(
-        &cfg.endpoint,
-        &cfg.model,
-        &cfg.api_key,
-        cfg.chat_temperature,
-        &messages,
-    )
-    .await?;
-
-    let thinking = rules::extract_thinking_block(&reply);
-    let reply = rules::strip_thinking_blocks(&reply);
+    let thinking = rules::extract_thinking_block(&raw_reply);
+    let reply = rules::strip_thinking_blocks(&raw_reply);
 
     // Defensive only -- turn 1's system prompt no longer mentions state or
     // rulesets at all (see `rules::build_chat_system_content`'s doc
@@ -224,6 +194,92 @@ pub async fn run_chat_turn(
         summary: trimmed.summary,
         rewritten_history: trimmed.rewritten_history,
     })
+}
+
+/// Builds the system prompt and the context-trimmed message list turn 1
+/// actually sends -- identical setup for both the non-streaming and
+/// streaming paths below, only the LLM call itself differs between them.
+async fn prepare_chat_turn(
+    cfg: &AppConfig,
+    session_id: &str,
+    history: &[ChatMessage],
+) -> anyhow::Result<(Vec<ChatMessage>, context::FitOutcome)> {
+    let (meta, _) = chat_session::load_session(session_id)?;
+    let persona_content = match &meta.persona {
+        Some(name) => persona::load_persona(name).ok(),
+        None => None,
+    };
+    let state = chat_session::read_state(session_id);
+    let system_content = rules::build_chat_system_content(
+        persona_content.as_deref(),
+        &state,
+        cfg.chat_state_max_tokens,
+    );
+
+    let summarizer = cfg.summarize_before_dropping.then(|| context::Summarizer {
+        endpoint: &cfg.endpoint,
+        model: &cfg.model,
+        api_key: &cfg.api_key,
+    });
+    let trimmed = context::fit_to_budget(
+        context::estimate_tokens(&system_content),
+        history.to_vec(),
+        cfg.max_context_tokens as usize,
+        summarizer,
+    )
+    .await;
+
+    let mut messages = vec![ChatMessage::text("system", system_content)];
+    messages.extend(trimmed.messages.clone());
+    Ok((messages, trimmed))
+}
+
+pub async fn run_chat_turn(
+    cfg: &AppConfig,
+    session_id: &str,
+    history: Vec<ChatMessage>,
+) -> anyhow::Result<ChatTurnOutcome> {
+    let (messages, trimmed) = prepare_chat_turn(cfg, session_id, &history).await?;
+
+    let raw = crate::llm::send_chat(
+        &cfg.endpoint,
+        &cfg.model,
+        &cfg.api_key,
+        cfg.chat_temperature,
+        &messages,
+    )
+    .await?;
+
+    finish_chat_turn(cfg, session_id, history, trimmed, raw)
+}
+
+/// Streaming sibling of `run_chat_turn` -- identical setup
+/// (`prepare_chat_turn`), only the LLM call differs: `on_delta` fires once
+/// per chunk as the reply is generated, for a caller that wants to forward
+/// partial text live (a Tauri `Channel`, an SSE stream). The final,
+/// persisted outcome is identical either way -- `finish_chat_turn` runs on
+/// the complete accumulated reply exactly as it does for the non-streaming
+/// path, so nothing about *what* gets stored or returned changes, only
+/// whether the caller also learns about the reply incrementally.
+pub async fn run_chat_turn_streaming(
+    cfg: &AppConfig,
+    session_id: &str,
+    history: Vec<ChatMessage>,
+    mut on_delta: impl FnMut(crate::llm::ChatDelta<'_>) + Send,
+) -> anyhow::Result<ChatTurnOutcome> {
+    let (messages, trimmed) = prepare_chat_turn(cfg, session_id, &history).await?;
+
+    let raw = crate::llm::send_chat_streaming(
+        &cfg.endpoint,
+        &cfg.model,
+        &cfg.api_key,
+        cfg.chat_temperature,
+        &messages,
+        &mut on_delta,
+    )
+    .await?;
+
+    finish_chat_turn(cfg, session_id, history, trimmed, raw)
 }
 
 /// The dedicated state-update turn's own completion, temperature-locked the

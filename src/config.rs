@@ -64,6 +64,16 @@ pub struct AppConfig {
     /// problem: a dialog always approved stops being read.
     #[serde(default = "default_confirm_fade_after")]
     pub confirm_fade_after: u32,
+    /// `--server` mode only (see `server::AuthState`) -- how long a login
+    /// session stays valid before it's treated as expired and swept from
+    /// the in-memory session set. Previously unbounded: a token lived until
+    /// the process restarted, so a long-running server slowly accumulated
+    /// one entry per login forever, real but slow growth (most users log in
+    /// roughly once per the cookie's own 30-day `Max-Age`, not per visit).
+    /// 0 = never expire, matching every other cap in this file. Has no
+    /// effect on the GUI, which never goes through `--server`'s login flow.
+    #[serde(default = "default_server_session_expiry_days")]
+    pub server_session_expiry_days: u32,
     /// The per-session record (`memory.rs`) in the system block. On by
     /// default -- app-written from observed facts, so unlike
     /// `summarize_before_dropping` nothing in it can be wrong. Turn off for
@@ -110,10 +120,25 @@ pub struct AppConfig {
     /// only wants the spoken lines.
     #[serde(default = "default_chat_hide_narration")]
     pub chat_hide_narration: bool,
+    /// Client-side only, same as `chat_hide_narration` -- the backend call
+    /// is always the streaming one (`send_chat_message_streaming`/
+    /// `h_send_chat_message_streaming`) either way, so a live reasoning
+    /// delta can still fill in `chat_show_thinking`'s placeholder as it
+    /// arrives regardless of this setting. This just controls whether the
+    /// reply's own text is also shown growing live in its own bubble (on
+    /// by default) or kept hidden behind the placeholder until the whole
+    /// reply is ready, the pre-streaming behavior, for anyone who finds the
+    /// live growing text distracting rather than reassuring.
+    #[serde(default = "default_chat_stream_replies")]
+    pub chat_stream_replies: bool,
 }
 
 fn default_confirm_fade_after() -> u32 {
     3
+}
+
+fn default_server_session_expiry_days() -> u32 {
+    7
 }
 
 fn default_memory_enabled() -> bool {
@@ -146,6 +171,10 @@ fn default_chat_persist_thinking() -> bool {
 
 fn default_chat_hide_narration() -> bool {
     false
+}
+
+fn default_chat_stream_replies() -> bool {
+    true
 }
 
 /// 8000 turned out tight once accounted for: `CHAT_PROTOCOL_PROMPT` +
@@ -192,12 +221,14 @@ impl Default for AppConfig {
             max_context_tokens: default_max_context_tokens(),
             summarize_before_dropping: false,
             confirm_fade_after: default_confirm_fade_after(),
+            server_session_expiry_days: default_server_session_expiry_days(),
             memory_enabled: default_memory_enabled(),
             memory_max_tokens: default_memory_max_tokens(),
             chat_state_max_tokens: default_chat_state_max_tokens(),
             chat_show_thinking: default_chat_show_thinking(),
             chat_persist_thinking: default_chat_persist_thinking(),
             chat_hide_narration: default_chat_hide_narration(),
+            chat_stream_replies: default_chat_stream_replies(),
         }
     }
 }

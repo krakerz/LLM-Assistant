@@ -267,6 +267,9 @@
         there — read it when it appears. Costs one extra request per turn while over budget. Shared
         by both modes below.
       </label>
+      <label>--server mode only: log a browser out this many days after logging in (0 = never expire). Has no effect on this desktop app, which never goes through --server's login.
+        <input id="cfgServerSessionExpiryDays" type="number" step="1" min="0" />
+      </label>
     </div>
 
     <div class="tab-panel" data-panel="chat" hidden>
@@ -292,6 +295,13 @@
         Keep a shown thinking block saved with the chat, so reopening that session later (or after
         restarting the app) still shows it. Off by default — otherwise it's only visible for the
         turn it arrived on. Has no effect if the option above is off.
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="cfgChatStreamReplies" />
+        Show a reply's own text growing live as it's generated, instead of only once it's complete.
+        On by default. Turning this off doesn't stop reasoning from streaming into the "Thinking"
+        box above if the option above is on — only the reply's own bubble goes back to waiting for
+        the full text.
       </label>
     </div>
 
