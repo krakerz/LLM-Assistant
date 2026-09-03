@@ -1,18 +1,27 @@
 name: Autobuild
 
 # Runs only on pushes to main -- a PR being opened/updated does not trigger
-# this at all. Reads the version straight out of Cargo.toml and, only if
-# that version hasn't been released yet, builds the full bundle and cuts a
-# tag + draft release (release notes pulled from the matching CHANGELOG.md
-# section). A push that didn't bump the version just gets fmt/clippy/test/
-# build as a sanity check.
+# this at all. `paths-ignore` below also skips it entirely for a push that
+# only touches docs/metadata with nothing to build or test -- a README fix
+# alone isn't worth a CI run. Reads the version straight out of Cargo.toml
+# and, only if that version hasn't been released yet, builds the full bundle
+# and cuts a tag + draft release (release notes pulled from the matching
+# CHANGELOG.md section). A push that didn't bump the version just gets
+# fmt/clippy/test/build as a sanity check.
 #
 # To trigger an actual release: bump the version in Cargo.toml and
 # tauri.conf.json, promote CHANGELOG.md's "Unreleased" section to that
-# version, commit, and merge to main.
+# version, commit, and merge to main -- Cargo.toml changing is real source,
+# so that push always runs regardless of what else is also in it.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "README.md"
+      - "CHANGELOG.md"
+      - "LICENSE"
+      - "INSTALL.txt"
+      - ".gitignore"
   workflow_dispatch:
 
 permissions:
