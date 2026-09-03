@@ -6,7 +6,7 @@
 <title>LLM Assistant</title>
 <link rel="stylesheet" href="style.css" />
 </head>
-<body>
+<body class="app-not-ready">
   <!-- Only shown outside Tauri, and only when `--server`'s server.json has a
        password set -- replaces relying on the browser's own native Basic
        Auth prompt, which some browsers render inconsistently (or not at
@@ -31,6 +31,12 @@
       <button id="fileOpsModeBtn" class="mode-rail-btn" title="File Operations">📁</button>
       <div class="mode-rail-bottom">
         <button id="settingsBtn" class="mode-rail-btn" title="Settings">⚙</button>
+        <!-- Just the version, never the build hash -- that's what actually
+             made this text wide enough to stretch the whole rail. The full
+             "vX.Y.Z (hash)" shows in Settings instead, for both the desktop
+             app and the browser. Populated by main.js; starts hidden so
+             there's nothing to see before that first happens. -->
+        <span id="railVersion" class="rail-version" hidden></span>
       </div>
     </nav>
 

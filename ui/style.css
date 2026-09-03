@@ -37,6 +37,17 @@ body {
   height: 100%;
 }
 
+/* `<body>` ships with this class in the markup, so the shell (chat log,
+   sessions, everything) stays fully off-screen from the very first paint
+   until `revealApp()` in main.js removes it -- outside Tauri, that's only
+   once `ensureAuthenticated()` has confirmed no password is required, or a
+   valid session already exists. Nothing behind the login form is ever
+   rendered even for the one local round trip `/api/auth_check` takes,
+   rather than flashing the real app and then covering it with the overlay. */
+body.app-not-ready .app-shell {
+  display: none;
+}
+
 .mode-rail {
   display: flex;
   flex-direction: column;
@@ -629,14 +640,26 @@ details.bubble.thinking > .bubble.assistant {
   margin-top: 14px;
 }
 
-/* Lives in the Settings dialog's own button row now, not the mode rail --
-   a build hash makes that text wide enough to force the rail itself wider
-   than its icons need, just to fit one line nobody checks constantly. */
+/* Lives in the Settings dialog's own button row, not the mode rail -- an
+   unbroken build-hash string is wide enough to force the whole rail wider
+   than its icons actually need, just to fit one line nobody checks
+   constantly. The short, hash-less version-only badge some places also show
+   is `.rail-version` below, not this. */
 .app-version {
   color: var(--muted);
   font-size: 10px;
   line-height: 1.2;
   margin-right: auto;
+}
+
+/* Under the gear icon, in both the desktop app and the browser -- just
+   "vX.Y.Z", never the build hash, so it's short enough to actually fit the
+   rail's own icon width without needing `.app-version`'s wrapping trick.
+   The full version+hash is one gear-click away in Settings either way. */
+.rail-version {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.2;
 }
 
 #approveBtn {
@@ -665,7 +688,8 @@ details.bubble.thinking > .bubble.assistant {
 #addPathDialog label,
 #newPersonaDialog label,
 #renameSessionDialog label,
-#rulesetDialog label {
+#rulesetDialog label,
+#loginOverlay label {
   display: block;
   margin: 12px 0 4px;
   color: var(--muted);
@@ -684,7 +708,8 @@ details.bubble.thinking > .bubble.assistant {
 #newPersonaDialog textarea,
 #renameSessionDialog input[type="text"],
 #rulesetDialog select,
-#rulesetDialog textarea {
+#rulesetDialog textarea,
+#loginOverlay input[type="password"] {
   width: 100%;
   background: #0f1116;
   color: var(--text);

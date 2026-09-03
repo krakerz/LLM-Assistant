@@ -28,7 +28,7 @@
 use crate::llm::ChatMessage;
 use crate::paths::app_config_dir;
 use crate::{chat_session, chat_turn, comfyui, config, llm, persona, ruleset, searxng};
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -123,8 +123,27 @@ async fn serve_index() -> Response {
     serve_asset("index.html").await
 }
 
-async fn serve_named_asset(AxumPath(path): AxumPath<String>) -> Response {
-    serve_asset(&path).await
+/// The single top-level fallback for anything that doesn't match `/` or a
+/// registered `/api/*` route -- deliberately not a nested `.fallback()` on
+/// the `/api` sub-router. A `Router::nest()`'d sub-router is flattened into
+/// the same route tree as everything else at build time; its own
+/// `.fallback()` is not honored the way a plain, non-nested router's is; an
+/// unmatched `/api/...` request instead falls through to whatever *other*
+/// pattern in the whole tree happens to match that path, which used to be a
+/// static-asset wildcard registered on `/` -- reporting a confusing `405
+/// Method Not Allowed` (that pattern exists, just only for `GET`) on a
+/// `POST` to a command that was never ported to `--server`, instead of the
+/// `404` this actually is. One fallback, with an explicit prefix check,
+/// sidesteps relying on nested-fallback semantics at all.
+async fn fallback(uri: axum::http::Uri) -> Response {
+    match uri.path().strip_prefix("/api/") {
+        Some(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no such command" })),
+        )
+            .into_response(),
+        None => serve_asset(uri.path().trim_start_matches('/')).await,
+    }
 }
 
 // --- auth: a cookie-backed session behind a custom login form in `ui/`,
@@ -276,16 +295,25 @@ fn load_cfg() -> Result<config::AppConfig, String> {
 // since the browser already offers "save image" on the `data:` URL itself.
 // ---
 
-async fn h_app_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+// Wrapped in `Json` rather than returned bare: axum's `IntoResponse` for a
+// plain `&str` sends it as an unquoted `text/plain` body, but the frontend's
+// `invoke` shim always calls `res.json()` on the response (matching what
+// Tauri's own `invoke` already does for every return type, strings
+// included -- it's real IPC, always JSON-serialized regardless of shape).
+// An unquoted body like `1.14.1` isn't valid JSON on its own (two decimal
+// points aren't a valid JSON number), so `res.json()` threw a SyntaxError
+// and the whole call silently failed -- exactly why neither the version nor
+// the rail badge ever appeared outside Tauri.
+async fn h_app_version() -> Json<&'static str> {
+    Json(env!("CARGO_PKG_VERSION"))
 }
 
-async fn h_app_build_hash() -> &'static str {
-    env!("BUILD_HASH")
+async fn h_app_build_hash() -> Json<&'static str> {
+    Json(env!("BUILD_HASH"))
 }
 
-async fn h_default_system_prompt() -> &'static str {
-    config::DEFAULT_SYSTEM_PROMPT
+async fn h_default_system_prompt() -> Json<&'static str> {
+    Json(config::DEFAULT_SYSTEM_PROMPT)
 }
 
 #[derive(Deserialize)]
@@ -796,8 +824,8 @@ pub async fn run(bind: String, port: u16, password: String) -> anyhow::Result<()
 
     let router = Router::new()
         .route("/", get(serve_index))
-        .route("/{*path}", get(serve_named_asset))
-        .nest("/api", public_api.merge(protected_api));
+        .nest("/api", public_api.merge(protected_api))
+        .fallback(fallback);
 
     let addr: std::net::SocketAddr = format!("{bind}:{port}").parse()?;
     log::info!("web server listening on http://{addr} (chat mode only)");
