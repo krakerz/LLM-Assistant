@@ -267,6 +267,9 @@
         there — read it when it appears. Costs one extra request per turn while over budget. Shared
         by both modes below.
       </label>
+      <label>--server mode only: log a browser out this many days after logging in (0 = never expire). Has no effect on this desktop app, which never goes through --server's login.
+        <input id="cfgServerSessionExpiryDays" type="number" step="1" min="0" />
+      </label>
     </div>
 
     <div class="tab-panel" data-panel="chat" hidden>

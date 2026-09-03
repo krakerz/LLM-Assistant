@@ -155,17 +155,33 @@ async fn fallback(uri: axum::http::Uri) -> Response {
 // ever prompting, with no way for this app to control or retry that. A
 // form the app itself owns removes that dependency entirely.
 
-/// One shared, in-memory set of currently-valid session tokens. Cleared on
-/// every server restart by construction (nothing persists it) -- losing all
-/// sessions on restart is an acceptable, simple default for a personal
-/// server; logging back in costs one password entry.
+/// One shared, in-memory map of currently-valid session tokens to when each
+/// was issued. Cleared on every server restart by construction (nothing
+/// persists it) -- losing all sessions on restart is an acceptable, simple
+/// default for a personal server; logging back in costs one password entry.
+/// `std::time::Instant` rather than a wall-clock timestamp since nothing
+/// here is ever serialized -- monotonic and immune to clock changes, and
+/// simpler than reasoning about a clock jump mid-run.
 #[derive(Clone)]
 struct AuthState {
     /// Empty means no password is configured -- see `ServerConfig::password`'s
     /// doc comment. Checked directly by `h_login`/`h_auth_check`; `run`
     /// decides whether to apply `require_session` at all based on this.
     password: Arc<str>,
-    sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
+}
+
+/// `AppConfig::server_session_expiry_days`, read fresh (not cached) so a
+/// change in Settings takes effect on the next check/sweep without a
+/// restart -- same "never trust a stale copy" convention every other route
+/// in this file already follows. Falls back to the field's own default if
+/// config can't be loaded at all, rather than failing a session check over
+/// an unrelated disk error. `Duration::ZERO` means "never expire."
+fn session_expiry() -> std::time::Duration {
+    let days = config::load_or_init()
+        .map(|cfg| cfg.server_session_expiry_days)
+        .unwrap_or_else(|_| config::AppConfig::default().server_session_expiry_days);
+    std::time::Duration::from_secs(u64::from(days) * 86400)
 }
 
 const SESSION_COOKIE_NAME: &str = "llm_session";
@@ -180,11 +196,51 @@ fn session_token_from_cookies(headers: &HeaderMap) -> Option<String> {
     })
 }
 
+/// Self-cleaning: a token found but past its expiry is removed right here,
+/// not just reported invalid -- the request that finally notices an old
+/// token is expired is also the one that takes it out of the map, rather
+/// than leaving that to the periodic sweep alone (`spawn_session_sweep`
+/// below still exists for a token nobody ever presents again).
 fn session_is_valid(headers: &HeaderMap, auth: &AuthState) -> bool {
-    match session_token_from_cookies(headers) {
-        Some(token) => auth.sessions.lock().unwrap().contains(&token),
-        None => false,
+    let Some(token) = session_token_from_cookies(headers) else {
+        return false;
+    };
+    let mut sessions = auth.sessions.lock().unwrap();
+    let Some(&issued_at) = sessions.get(&token) else {
+        return false;
+    };
+    let expiry = session_expiry();
+    if expiry.is_zero() || issued_at.elapsed() < expiry {
+        true
+    } else {
+        sessions.remove(&token);
+        false
     }
+}
+
+/// Catches a session nobody ever comes back to present again (an abandoned
+/// login, a one-off test), which `session_is_valid`'s own self-cleaning
+/// can't reach since it only ever runs when that specific token shows up on
+/// a request. An hourly sweep is frequent enough that even the shortest
+/// sane expiry setting doesn't linger for long, and cheap enough (one
+/// `HashMap::retain` over what's realistically at most a handful of live
+/// sessions for a personal server) not to matter at any interval this
+/// coarse. Not spawned at all when no password is configured -- `h_login`
+/// is unreachable then, so `auth.sessions` never gets an entry to sweep.
+fn spawn_session_sweep(auth: AuthState) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            let expiry = session_expiry();
+            if expiry.is_zero() {
+                continue;
+            }
+            auth.sessions
+                .lock()
+                .unwrap()
+                .retain(|_, issued_at| issued_at.elapsed() < expiry);
+        }
+    });
 }
 
 /// Not a cryptographic RNG -- `RandomState`'s per-instance key, freshly
@@ -255,7 +311,10 @@ async fn h_login(State(auth): State<AuthState>, Json(req): Json<LoginRequest>) -
             .into_response();
     }
     let token = generate_session_token();
-    auth.sessions.lock().unwrap().insert(token.clone());
+    auth.sessions
+        .lock()
+        .unwrap()
+        .insert(token.clone(), std::time::Instant::now());
     let cookie =
         format!("{SESSION_COOKIE_NAME}={token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=2592000");
     (
@@ -952,7 +1011,7 @@ fn api_router() -> Router {
 pub async fn run(bind: String, port: u16, password: String) -> anyhow::Result<()> {
     let auth = AuthState {
         password: Arc::from(password.as_str()),
-        sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let public_api = Router::new()
@@ -968,6 +1027,7 @@ pub async fn run(bind: String, port: u16, password: String) -> anyhow::Result<()
             auth.clone(),
             require_session,
         ));
+        spawn_session_sweep(auth.clone());
     }
 
     let router = Router::new()

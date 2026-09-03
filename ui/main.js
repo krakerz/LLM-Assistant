@@ -1464,6 +1464,8 @@ function renderSettings() {
   document.getElementById("cfgDisableBuiltinRules").checked = !!currentConfig.disable_builtin_rules;
   document.getElementById("cfgSummarizeBeforeDropping").checked =
     !!currentConfig.summarize_before_dropping;
+  document.getElementById("cfgServerSessionExpiryDays").value =
+    currentConfig.server_session_expiry_days;
   document.getElementById("cfgGeneralRules").value = currentGeneralRules;
   document.getElementById("cfgCommandRules").value = currentCommandRules;
 
@@ -1705,6 +1707,10 @@ document.getElementById("settingsSaveBtn").addEventListener("click", async () =>
   currentConfig.summarize_before_dropping = document.getElementById(
     "cfgSummarizeBeforeDropping",
   ).checked;
+  currentConfig.server_session_expiry_days = Math.max(
+    0,
+    parseInt(document.getElementById("cfgServerSessionExpiryDays").value, 10) || 0,
+  );
   currentGeneralRules = document.getElementById("cfgGeneralRules").value;
   currentCommandRules = document.getElementById("cfgCommandRules").value;
   currentComfyConfig = collectComfyConfigFromForm();

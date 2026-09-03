@@ -9,6 +9,7 @@ All notable changes to this project are documented here. The format follows [Kee
 ### Added
 - Chat mode's turn 1 reply now streams in live (GUI and `--server`), instead of appearing all at once after the full reply is generated
 - New Chat setting: "show a reply's own text growing live" (on by default) — turning it off keeps replies masked behind the thinking placeholder like before, without affecting live reasoning display
+- New General setting: `--server` login sessions now expire (7 days by default, 0 = never) instead of living until the process restarts
 
 ### Changed
 - The live streaming view strips `//`/`||` narration markers from what's shown — display only, the stored/dispatched reply is unaffected
@@ -17,6 +18,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Fixed
 - A live reply bubble rendered as an empty padded pill for the moment before the first streamed chunk arrived
+- `--server`'s login sessions grew unbounded for the life of the process — no expiry, no logout, nothing ever removed a token once issued. Now expired on a per-check basis plus an hourly sweep for sessions nobody ever presents again
 
 ## [1.15.0] — 2026-09-03
 
