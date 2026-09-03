@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [1.14.1] — 2026-09-03
+
+### Fixed
+- `--server`'s password prompt relied on the browser's own HTTP Basic Auth dialog -- some browsers rendered the raw `401` body ("password required") as the page instead of ever prompting, with no way for the app to retry or control that. Replaced with a login form the app itself owns (`ui/index.html`'s new overlay), backed by a server-issued session cookie (`/api/login`, checked via `/api/auth_check`) instead of a `WWW-Authenticate` challenge -- `server.json`'s `password` field means the same thing either way, only how it's asked for changed
+- A real session showed the dispatch pass answer "none" to "can you find me an info for X?" -- a direct search request -- and instead had the persona narrate "let me check my information base" in character rather than actually requesting one. `ruleset::WEB_SEARCH_HINT` now names that exact failure and lists concrete trigger phrasing ("find me info on X", "look up X", "search for X", "can you check X for me") instead of leaving the model to infer intent from an abstract description
+- The `web-search` ruleset was offered as available regardless of whether SearXNG was actually configured, so the model could request a search that was guaranteed to fail (`searxng.json` with no `base_url`) before turn 4's apology-in-character ran. It's no longer offered at all unless a `base_url` is actually set -- nothing to request, nothing to fail
+
+### Changed
+- `--server`'s Settings dialog now hides the "File Operations" tab -- its granted-paths/sandbox settings have no meaning with no folder-picking mode to use them from in a browser
+- The version/build hash display moved from the mode rail (bottom-left, next to the gear icon) into the Settings dialog's own button row -- a build hash made that text wide enough to force the whole rail wider than its icons actually need
+
 ## [1.14.0] — 2026-09-03
 
 ### Added

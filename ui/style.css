@@ -629,11 +629,14 @@ details.bubble.thinking > .bubble.assistant {
   margin-top: 14px;
 }
 
+/* Lives in the Settings dialog's own button row now, not the mode rail --
+   a build hash makes that text wide enough to force the rail itself wider
+   than its icons need, just to fit one line nobody checks constantly. */
 .app-version {
   color: var(--muted);
   font-size: 10px;
   line-height: 1.2;
-  text-align: center;
+  margin-right: auto;
 }
 
 #approveBtn {

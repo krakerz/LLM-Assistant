@@ -127,46 +127,123 @@ async fn serve_named_asset(AxumPath(path): AxumPath<String>) -> Response {
     serve_asset(&path).await
 }
 
-// --- auth: HTTP Basic, applied only when a password is actually set ---
+// --- auth: a cookie-backed session behind a custom login form in `ui/`,
+// not the browser's own HTTP Basic Auth prompt. An earlier version used
+// Basic Auth -- simpler on the server, since the browser owns the whole
+// credential UI -- but that UI turned out to be exactly the problem: a
+// plain top-level navigation to a password-protected `--server` sometimes
+// rendered the raw 401 body ("password required") as the page instead of
+// ever prompting, with no way for this app to control or retry that. A
+// form the app itself owns removes that dependency entirely.
 
-fn check_basic_auth(headers: &HeaderMap, password: &str) -> bool {
-    let Some(header_value) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return false;
-    };
-    let Some(encoded) = header_value.strip_prefix("Basic ") else {
-        return false;
-    };
-    let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
-    else {
-        return false;
-    };
-    let Ok(decoded) = String::from_utf8(decoded) else {
-        return false;
-    };
-    // "username:password" -- the username is never checked, only the half
-    // after the colon matters, so any username the browser prompts for works.
-    decoded.split_once(':').map(|(_, pass)| pass) == Some(password)
+/// One shared, in-memory set of currently-valid session tokens. Cleared on
+/// every server restart by construction (nothing persists it) -- losing all
+/// sessions on restart is an acceptable, simple default for a personal
+/// server; logging back in costs one password entry.
+#[derive(Clone)]
+struct AuthState {
+    /// Empty means no password is configured -- see `ServerConfig::password`'s
+    /// doc comment. Checked directly by `h_login`/`h_auth_check`; `run`
+    /// decides whether to apply `require_session` at all based on this.
+    password: Arc<str>,
+    sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
-async fn require_password(
-    State(password): State<Arc<str>>,
+const SESSION_COOKIE_NAME: &str = "llm_session";
+
+fn session_token_from_cookies(headers: &HeaderMap) -> Option<String> {
+    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookie_header.split(';').find_map(|kv| {
+        kv.trim()
+            .strip_prefix(SESSION_COOKIE_NAME)?
+            .strip_prefix('=')
+            .map(str::to_string)
+    })
+}
+
+fn session_is_valid(headers: &HeaderMap, auth: &AuthState) -> bool {
+    match session_token_from_cookies(headers) {
+        Some(token) => auth.sessions.lock().unwrap().contains(&token),
+        None => false,
+    }
+}
+
+/// Not a cryptographic RNG -- `RandomState`'s per-instance key, freshly
+/// drawn from OS randomness on every call (the same mechanism that makes
+/// `HashMap` resistant to HashDoS attacks), stands in for one without
+/// pulling in a dedicated crate for a personal-server session token. Four
+/// independently-seeded draws concatenated is plenty of entropy for
+/// "guessing this cookie is infeasible," which is all this needs to be.
+fn generate_session_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    (0..4)
+        .map(|_| format!("{:016x}", RandomState::new().build_hasher().finish()))
+        .collect()
+}
+
+async fn require_session(
+    State(auth): State<AuthState>,
     headers: HeaderMap,
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if check_basic_auth(&headers, &password) {
+    if session_is_valid(&headers, &auth) {
         next.run(request).await
     } else {
         (
             StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"llm-assistant\"")],
-            "password required",
+            Json(serde_json::json!({ "error": "unauthorized" })),
         )
             .into_response()
     }
+}
+
+/// Public even when a password is set -- this is what the login overlay
+/// itself calls, both to decide whether to show up at all (no password
+/// configured, or this tab already has a valid session) and, on a fresh
+/// visit, whether it needs to.
+#[derive(Serialize)]
+struct AuthCheckResponse {
+    required: bool,
+    authenticated: bool,
+}
+
+async fn h_auth_check(State(auth): State<AuthState>, headers: HeaderMap) -> Response {
+    let required = !auth.password.is_empty();
+    let authenticated = required && session_is_valid(&headers, &auth);
+    Json(AuthCheckResponse {
+        required,
+        authenticated,
+    })
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    password: String,
+}
+
+/// Public even when a password is set -- see `AuthCheckResponse`'s doc
+/// comment; this is the one gated action a session-less request is still
+/// allowed to take.
+async fn h_login(State(auth): State<AuthState>, Json(req): Json<LoginRequest>) -> Response {
+    if auth.password.is_empty() || req.password != *auth.password {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "wrong password" })),
+        )
+            .into_response();
+    }
+    let token = generate_session_token();
+    auth.sessions.lock().unwrap().insert(token.clone());
+    let cookie =
+        format!("{SESSION_COOKIE_NAME}={token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=2592000");
+    (
+        [(header::SET_COOKIE, cookie)],
+        Json(serde_json::json!({ "ok": true })),
+    )
+        .into_response()
 }
 
 // --- small helpers shared by every route below ---
@@ -691,19 +768,36 @@ fn api_router() -> Router {
 /// An empty `password` serves everything unauthenticated -- "auto mode",
 /// a deliberate choice for a trusted network rather than an error to block
 /// startup on, but always logged at `warn` so it's never silently the case.
+/// Static assets and `/api/auth_check`/`/api/login` are always public
+/// regardless (the login overlay itself is one of those assets, and has to
+/// reach both routes before any session exists to show up at all); every
+/// other `/api/*` route sits behind `require_session` only when a password
+/// is actually configured.
 pub async fn run(bind: String, port: u16, password: String) -> anyhow::Result<()> {
+    let auth = AuthState {
+        password: Arc::from(password.as_str()),
+        sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+    };
+
+    let public_api = Router::new()
+        .route("/auth_check", get(h_auth_check))
+        .route("/login", post(h_login))
+        .with_state(auth.clone());
+
+    let mut protected_api = api_router();
+    if auth.password.is_empty() {
+        log::warn!("server.json has no password set -- serving without authentication");
+    } else {
+        protected_api = protected_api.layer(middleware::from_fn_with_state(
+            auth.clone(),
+            require_session,
+        ));
+    }
+
     let router = Router::new()
         .route("/", get(serve_index))
         .route("/{*path}", get(serve_named_asset))
-        .nest("/api", api_router());
-
-    let router = if password.is_empty() {
-        log::warn!("server.json has no password set -- serving without authentication");
-        router
-    } else {
-        let password: Arc<str> = Arc::from(password.as_str());
-        router.layer(middleware::from_fn_with_state(password, require_password))
-    };
+        .nest("/api", public_api.merge(protected_api));
 
     let addr: std::net::SocketAddr = format!("{bind}:{port}").parse()?;
     log::info!("web server listening on http://{addr} (chat mode only)");
