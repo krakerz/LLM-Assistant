@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [1.14.0] — 2026-09-03
+
+### Added
+- `llm-assistant --server [--bind <addr>] [--port <n>]` -- a headless mode that serves chat mode only (no file-ops/sandbox, which depends on a folder picked through the desktop GUI and has no meaning to a remote browser) over plain HTTP, so the app can be left running on a machine and reached from a browser elsewhere. Reuses the exact same chat-mode logic the desktop app already runs -- every chat-mode Tauri command was already state-free plain Rust, so this is a thin HTTP-shaped wrapper around the same functions, not a second implementation. Shares the same `config.toml`/session files as the desktop GUI (both resolve through the same `$XDG_CONFIG_HOME/llm-assistant`), so a session started from a browser picks up seamlessly in the desktop app and vice versa; the two can also run at the same time as separate processes. `ui/`'s static assets are compiled directly into the binary, so this works identically from a dev build, a `.deb` install, or an AppImage. Optionally password-protected via `server.json`'s `password` field (HTTP Basic Auth, checked on every route) -- config-file-only for now, never a CLI flag, since a flag would leak into shell history and `ps aux`; an empty password serves openly with a startup warning, a deliberate choice for a trusted network rather than an error
+
 ## [1.13.2] — 2026-09-02
 
 ### Fixed
