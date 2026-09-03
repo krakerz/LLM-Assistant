@@ -700,13 +700,6 @@ fn get_chat_state(session_id: String) -> String {
 struct SendChatMessageResult {
     reply: String,
     thinking: Option<String>,
-    /// Whether this turn's reply included a ` ```state ``` ` block that got
-    /// saved -- the UI shows a small indicator rather than the raw block.
-    state_updated: bool,
-    ruleset_loaded: Option<String>,
-    ruleset_error: Option<String>,
-    image_prompt_requested: Option<comfyui::ImagePromptFields>,
-    web_search_requested: Option<String>,
     dropped: usize,
     condensed: usize,
     summarized: usize,
@@ -714,9 +707,12 @@ struct SendChatMessageResult {
     rewritten_history: Option<Vec<ChatMessage>>,
 }
 
-/// Thin wrapper around `chat_turn::run_chat_turn`, the logic shared with the
-/// `--persona-chat` CLI (`chat_cli.rs`) -- this command just loads config and
-/// maps the error type Tauri expects.
+/// Thin wrapper around `chat_turn::run_chat_turn` (turn 1 only -- see its
+/// module doc comment), the logic shared with the `--persona-chat` CLI
+/// (`chat_cli.rs`) -- this command just loads config and maps the error
+/// type Tauri expects. Dispatch and state-update are a separate follow-up
+/// call (`run_turn_followup` below) the frontend fires only after showing
+/// this reply.
 #[tauri::command]
 async fn send_chat_message(
     session_id: String,
@@ -729,17 +725,71 @@ async fn send_chat_message(
     Ok(SendChatMessageResult {
         reply: outcome.reply,
         thinking: outcome.thinking,
-        state_updated: outcome.state_updated,
-        ruleset_loaded: outcome.ruleset_loaded,
-        ruleset_error: outcome.ruleset_error,
-        image_prompt_requested: outcome.image_prompt_requested,
-        web_search_requested: outcome.web_search_requested,
         dropped: outcome.dropped,
         condensed: outcome.condensed,
         summarized: outcome.summarized,
         summary: outcome.summary,
         rewritten_history: outcome.rewritten_history,
     })
+}
+
+/// Turn 2 as its own round-trip -- called by the frontend only after
+/// `send_chat_message` has already returned and shown its reply, so neither
+/// dispatch nor the state-update turn it also kicks off (detached, see
+/// `chat_turn::run_turn_followup`'s doc comment) can add latency to that.
+#[derive(serde::Serialize)]
+struct TurnFollowupResult {
+    ruleset_loaded: Option<String>,
+    ruleset_error: Option<String>,
+    image_prompt_requested: Option<comfyui::ImagePromptFields>,
+    web_search_requested: Option<String>,
+    /// Whether this turn spawned its own state-update turn -- known the
+    /// instant it's spawned, not once it finishes (it's a detached
+    /// background task, see `chat_turn::spawn_state_update`'s doc comment),
+    /// so this is purely "a memory update was triggered for this turn," not
+    /// "state has now actually changed." The GUI shows it as a small badge
+    /// the moment this result comes back, same spirit as the old
+    /// `state_updated` indicator but without waiting on anything.
+    state_update_dispatched: bool,
+}
+
+impl From<chat_turn::TurnFollowupOutcome> for TurnFollowupResult {
+    fn from(outcome: chat_turn::TurnFollowupOutcome) -> Self {
+        Self {
+            ruleset_loaded: outcome.ruleset_loaded,
+            ruleset_error: outcome.ruleset_error,
+            image_prompt_requested: outcome.image_prompt_requested,
+            web_search_requested: outcome.web_search_requested,
+            // Always true today: `run_turn_followup` unconditionally spawns
+            // one (`outcome.state_update_handle` is dropped here, unused --
+            // there is no "did it spawn" question for this particular
+            // outcome type, only for `TurnReply` below, where it's optional).
+            state_update_dispatched: true,
+        }
+    }
+}
+
+#[tauri::command]
+async fn run_turn_followup(
+    session_id: String,
+    last_user_message: String,
+    last_assistant_reply: String,
+) -> Result<TurnFollowupResult, String> {
+    let cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let (meta, _) = chat_session::load_session(&session_id).map_err(|e| e.to_string())?;
+    let persona_content = match &meta.persona {
+        Some(name) => persona::load_persona(name).ok(),
+        None => None,
+    };
+    Ok(chat_turn::run_turn_followup(
+        &cfg,
+        &session_id,
+        persona_content.as_deref(),
+        &last_user_message,
+        &last_assistant_reply,
+    )
+    .await
+    .into())
 }
 
 /// Settings' "Test image generation" button -- runs the real pipeline
@@ -817,11 +867,16 @@ async fn generate_comfyui_image(
 struct TurnReplyResult {
     text: Option<String>,
     thinking: Option<String>,
+    /// See `TurnFollowupResult::state_update_dispatched`'s doc comment --
+    /// same meaning. `false` whenever `text` is `None` (nothing to update
+    /// state from) or the reaction/answer turn itself failed outright.
+    state_update_dispatched: bool,
 }
 
 impl From<chat_turn::TurnReply> for TurnReplyResult {
     fn from(reply: chat_turn::TurnReply) -> Self {
         Self {
+            state_update_dispatched: reply.state_update_handle.is_some(),
             text: reply.text,
             thinking: reply.thinking,
         }
@@ -1274,6 +1329,7 @@ fn main() {
             delete_chat_session,
             get_chat_state,
             send_chat_message,
+            run_turn_followup,
             test_comfyui_generation,
             generate_comfyui_image,
             run_image_reaction,

@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [1.15.0] — 2026-09-03
+
+### Changed
+- Chat mode's persistent state moved from a bespoke bold-markdown text block to a two-tier JSON design: `state.json` is now the full character sheet as raw JSON (the source of truth, written by a new dedicated state-update turn), and `state.md` is a compact prose summary derived from it, fed into every other completion as before. Precise/quantitative fields (a percentage, a fraction like `85/100`) and anything anchoring the current moment factually (any field named like "Action") are pulled out mechanically and appended to the summary verbatim, bolded, never touched by the summarizer -- only genuinely descriptive fields (mood, personality, appearance) go through it, where lossy compression is an acceptable trade for brevity. This replaces a long-running source of recurring formatting bugs (stray `//`/`||` used as field separators, missing bold, a literal `\n` written instead of a line break) with one real, mechanically-validated syntax instead of an invented text convention
+- Turn 1 (the user-facing reply) no longer waits on the dispatch decision or the new state-update turn before returning -- both were confirmed, while designing this change, to already be blocking the visible reply for no real benefit. They now run concurrently as a separate follow-up call the frontend fires only after the reply is already on screen, the same pattern already used for image generation and web search. The image-reaction and search-answer turns also each get their own follow-up state-update now, not just the original reply
+- The chat log's small "state updated" badge is back, with different meaning: since state-update now runs as a detached background task with nothing awaiting its completion, the badge no longer means "state definitely changed" -- it means "this turn triggered a memory update," shown the instant that's dispatched rather than once it finishes, since there's no longer a moment at which completion could be reported without waiting on it
+- The "Remembered state for this chat" quick view now has a Refresh button and a short note explaining why it can show the previous turn's state for a few seconds after sending a message -- state-update runs in the background after the reply, not before it, so opening the dialog immediately can catch it mid-flight; Refresh re-fetches in place instead of needing a close-and-reopen
+
+### Fixed
+- Chat mode's state block could end up with a literal `\n` (or doubled `\\n`) written between fields instead of a real line break, which the old text-based parser couldn't recover from, leaving several fields stuck as part of one field's value. Moot now that state is JSON, but was also fixed mechanically before the redesign landed
+- A background state-update task spawned via `tokio::spawn` gets silently killed if the process exits before it finishes -- confirmed live in `--persona-chat`, which exits the moment stdin closes and reliably raced ahead of its own in-flight update. The CLI now collects every spawned state-update handle and drains them before exiting instead of dropping them; the GUI and `--server` are long-running processes with no equivalent risk, so they still fire-and-forget as before
+- The new state-update prompt's own format example (`{"HP": "85/100", "Trust in the user": "growing"}`) was concrete enough that a real session copied it verbatim as actual tracked fields, even though nothing in that persona's character sheet mentions HP or trust at all -- classic few-shot leakage. The example now uses `<placeholder>`-style field names with an explicit "this is a format example, not a suggestion for what to track" instruction instead
+
 ## [1.14.1] — 2026-09-03
 
 ### Fixed

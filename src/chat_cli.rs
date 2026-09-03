@@ -98,6 +98,11 @@ async fn run_async(opts: Options) -> i32 {
         }
     };
 
+    let persona_content = match &meta.persona {
+        Some(name) => persona::load_persona(name).ok(),
+        None => None,
+    };
+
     println!("llm-assistant -- persona chat: {}", meta.title);
     if let Some(p) = &meta.persona {
         println!("persona: {p}");
@@ -119,6 +124,15 @@ async fn run_async(opts: Options) -> i32 {
             _ => {}
         }
     }
+
+    // A `tokio::spawn`'d state-update task keeps running even after its
+    // `JoinHandle` is dropped -- but not if the *process itself* exits
+    // first, which this short-lived CLI does the moment stdin closes.
+    // Confirmed live: without this, state.json/state.md silently never got
+    // written at all if the update was still in flight at exit. Collected
+    // here and drained just before returning, rather than awaited inline
+    // per turn, so a slow state-update still doesn't delay the next prompt.
+    let mut pending_state_updates: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     let stdin = io::stdin();
     loop {
@@ -150,19 +164,30 @@ async fn run_async(opts: Options) -> i32 {
 
         history.push(ChatMessage::text("user", text));
         match chat_turn::run_chat_turn(&cfg, &session_id, history.clone()).await {
-            Ok(outcome) => {
-                if let Some(rewritten) = outcome.rewritten_history {
-                    history = rewritten;
+            Ok(turn1) => {
+                if let Some(rewritten) = &turn1.rewritten_history {
+                    history = rewritten.clone();
                 }
-                history.push(ChatMessage::text("assistant", outcome.reply.clone()));
+                history.push(ChatMessage::text("assistant", turn1.reply.clone()));
 
-                if let Some(thinking) = &outcome.thinking {
+                if let Some(thinking) = &turn1.thinking {
                     println!("\n🧠 {}", to_plain_text(thinking));
                 }
-                println!("\n{}", to_plain_text(&outcome.reply));
-                if outcome.state_updated {
-                    println!("\n[memories updated]");
-                }
+                println!("\n{}", to_plain_text(&turn1.reply));
+
+                // Turn 2: dispatch + state-update, run only now that the
+                // reply above is already shown -- see chat_turn.rs's module
+                // doc comment. Blocking here is fine for a terminal (no
+                // "thinking" indicator to manage the way the GUI has).
+                let outcome = chat_turn::run_turn_followup(
+                    &cfg,
+                    &session_id,
+                    persona_content.as_deref(),
+                    text,
+                    &turn1.reply,
+                )
+                .await;
+                pending_state_updates.push(outcome.state_update_handle);
                 if let Some(name) = &outcome.ruleset_loaded {
                     println!("\n[loaded ruleset: {name}]");
                 }
@@ -186,6 +211,9 @@ async fn run_async(opts: Options) -> i32 {
                                 // hand afterward.
                                 Ok(result) => {
                                     println!("[image saved to: {}]", result.path.display());
+                                    if let Some(handle) = result.state_update_handle {
+                                        pending_state_updates.push(handle);
+                                    }
                                     // A missing reaction isn't necessarily a
                                     // failure -- `Never` never asks at all,
                                     // and `Optional` can legitimately decide
@@ -243,6 +271,9 @@ async fn run_async(opts: Options) -> i32 {
                                         Some(answer) => println!("\n{}", to_plain_text(answer)),
                                         None => println!("[answer turn failed -- see the log]"),
                                     }
+                                    if let Some(handle) = result.state_update_handle {
+                                        pending_state_updates.push(handle);
+                                    }
                                 }
                                 Err(e) => println!("[web search failed: {e}]"),
                             }
@@ -250,16 +281,16 @@ async fn run_async(opts: Options) -> i32 {
                         Err(e) => println!("[could not load SearXNG config: {e}]"),
                     }
                 }
-                if let Some(summary) = &outcome.summary {
+                if let Some(summary) = &turn1.summary {
                     eprintln!(
                         "\n[summarized {} old message(s) to fit the context budget]\n{summary}",
-                        outcome.summarized
+                        turn1.summarized
                     );
                 }
-                if outcome.dropped > 0 {
+                if turn1.dropped > 0 {
                     eprintln!(
                         "\n[dropped {} old message(s) to fit the context budget]",
-                        outcome.dropped
+                        turn1.dropped
                     );
                 }
             }
@@ -272,6 +303,13 @@ async fn run_async(opts: Options) -> i32 {
                 eprintln!("\nerror: {e}");
             }
         }
+    }
+
+    // See `pending_state_updates`'s doc comment at the top of this
+    // function -- without this drain, any state-update still in flight
+    // when stdin closes gets silently killed along with the process.
+    for handle in pending_state_updates {
+        let _ = handle.await;
     }
     0
 }

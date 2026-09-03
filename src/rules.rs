@@ -104,61 +104,19 @@ describe any file as moved, created, or deleted unless output above shows it act
 part of this conversation was summarized or dropped to save context, don't reconstruct what was in \
 it: say you no longer have it rather than describing file contents you cannot see.]";
 
-/// Chat mode's entire mechanical contract -- mechanical because only the app
-/// parses the ` ```state ` fence it describes, so only the app can teach the
-/// syntax exists at all. What's actually worth tracking is up to whatever
-/// persona is loaded (a character sheet might say to track HP, or a
-/// relationship level, or nothing) -- this text never says what to track,
-/// only how. Always sent in chat mode; there's no `disable_builtin_rules`
-/// equivalent here since there's nothing else to conflict with it.
-///
-/// **Mandatory every reply, no "if nothing changed" exception** -- it used
-/// to have one ("if nothing needs to change, you don't need to include one
-/// at all"), which a real session showed was enough of an out for the
-/// model to skip it most turns, leaving `state.md` stale. That's a bigger
-/// problem now than it was originally: `rules::build_dispatch_system_content`
-/// (the dispatch pass, `chat_turn::run_dispatch_turn`) reads `state.md` as
-/// its *only* context beyond the single latest exchange, so a stale
-/// snapshot doesn't just show old info in the transcript -- it actively
-/// feeds the tool-dispatch decision wrong information. Same lesson as the
-/// narration markers and the dispatch fence itself: an optional instruction
-/// with an escape hatch is exactly what a small model uses to skip the
-/// mechanical part in favor of just the creative reply.
-///
-/// Also explicitly forbids narrating a fabricated tool result (e.g. "an
-/// image is generated showing...") -- added after a real session where the
-/// model, asked for an image, wrote prose describing a fake one right in
-/// its normal reply instead of deferring to the actual mechanism, whether
-/// or not the dispatch pass (`chat_turn::run_dispatch_turn`) even fired
-/// that turn. Turn 1 genuinely has no way to know here whether a tool
-/// request will succeed -- it runs and returns before dispatch does -- so
-/// the only honest instruction is "don't claim it happened," not "confirm
-/// only if it happened."
-pub const CHAT_PROTOCOL_PROMPT: &str = "If you want something to reliably persist for the rest of \
-this conversation -- a stat, a fact, a relationship status, anything your character sheet says to \
-keep track of -- put the COMPLETE current version of it in a single fenced ```state code block \
-somewhere in your reply, for example:\n\n```state\n**HP** : 85/100\n**Trust in the user** : growing\n```\n\n\
-Format every field as `**field name** : value` -- the name always bold, then a space, a colon, a \
-space, then the value, one field per line. Bolding the name is what makes it visually unambiguous \
-as a field label rather than prose, so it's easier for you to reliably reparse turn over turn.\n\n\
-This replaces everything you wrote in your last ```state block, so restate everything you still \
-want remembered, not just what changed -- anything you leave out is gone. It is never shown to the \
-user as part of your reply, so don't reference it as if they can see it. Include this block in \
-EVERY reply, without exception -- even a short one, and even if nothing has changed since your \
-last one, in which case just restate the same content again rather than leaving it out. Never skip \
-it.\n\n\
-Never drop a field you were already tracking just because this particular reply didn't touch it -- \
-carry every one forward with its current value, unchanged. If a field has genuinely stopped applying, \
-never delete its line either -- set its value to none (or null) instead, so the field itself is still \
-there, just marked empty, rather than missing entirely. This especially includes anything about \
-physical state or appearance -- worn clothing, equipment, position, anything visibly different from \
-one moment to the next -- track it exactly like any other stat, and update it the instant it changes \
-(armor gets unequipped, an outfit changes, and so on), not just when the conversation happens to be \
-about it. Keep each field a short line, not a paragraph -- a compact block is what actually keeps this \
-reliable turn over turn. Other than the field name's own `**...**` bold, write it as plain text -- \
-never wrap any part of a line in `//...//` or `||...||`; that formatting is for your reply's own \
-narration/dialogue and has no meaning inside this block, so it never belongs here even by habit.\n\n\
-Separately: some requests (like generating an image) are handled by a different part of this app, \
+/// Turn 1/3/4's shared "don't narrate a fabricated tool result" guard --
+/// added after a real session where the model, asked for an image, wrote
+/// prose describing a fake one right in its normal reply instead of
+/// deferring to the actual mechanism, whether or not the dispatch pass
+/// (`chat_turn::run_turn_followup`) even fired that turn. Turn 1 genuinely
+/// has no way to know here whether a tool request will succeed -- it runs
+/// and returns before dispatch does -- so the only honest instruction is
+/// "don't claim it happened," not "confirm only if it happened." Kept
+/// separate from state instructions now that state has its own dedicated
+/// turn (`CHAT_STATE_UPDATE_PROMPT`) with nothing left for turn 1 itself to
+/// be told about it.
+pub const CHAT_TOOL_RESULT_GUARD_PROMPT: &str =
+    "Some requests (like generating an image) are handled by a different part of this app, \
 outside this reply entirely -- you have no way to know here whether that actually happened or \
 succeeded. If the user asks for something like that, acknowledge the request naturally and stay in \
 character, but never narrate, describe, or claim the result as if it already happened -- not by \
@@ -168,15 +126,55 @@ about to appear) -- the real result, if any, appears on its own afterward, alrea
 you never need to reference, announce, or point at it yourself. Describing or gesturing at a result \
 yourself only produces a fake one no one asked for.";
 
+/// The dedicated state-update turn's own instructions (see
+/// `chat_turn::run_state_update_turn`'s doc comment for why this replaced
+/// asking turn 1/3/4 to write state inline -- a real session showed a small
+/// model asked to simultaneously stay in character, update state, and watch
+/// for a dispatch fence reliably did none of the mechanical parts). JSON
+/// instead of the old bold-markdown convention for the same reason dispatch
+/// itself is a narrow three-way choice rather than open-ended: one real
+/// syntax the model already knows, that the app can validate with a single
+/// `serde_json::from_str` instead of a pile of text-sanitizing heuristics.
+pub const CHAT_STATE_UPDATE_PROMPT: &str =
+    "You are not replying to the user -- nothing you write here is ever shown to them, and you are \
+not continuing the conversation. Given the exchange below and your previous state, output ONLY the \
+complete, current state as a single fenced ```state code block containing a flat JSON object -- \
+string keys, string values, no nesting -- restating every field your character sheet tracks, not \
+just what changed. The shape looks like this:\n\n```state\n{\"<field name>\": \"<its current value>\", \"<another field name>\": \"<its current value>\"}\n```\n\n\
+That's a format example, not a suggestion for what to track -- never invent or copy example field \
+names like these literally; only ever include fields your actual persona/character sheet defines.\n\n\
+This replaces everything in your previous state, so anything you leave out is gone -- carry every \
+field forward with its current value even if this exchange didn't touch it. If a field has \
+genuinely stopped applying, don't delete it either -- set its value to \"none\" so the field itself \
+stays present. This especially includes physical state or appearance -- worn clothing, equipment, \
+position, anything visibly different from one moment to the next -- track it exactly like any other \
+field, updated the instant it changes, not just when the conversation happens to be about it. \
+Nothing else in your reply: no commentary, no narration, just the one fenced JSON block.";
+
+/// Feeds only the *narrative* half of a parsed state (mood, personality,
+/// description -- anything `rules::is_precise_field` didn't pull out) to a
+/// separate, cheap completion that turns it into a short paragraph for
+/// `state.md`, the compact summary turn 1/3/4 and dispatch's own decision
+/// (not its image-prompt content -- see `chat_turn::run_turn_followup`'s
+/// doc comment) read as context. Precise/quantitative fields never reach
+/// this prompt at all -- the summarizer can't drift on data it never sees,
+/// which is a stronger guarantee than instructing it not to paraphrase
+/// values it does see.
+pub const CHAT_STATE_SUMMARY_PROMPT: &str =
+    "You'll be given some fields from a character's current state, as JSON. Write a short, natural \
+paragraph (2-4 sentences) that reads as flowing description, not a labeled list -- but don't invent \
+new details and don't omit any field's actual information, just phrase it as prose instead of \
+separate lines. Output only the paragraph itself, nothing else.";
+
 /// Forces every reply into the same narration/dialogue split
 /// `ui/main.js`'s `renderChatText` renders as separate blocks (see the
 /// "Roleplay text formatting" note in the project `CLAUDE.md`) -- most
 /// models don't write this way on their own, so without an explicit
 /// instruction a reply comes back as one plain paragraph and there's
 /// nothing for the renderer to split; the visual feature is only as good as
-/// the model actually producing the markers. Always sent in chat mode, same
-/// reasoning and no off-switch as `CHAT_PROTOCOL_PROMPT` -- this is how the
-/// app displays every reply, not a style the model is free to skip.
+/// the model actually producing the markers. Always sent in chat mode, no
+/// off-switch -- this is how the app displays every reply, not a style the
+/// model is free to skip.
 ///
 /// Both sides now need an explicit pair of markers -- dialogue used to be
 /// "whatever's left over," which a real session showed the model reading as
@@ -301,72 +299,18 @@ fn collapse_blank_runs(text: &str) -> String {
     out
 }
 
-/// The read side of `CHAT_PROTOCOL_PROMPT`'s ` ```state ` contract -- only
-/// the first block counts, matching how only the first ` ```sh ` fence ever
-/// runs in operation mode. `None` means the model didn't update its state
-/// this turn, not that it cleared it.
-pub fn extract_state_block(text: &str) -> Option<String> {
+/// The read side of `CHAT_STATE_UPDATE_PROMPT`'s ` ```state ` contract --
+/// only the first block counts, matching how only the first ` ```sh ` fence
+/// ever runs in operation mode. Returns the raw inner text for the caller to
+/// `serde_json::from_str`; unlike the old bold-markdown state block this
+/// replaced, there is no mechanical sanitizing to do here -- the content is
+/// either valid JSON or it isn't, and the caller decides what to do with a
+/// parse failure (see `chat_turn::run_state_update_turn`).
+pub fn extract_json_state_block(text: &str) -> Option<String> {
     let marker = "```state\n";
     let start = text.find(marker)? + marker.len();
     let end = text[start..].find("```")?;
-    Some(sanitize_state_content(text[start..start + end].trim()))
-}
-
-/// Defensive backstop for `CHAT_PROTOCOL_PROMPT`'s "write it as plain text,
-/// never `//...//`/`||...||`" rule -- a real session showed the model bleed
-/// its reply's own narration formatting into the state block anyway, using
-/// a stray `//` as an ad-hoc field separator instead of a newline (e.g.
-/// `"...the request.// User Action: ..."`, two fields run together onto one
-/// line). Since a genuine field separator is exactly what got used in its
-/// place, replacing with a newline (not just deleting the marker) is what
-/// actually recovers the intended structure, not just hides the mistake.
-///
-/// Also a backstop for `**field name** : value`, the same reasoning as the
-/// narration markers above: a real session confirmed the model can just
-/// skip the bold instruction on a given turn even in a build that has it
-/// (small local models don't reliably follow every formatting rule every
-/// single time), so this is enforced mechanically rather than trusted to
-/// always be followed.
-fn sanitize_state_content(raw: &str) -> String {
-    raw.replace("//", "\n")
-        .replace("||", "\n")
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(enforce_bold_field_name)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Caps how much of a line counts as a candidate field name -- long enough
-/// for anything real (`state.md` field names are short by design, per
-/// `CHAT_PROTOCOL_PROMPT`), short enough that an ordinary sentence with a
-/// colon somewhere in its *value* (a time, a URL, a ratio) doesn't get
-/// mistaken for one and get its front half wrongly bolded.
-const MAX_FIELD_NAME_LEN: usize = 40;
-
-/// Rewrites a plain `field name: value` line into `**field name** : value`
-/// -- see `sanitize_state_content`'s doc comment. Already-bold lines
-/// (`**...`) and lines with no colon in their first `MAX_FIELD_NAME_LEN`
-/// characters (nothing that looks like a field label) are left untouched.
-fn enforce_bold_field_name(line: &str) -> String {
-    if line.starts_with("**") {
-        return line.to_string();
-    }
-    let Some(colon) = line
-        .char_indices()
-        .take(MAX_FIELD_NAME_LEN)
-        .find(|&(_, c)| c == ':')
-        .map(|(i, _)| i)
-    else {
-        return line.to_string();
-    };
-    let name = line[..colon].trim();
-    let value = line[colon + 1..].trim();
-    if name.is_empty() {
-        return line.to_string();
-    }
-    format!("**{name}** : {value}")
+    Some(text[start..start + end].trim().to_string())
 }
 
 /// Removes every ` ```state ` block from `text` for display -- the model is
@@ -741,13 +685,19 @@ pub fn build_system_content(
     out
 }
 
-/// Shared by `build_chat_system_content` and `build_dispatch_system_content`
-/// -- both need the same capped `state.md` snapshot appended, just as the
+/// Shared by `build_chat_system_content` (fed the compact `state.md`
+/// summary) and `build_dispatch_system_content` (fed the raw JSON instead,
+/// for image-prompt fidelity -- see `chat_turn::run_turn_followup`'s doc
+/// comment) -- both need whatever they were handed appended, capped, as the
 /// last thing in an otherwise different system message. `state` is capped
 /// at `state_max_tokens` (0 = no cap) with an explicit truncation note, same
 /// reasoning as `memory::build_block`'s cap: this goes in the system
 /// message, which `context::fit_to_budget` never trims, so nothing else is
-/// in a position to keep it in check.
+/// in a position to keep it in check. Blind character truncation is safe
+/// either way -- this text is only ever shown to a model as reference
+/// context, never re-parsed by this app, so a truncated raw-JSON tail being
+/// syntactically broken doesn't matter the way it would if something here
+/// had to `serde_json::from_str` it back.
 fn append_state_block(out: &mut String, state: &str, state_max_tokens: u32) {
     let state = state.trim();
     if state.is_empty() {
@@ -762,13 +712,121 @@ fn append_state_block(out: &mut String, state: &str, state_max_tokens: u32) {
     out.push_str(&capped);
 }
 
+/// One field parsed out of the state-update turn's raw JSON object, in the
+/// order `serde_json` read them (see `parse_state_fields`).
+pub struct StateField {
+    pub name: String,
+    pub value: String,
+}
+
+/// Parses a flat JSON object (string keys, string values -- exactly the
+/// shape `CHAT_STATE_UPDATE_PROMPT` asks for) into an ordered field list.
+/// Any value that isn't a JSON string is stringified rather than rejected
+/// outright (a model writing a bare number or bool for a field is an easy
+/// near-miss, not a reason to lose the whole field) -- nested
+/// objects/arrays are skipped, since character-sheet fields are flat by
+/// design and there's no sane single-line display for either. Returns an
+/// empty vec (not an error) for anything that isn't a JSON object at all,
+/// treated the same as "the model produced nothing usable this turn".
+pub fn parse_state_fields(raw_json: &str) -> Vec<StateField> {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(raw_json)
+    else {
+        return Vec::new();
+    };
+    map.into_iter()
+        .filter_map(|(name, value)| {
+            let value = match value {
+                serde_json::Value::String(s) => Some(s),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                serde_json::Value::Bool(b) => Some(b.to_string()),
+                serde_json::Value::Null => Some("none".to_string()),
+                serde_json::Value::Object(_) | serde_json::Value::Array(_) => None,
+            }?;
+            Some(StateField { name, value })
+        })
+        .collect()
+}
+
+/// `true` for a field precise/concrete enough that summarizing it risks
+/// losing the one thing that made it worth tracking in the first place --
+/// pulled out mechanically and preserved verbatim (never fed to
+/// `CHAT_STATE_SUMMARY_PROMPT` at all) rather than trusting a summarizer not
+/// to paraphrase it away. Two signals, either one enough: the value is
+/// essentially just a number/fraction/percentage, or the field's *name*
+/// suggests it anchors the current moment factually (what's happening right
+/// now) rather than describing mood or personality, which tolerates lossy
+/// compression far better.
+pub fn is_precise_field(name: &str, value: &str) -> bool {
+    name.to_lowercase().contains("action") || looks_quantitative(value)
+}
+
+/// A value is "quantitative" if, once trimmed, it's *only* digits, digits
+/// with a trailing `%`, or `digits/digits` (an HP fraction) -- deliberately
+/// tight rather than "contains a digit somewhere," so an ordinary
+/// descriptive sentence that happens to mention a number ("she's 8 years
+/// older than...") isn't misclassified as precise data worth pulling out of
+/// its narrative context.
+fn looks_quantitative(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let digits_only = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    if let Some(pct) = value.strip_suffix('%') {
+        return digits_only(pct);
+    }
+    if let Some((whole, part)) = value.split_once('/') {
+        return digits_only(whole) && digits_only(part);
+    }
+    digits_only(value)
+}
+
+/// Splits a parsed field list into (precise, narrative) by
+/// `is_precise_field`, preserving each side's original relative order.
+pub fn partition_state_fields(fields: Vec<StateField>) -> (Vec<StateField>, Vec<StateField>) {
+    fields
+        .into_iter()
+        .partition(|f| is_precise_field(&f.name, &f.value))
+}
+
+/// Composes the final `state.md` text: precise fields bolded and verbatim
+/// first (never touched by the summarizer -- see `is_precise_field`'s doc
+/// comment), then the narrative paragraph `CHAT_STATE_SUMMARY_PROMPT`
+/// produced from everything else. Either half can be empty (a character
+/// sheet with no quantitative fields yet, or one that's entirely numeric).
+pub fn build_state_markdown(precise: &[StateField], narrative_summary: &str) -> String {
+    let mut lines: Vec<String> = precise
+        .iter()
+        .map(|f| format!("**{}** : {}", f.name, f.value))
+        .collect();
+    let narrative_summary = narrative_summary.trim();
+    if !narrative_summary.is_empty() {
+        lines.push(narrative_summary.to_string());
+    }
+    lines.join("\n")
+}
+
+/// Mechanical fallback for `build_state_markdown` when the summarize call
+/// itself fails -- a plain bold listing of the narrative fields rather than
+/// silently dropping them, same "never lose information to a failed
+/// request" reasoning as everywhere else a follow-up call can fail.
+pub fn plain_field_listing(fields: &[StateField]) -> String {
+    fields
+        .iter()
+        .map(|f| format!("**{}** : {}", f.name, f.value))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Chat mode's whole system message for the user-facing reply (turn 1 of
-/// the turn/dispatch/reaction split -- see `chat_turn::run_chat_turn`'s doc
-/// comment): the mechanical `CHAT_PROTOCOL_PROMPT` and
-/// `CHAT_NARRATION_PROMPT`, then the persona's own content (if one is
-/// loaded), then the session's current ` ```state ` snapshot (if it's ever
-/// written one). No root note, no rules.md/command-rules.md -- those are
-/// operation-mode concepts with nothing to say here.
+/// the turn/dispatch/reaction/state-update split -- see
+/// `chat_turn::run_chat_turn`'s doc comment): `CHAT_NARRATION_PROMPT` and
+/// the tool-result guard, then the persona's own content (if one is
+/// loaded), then the session's current `state.md` summary (read-only
+/// context -- this turn is never asked to write a new one; that's
+/// `chat_turn::run_state_update_turn`'s own dedicated job now). No root
+/// note, no rules.md/command-rules.md -- those are operation-mode concepts
+/// with nothing to say here.
 ///
 /// Deliberately carries **no** ruleset information -- this reply is no
 /// longer the one expected to request or use a ruleset (that moved entirely
@@ -782,9 +840,9 @@ pub fn build_chat_system_content(
     state: &str,
     state_max_tokens: u32,
 ) -> String {
-    let mut out = CHAT_PROTOCOL_PROMPT.to_string();
+    let mut out = CHAT_NARRATION_PROMPT.to_string();
     out.push_str("\n\n");
-    out.push_str(CHAT_NARRATION_PROMPT);
+    out.push_str(CHAT_TOOL_RESULT_GUARD_PROMPT);
     if let Some(persona) = persona {
         out.push_str("\n\n");
         out.push_str(persona);
@@ -794,8 +852,8 @@ pub fn build_chat_system_content(
 }
 
 /// The dispatch pass's own instructions (turn 2 -- see
-/// `chat_turn::run_dispatch_turn`'s doc comment). Deliberately not
-/// `CHAT_PROTOCOL_PROMPT`/`CHAT_NARRATION_PROMPT` -- this reply is never
+/// `chat_turn::run_turn_followup`'s doc comment). Deliberately not
+/// `CHAT_NARRATION_PROMPT` -- this reply is never
 /// shown to the user, so narration formatting has nothing to do here; its
 /// only job is deciding whether a ruleset/tool applies and, if so, emitting
 /// exactly the fence for it. Spelled out as a strict three-way choice
@@ -975,88 +1033,101 @@ mod tests {
     }
 
     #[test]
-    fn extract_state_block_reads_the_content() {
-        let reply = "Sure!\n```state\nHP: 85/100\n```\nDone.";
+    fn extract_json_state_block_reads_the_raw_content() {
+        let reply = "Sure!\n```state\n{\"HP\": \"85/100\"}\n```\nDone.";
         assert_eq!(
-            extract_state_block(reply).as_deref(),
-            Some("**HP** : 85/100")
+            extract_json_state_block(reply).as_deref(),
+            Some("{\"HP\": \"85/100\"}")
         );
     }
 
     #[test]
-    fn extract_state_block_splits_a_stray_marker_used_as_a_field_separator() {
-        // The exact real-world regression: the model used a bare `//` as an
-        // ad-hoc separator between two fields instead of a newline, run
-        // together onto one line -- recovered as two separate lines rather
-        // than left with the marker (or the run-on) intact.
-        let reply =
-            "```state\nAction: waits for the request.// User Action: asks for a photo.\n```";
+    fn extract_json_state_block_is_none_when_absent() {
+        assert_eq!(extract_json_state_block("just a normal reply"), None);
+    }
+
+    #[test]
+    fn is_precise_field_true_for_a_percentage() {
+        assert!(is_precise_field("Arousal", "75%"));
+    }
+
+    #[test]
+    fn is_precise_field_true_for_a_fraction() {
+        assert!(is_precise_field("HP", "85/100"));
+    }
+
+    #[test]
+    fn is_precise_field_true_for_a_bare_number() {
+        assert!(is_precise_field("Level", "12"));
+    }
+
+    #[test]
+    fn is_precise_field_true_for_an_action_named_field_regardless_of_value() {
+        assert!(is_precise_field("Action", "waits for the request"));
+        assert!(is_precise_field("User Action", "asks for a photo"));
+    }
+
+    #[test]
+    fn is_precise_field_false_for_ordinary_descriptive_text() {
+        assert!(!is_precise_field("Mind", "cheerful and a little nervous"));
+        // A digit appearing deep inside a sentence shouldn't misclassify it.
+        assert!(!is_precise_field(
+            "Backstory",
+            "she's 8 years older than her brother"
+        ));
+    }
+
+    #[test]
+    fn parse_state_fields_reads_a_flat_object_and_stringifies_non_strings() {
+        let fields = parse_state_fields(r#"{"HP": "85/100", "Level": 3, "Alive": true}"#);
+        let mut pairs: Vec<(String, String)> =
+            fields.into_iter().map(|f| (f.name, f.value)).collect();
+        pairs.sort();
         assert_eq!(
-            extract_state_block(reply).as_deref(),
-            Some("**Action** : waits for the request.\n**User Action** : asks for a photo.")
+            pairs,
+            vec![
+                ("Alive".to_string(), "true".to_string()),
+                ("HP".to_string(), "85/100".to_string()),
+                ("Level".to_string(), "3".to_string()),
+            ]
         );
     }
 
     #[test]
-    fn extract_state_block_leaves_a_single_slash_alone() {
-        // A single `/` (e.g. an HP fraction) is not the `//` marker and
-        // must survive untouched.
-        let reply = "```state\nHP: 85/100\n```";
-        assert_eq!(
-            extract_state_block(reply).as_deref(),
-            Some("**HP** : 85/100")
-        );
+    fn parse_state_fields_is_empty_for_invalid_or_non_object_json() {
+        assert!(parse_state_fields("not json").is_empty());
+        assert!(parse_state_fields("[1, 2, 3]").is_empty());
     }
 
     #[test]
-    fn extract_state_block_is_none_when_absent() {
-        assert_eq!(extract_state_block("just a normal reply"), None);
+    fn partition_state_fields_splits_precise_from_narrative() {
+        let fields =
+            parse_state_fields(r#"{"HP": "85/100", "Mind": "cheerful", "Action": "waiting"}"#);
+        let (precise, narrative) = partition_state_fields(fields);
+        let precise_names: Vec<&str> = precise.iter().map(|f| f.name.as_str()).collect();
+        let narrative_names: Vec<&str> = narrative.iter().map(|f| f.name.as_str()).collect();
+        assert!(precise_names.contains(&"HP"));
+        assert!(precise_names.contains(&"Action"));
+        assert_eq!(narrative_names, vec!["Mind"]);
     }
 
     #[test]
-    fn extract_state_block_bolds_a_plain_field_name() {
-        // The model is told to always write `**field name** : value`
-        // (`CHAT_PROTOCOL_PROMPT`), but a real session showed it can still
-        // skip that and fall back to plain `field name: value` on a given
-        // turn -- enforced mechanically here rather than trusted.
-        let reply = "```state\nMind: cheerful\n```";
-        assert_eq!(
-            extract_state_block(reply).as_deref(),
-            Some("**Mind** : cheerful")
-        );
+    fn build_state_markdown_bolds_precise_fields_and_appends_the_summary() {
+        let precise = vec![StateField {
+            name: "HP".to_string(),
+            value: "85/100".to_string(),
+        }];
+        let markdown = build_state_markdown(&precise, "She seems cheerful today.");
+        assert_eq!(markdown, "**HP** : 85/100\nShe seems cheerful today.");
     }
 
     #[test]
-    fn extract_state_block_leaves_an_already_bold_field_name_alone() {
-        let reply = "```state\n**Mind** : cheerful\n```";
-        assert_eq!(
-            extract_state_block(reply).as_deref(),
-            Some("**Mind** : cheerful")
-        );
-    }
-
-    #[test]
-    fn extract_state_block_leaves_a_colonless_line_alone() {
-        let reply = "```state\njust a stray line with no field structure at all\n```";
-        assert_eq!(
-            extract_state_block(reply).as_deref(),
-            Some("just a stray line with no field structure at all")
-        );
-    }
-
-    #[test]
-    fn extract_state_block_does_not_bold_a_late_colon_in_a_long_line() {
-        // A colon that only shows up deep into an ordinary sentence (a
-        // time, a URL, a ratio) isn't a field label -- past
-        // `MAX_FIELD_NAME_LEN`, the line is left alone rather than wrongly
-        // treating everything before it as the "field name".
-        let reply = "```state\nthis is a long sentence with no real field label anywhere near the start: some value\n```";
-        assert_eq!(
-            extract_state_block(reply).as_deref(),
-            Some(
-                "this is a long sentence with no real field label anywhere near the start: some value"
-            )
-        );
+    fn build_state_markdown_handles_an_empty_summary() {
+        let precise = vec![StateField {
+            name: "HP".to_string(),
+            value: "85/100".to_string(),
+        }];
+        assert_eq!(build_state_markdown(&precise, ""), "**HP** : 85/100");
     }
 
     #[test]
@@ -1078,8 +1149,8 @@ mod tests {
     #[test]
     fn build_chat_system_content_includes_persona_and_state() {
         let out = build_chat_system_content(Some("You are Aria, a shopkeeper."), "HP: 90", 0);
-        assert!(out.contains(CHAT_PROTOCOL_PROMPT));
         assert!(out.contains(CHAT_NARRATION_PROMPT));
+        assert!(out.contains(CHAT_TOOL_RESULT_GUARD_PROMPT));
         assert!(out.contains("You are Aria, a shopkeeper."));
         assert!(out.contains("HP: 90"));
     }

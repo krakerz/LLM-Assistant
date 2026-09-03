@@ -960,9 +960,9 @@ select {
   flex-direction: column;
 }
 
-/* Overlaid on the bubble it belongs to, bottom-right corner -- a state
-   update is routine, not something worth its own line. Hover shows what it
-   means. */
+/* Overlaid on the bubble it belongs to, bottom-right corner -- triggering a
+   memory update is routine, not something worth its own line. Hover shows
+   what it means. */
 .state-updated-badge {
   position: absolute;
   bottom: 4px;
