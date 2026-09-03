@@ -1,8 +1,11 @@
 //! Chat mode's persistent conversations: `<app-config-dir>/chat/sessions/
 //! session-<timestamp>/`, one directory per session, holding `meta.json`
-//! (title, persona, timestamps), `history.json` (the conversation), and
-//! `state.md` (the persona's session-scoped, model-writable persistent
-//! state -- see `rules::CHAT_PROTOCOL_PROMPT`).
+//! (title, persona, timestamps), `history.json` (the conversation),
+//! `state.json` (the persona's full character sheet as raw JSON -- the
+//! source of truth, written only by `chat_turn::run_state_update_turn`),
+//! and `state.md` (a compact prose summary derived from `state.json`, fed
+//! into every other completion's system prompt -- see
+//! `rules::CHAT_STATE_UPDATE_PROMPT`).
 //!
 //! Deliberately **not** rotated or capped the way `chat_log`/`memory`
 //! sessions are -- the whole point is a session list the user manages
@@ -21,6 +24,7 @@ use std::path::PathBuf;
 const META_FILE: &str = "meta.json";
 const HISTORY_FILE: &str = "history.json";
 const STATE_FILE: &str = "state.md";
+const RAW_STATE_FILE: &str = "state.json";
 const RULESETS_FILE: &str = "loaded-rulesets.json";
 
 /// Title a freshly created session starts with, and the signal
@@ -141,6 +145,7 @@ pub fn create_session(persona: Option<&str>) -> anyhow::Result<SessionSummary> {
     write_meta(&id, &meta)?;
     fs::write(session_dir(&id).join(HISTORY_FILE), "[]")?;
     fs::write(session_dir(&id).join(STATE_FILE), "")?;
+    fs::write(session_dir(&id).join(RAW_STATE_FILE), "{}")?;
     fs::write(session_dir(&id).join(RULESETS_FILE), "[]")?;
     Ok(SessionSummary {
         id,
@@ -211,12 +216,29 @@ pub fn append_assistant_message(id: &str, content: &str) -> anyhow::Result<()> {
     save_history(id, &history, None)
 }
 
+/// The compact prose summary -- what turn 1/3/4's system prompt reads as
+/// read-only context. See `read_raw_state` for the full-fidelity source of
+/// truth this is derived from.
 pub fn read_state(id: &str) -> String {
     fs::read_to_string(session_dir(id).join(STATE_FILE)).unwrap_or_default()
 }
 
 pub fn update_state(id: &str, content: &str) -> anyhow::Result<()> {
     fs::write(session_dir(id).join(STATE_FILE), content)?;
+    Ok(())
+}
+
+/// The full character sheet as raw JSON text -- the source of truth, only
+/// ever written by `chat_turn::run_state_update_turn` and read back by that
+/// same turn (as "your previous state") and by the dispatch turn (which
+/// needs the precise, unsummarized detail to write a good image prompt).
+/// Empty string if missing, same convention as `read_state`.
+pub fn read_raw_state(id: &str) -> String {
+    fs::read_to_string(session_dir(id).join(RAW_STATE_FILE)).unwrap_or_default()
+}
+
+pub fn update_raw_state(id: &str, content: &str) -> anyhow::Result<()> {
+    fs::write(session_dir(id).join(RAW_STATE_FILE), content)?;
     Ok(())
 }
 
@@ -324,6 +346,22 @@ mod tests {
             read_state(&session.id),
             "HP: 80",
             "state.md holds the current snapshot, not a growing log"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_state_starts_as_an_empty_json_object_and_overwrites() {
+        let dir = scratch("raw-state");
+        let session = create_session(None).unwrap();
+        assert_eq!(read_raw_state(&session.id), "{}");
+        update_raw_state(&session.id, r#"{"HP":"100"}"#).unwrap();
+        assert_eq!(read_raw_state(&session.id), r#"{"HP":"100"}"#);
+        update_raw_state(&session.id, r#"{"HP":"80"}"#).unwrap();
+        assert_eq!(
+            read_raw_state(&session.id),
+            r#"{"HP":"80"}"#,
+            "state.json holds the current snapshot, not a growing log"
         );
         let _ = fs::remove_dir_all(&dir);
     }

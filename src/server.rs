@@ -423,11 +423,16 @@ async fn h_generate_comfyui_image(Json(req): Json<GenerateComfyuiImageRequest>) 
 struct TurnReplyResponse {
     text: Option<String>,
     thinking: Option<String>,
+    /// See `TurnFollowupResponse::state_update_dispatched`'s doc comment --
+    /// same meaning. `false` whenever `text` is `None` (nothing to update
+    /// state from) or the reaction/answer turn itself failed outright.
+    state_update_dispatched: bool,
 }
 
 impl From<chat_turn::TurnReply> for TurnReplyResponse {
     fn from(reply: chat_turn::TurnReply) -> Self {
         Self {
+            state_update_dispatched: reply.state_update_handle.is_some(),
             text: reply.text,
             thinking: reply.thinking,
         }
@@ -645,15 +650,14 @@ async fn h_get_chat_state(Json(req): Json<SessionIdRequest>) -> Response {
     Json(chat_session::read_state(&req.session_id)).into_response()
 }
 
+async fn h_get_chat_raw_state(Json(req): Json<SessionIdRequest>) -> Response {
+    Json(chat_session::read_raw_state(&req.session_id)).into_response()
+}
+
 #[derive(Serialize)]
 struct SendChatMessageResponse {
     reply: String,
     thinking: Option<String>,
-    state_updated: bool,
-    ruleset_loaded: Option<String>,
-    ruleset_error: Option<String>,
-    image_prompt_requested: Option<comfyui::ImagePromptFields>,
-    web_search_requested: Option<String>,
     dropped: usize,
     condensed: usize,
     summarized: usize,
@@ -668,6 +672,9 @@ struct SendChatMessageRequest {
     history: Vec<ChatMessage>,
 }
 
+/// Turn 1 only -- see `chat_turn.rs`'s module doc comment. Dispatch and
+/// state-update are `h_run_turn_followup` below, called by the frontend
+/// only after this reply is already shown.
 async fn h_send_chat_message(Json(req): Json<SendChatMessageRequest>) -> Response {
     let result: Result<SendChatMessageResponse, String> = async {
         let cfg = load_cfg()?;
@@ -677,17 +684,70 @@ async fn h_send_chat_message(Json(req): Json<SendChatMessageRequest>) -> Respons
         Ok(SendChatMessageResponse {
             reply: outcome.reply,
             thinking: outcome.thinking,
-            state_updated: outcome.state_updated,
-            ruleset_loaded: outcome.ruleset_loaded,
-            ruleset_error: outcome.ruleset_error,
-            image_prompt_requested: outcome.image_prompt_requested,
-            web_search_requested: outcome.web_search_requested,
             dropped: outcome.dropped,
             condensed: outcome.condensed,
             summarized: outcome.summarized,
             summary: outcome.summary,
             rewritten_history: outcome.rewritten_history,
         })
+    }
+    .await;
+    ok_or_400(result)
+}
+
+#[derive(Serialize)]
+struct TurnFollowupResponse {
+    ruleset_loaded: Option<String>,
+    ruleset_error: Option<String>,
+    image_prompt_requested: Option<comfyui::ImagePromptFields>,
+    web_search_requested: Option<String>,
+    /// Whether this turn spawned its own state-update turn -- known the
+    /// instant it's spawned, not once it finishes (it's a detached
+    /// background task, see `chat_turn::spawn_state_update`'s doc comment),
+    /// so this is purely "a memory update was triggered for this turn," not
+    /// "state has now actually changed." The frontend shows it as a small
+    /// badge the moment this result comes back, same spirit as the old
+    /// `state_updated` indicator but without waiting on anything.
+    state_update_dispatched: bool,
+}
+
+impl From<chat_turn::TurnFollowupOutcome> for TurnFollowupResponse {
+    fn from(outcome: chat_turn::TurnFollowupOutcome) -> Self {
+        Self {
+            ruleset_loaded: outcome.ruleset_loaded,
+            ruleset_error: outcome.ruleset_error,
+            image_prompt_requested: outcome.image_prompt_requested,
+            web_search_requested: outcome.web_search_requested,
+            state_update_dispatched: outcome.state_update_handle.is_some(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnFollowupRequest {
+    session_id: String,
+    last_user_message: String,
+    last_assistant_reply: String,
+}
+
+async fn h_run_turn_followup(Json(req): Json<TurnFollowupRequest>) -> Response {
+    let result: Result<TurnFollowupResponse, String> = async {
+        let cfg = load_cfg()?;
+        let (meta, _) = chat_session::load_session(&req.session_id).map_err(|e| e.to_string())?;
+        let persona_content = match &meta.persona {
+            Some(name) => persona::load_persona(name).ok(),
+            None => None,
+        };
+        Ok(chat_turn::run_turn_followup(
+            &cfg,
+            &req.session_id,
+            persona_content.as_deref(),
+            &req.last_user_message,
+            &req.last_assistant_reply,
+        )
+        .await
+        .into())
     }
     .await;
     ok_or_400(result)
@@ -786,7 +846,9 @@ fn api_router() -> Router {
         .route("/rename_chat_session", post(h_rename_chat_session))
         .route("/delete_chat_session", post(h_delete_chat_session))
         .route("/get_chat_state", post(h_get_chat_state))
+        .route("/get_chat_raw_state", post(h_get_chat_raw_state))
         .route("/send_chat_message", post(h_send_chat_message))
+        .route("/run_turn_followup", post(h_run_turn_followup))
         .route("/read_generated_image", post(h_read_generated_image))
         .route("/probe_vision_capability", post(h_probe_vision_capability))
         .route("/test_vision_support", post(h_test_vision_support))

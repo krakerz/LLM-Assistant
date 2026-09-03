@@ -1,14 +1,30 @@
-//! Chat mode's turn, split into three single-purpose LLM calls:
+//! Chat mode's turn, split into single-purpose LLM calls:
 //!
-//! 1. `run_chat_turn` -- the fast, user-facing reply. Used by both the GUI
-//!    (`main.rs`'s `send_chat_message` Tauri command) and the CLI
-//!    (`chat_cli.rs`) so the two can never drift the way operation mode's
-//!    GUI/headless split once did before `rules.rs` centralized its shared
-//!    prompts.
-//! 2. `run_dispatch_turn` -- a separate, narrowly-scoped pass (called from
-//!    `run_chat_turn`, after the reply above is already persisted) whose
-//!    only job is deciding whether the exchange that was just had calls for
-//!    a ruleset/tool, and firing it.
+//! 1. `run_chat_turn` -- the fast, user-facing reply, and *only* that. Used
+//!    by both the GUI (`main.rs`'s `send_chat_message` Tauri command) and
+//!    the CLI (`chat_cli.rs`) so the two can never drift the way operation
+//!    mode's GUI/headless split once did before `rules.rs` centralized its
+//!    shared prompts. Returns as soon as the reply is persisted -- nothing
+//!    else in this list runs inside this call or blocks its return.
+//! 2. `run_turn_followup` -- called separately, after the frontend has
+//!    already shown turn 1's reply (`main.rs`'s own `run_turn_followup`
+//!    Tauri command). Awaits the state-update turn's raw-JSON half
+//!    (`run_state_json_turn`) *before* dispatch (`run_dispatch_turn`),
+//!    deliberately sequential rather than concurrent: dispatch's own
+//!    completion is what writes the `` ```image-prompt``` `` fence when
+//!    that ruleset is already loaded, and it needs *this* turn's fresh
+//!    state to describe the character accurately, not last turn's --
+//!    confirmed as a real gap in an earlier, fully-concurrent version of
+//!    this call, and worth the added wait now that it's deliberately masked
+//!    (the GUI shows a "thinking" placeholder for exactly this step, purely
+//!    cosmetic -- there's no real model reasoning behind it, just something
+//!    to tell the user a process is running instead of showing nothing).
+//!    Once the raw JSON is written, the slower narrative-summarize half
+//!    (`finish_state_update`) is spawned detached -- nothing downstream
+//!    needs *that* to be fresh, only the raw JSON dispatch is about to read,
+//!    so there's nothing to gain from waiting on it too. Only dispatch's
+//!    result is actually returned; state-update's success or failure is
+//!    logged, not surfaced.
 //! 3. `run_image_reaction_turn` -- triggered later, once ComfyUI actually
 //!    returns a generated image (`main.rs`'s `generate_comfyui_image`,
 //!    which can be seconds to minutes after 1/2 already returned) -- not
@@ -17,24 +33,30 @@
 //!    already returned the image, so the image shows up right away instead
 //!    of waiting on this turn too; `chat_cli.rs` still runs both back to
 //!    back in one `run_full_image_generation` call, since a terminal has no
-//!    separate "thinking" indicator to show between the two.
+//!    separate "thinking" indicator to show between the two. Also spawns
+//!    its own follow-up state-update, same as turn 1.
 //! 4. `run_search_answer_turn` -- the same shape as 3, but for a real
 //!    `searxng` web search instead of an image: fired once real results
 //!    come back, feeding them to the model for an answer grounded in what
 //!    was actually found rather than a guess. Split into its own
-//!    `run_search_answer` GUI command the same way, behind `run_web_search`.
+//!    `run_search_answer` GUI command the same way, behind `run_web_search`;
+//!    also spawns its own follow-up state-update.
 //!
-//! This three-way split is a deliberate departure from "one LLM request per
-//! call, no auto-continue chain": a real session showed one completion
-//! asked to simultaneously stay in character, update `state.md`, and
-//! remember to emit a protocol fence reliably did none of the mechanical
-//! parts -- small models are especially bad at juggling several competing
+//! This split is a deliberate departure from "one LLM request per call, no
+//! auto-continue chain": a real session showed one completion asked to
+//! simultaneously stay in character, update `state.md`, and remember to
+//! emit a protocol fence reliably did none of the mechanical parts --
+//! small models are especially bad at juggling several competing
 //! responsibilities in one completion. Splitting "have the conversation"
-//! from "decide whether a tool applies" into separate, single-purpose
-//! completions is far more reliable, at the cost of a real extra request
-//! every turn (confirmed acceptable by the user -- reliability over saving
-//! one round-trip, and it runs on *every* turn, not gated behind "only if a
-//! ruleset exists").
+//! from "decide whether a tool applies" from "update the character sheet"
+//! into separate, single-purpose completions is far more reliable, at the
+//! cost of real extra requests every turn (confirmed acceptable by the
+//! user -- reliability over saving round-trips). Turn 1 was originally also
+//! blocked on dispatch finishing before returning anything to the frontend
+//! -- confirmed, while designing this state-update split, to be an
+//! unintentional latency cost with no real benefit, so dispatch (and now
+//! state-update alongside it) moved out to their own follow-up call the
+//! frontend fires only after the reply is already on screen.
 
 use crate::config::AppConfig;
 use crate::llm::ChatMessage;
@@ -46,9 +68,22 @@ pub struct ChatTurnOutcome {
     /// `<thinking>`) tag -- never stored in history, only surfaced for
     /// display.
     pub thinking: Option<String>,
-    /// Whether this turn's reply included a ` ```state ``` ` block that got
-    /// saved -- callers show a small indicator rather than the raw block.
-    pub state_updated: bool,
+    pub dropped: usize,
+    pub condensed: usize,
+    pub summarized: usize,
+    pub summary: Option<String>,
+    pub rewritten_history: Option<Vec<ChatMessage>>,
+}
+
+/// Turn 2's result -- see the module doc comment for why this is no longer
+/// part of `ChatTurnOutcome`. State-update's own full completion is still
+/// not part of this shape: only its raw-JSON half is awaited before this
+/// returns (dispatch needs it fresh), and the slower narrative-summarize
+/// half stays a detached background task with nothing awaiting it, so
+/// there's still no moment at which "has state *fully* finished updating
+/// this turn" could be reported without re-introducing the exact latency
+/// this whole split exists to avoid for that half specifically.
+pub struct TurnFollowupOutcome {
     /// A ruleset the dispatch pass requested this turn
     /// (` ```ruleset <name> ``` `) that existed and is now loaded for the
     /// rest of this session.
@@ -66,11 +101,13 @@ pub struct ChatTurnOutcome {
     /// search and answer happen later, separately, same reasoning as
     /// `image_prompt_requested`.
     pub web_search_requested: Option<String>,
-    pub dropped: usize,
-    pub condensed: usize,
-    pub summarized: usize,
-    pub summary: Option<String>,
-    pub rewritten_history: Option<Vec<ChatMessage>>,
+    /// `None` only if the raw-JSON half itself failed or produced nothing
+    /// usable (logged, not surfaced) -- otherwise `Some`, covering just the
+    /// detached narrative-summarize half (the raw-JSON half already
+    /// finished by the time this outcome exists at all, since it's awaited
+    /// before dispatch runs). Same "GUI/`--server` drop it, `chat_cli.rs`
+    /// drains it" contract as `TurnReply::state_update_handle`.
+    pub state_update_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 const AUTO_TITLE_MAX_CHARS: usize = 40;
@@ -105,10 +142,10 @@ const MAX_DISPATCH_ATTEMPTS: u32 = 2;
 /// durable copy) and the model's reasoning attached only if
 /// `chat_persist_thinking` says to keep it (never re-explained to the model
 /// itself next turn either way -- `llm::to_wire` never reads it) -- is
-/// persisted before returning, so a session survives a crash up to its last
-/// successful reply. The dispatch pass (turn 2, see module doc comment)
-/// runs after that persistence, so its own failure can never lose the
-/// user-facing reply.
+/// persisted before returning. Returns immediately after that -- dispatch
+/// and the state-update turn (turn 2, see module doc comment) are a
+/// separate follow-up call the caller fires only after showing this reply,
+/// not something awaited here.
 pub async fn run_chat_turn(
     cfg: &AppConfig,
     session_id: &str,
@@ -154,37 +191,11 @@ pub async fn run_chat_turn(
     let thinking = rules::extract_thinking_block(&reply);
     let reply = rules::strip_thinking_blocks(&reply);
 
-    let state_block = rules::extract_state_block(&reply);
-    let state_updated = if let Some(new_state) = &state_block {
-        chat_session::update_state(session_id, new_state)?;
-        true
-    } else {
-        // The model skipped the mandatory ```state``` block -- one cheap,
-        // targeted follow-up asking for *only* that, rather than
-        // regenerating the whole reply (which would risk changing its
-        // voice/content on a retry). Only ever costs an extra request in
-        // this failure case; a well-behaved reply never reaches it.
-        match run_state_catchup_turn(cfg, session_id, persona_content.as_deref(), &reply).await {
-            Ok(Some(new_state)) => {
-                chat_session::update_state(session_id, &new_state)?;
-                true
-            }
-            Ok(None) => {
-                log::warn!("run_chat_turn: state catch-up produced no usable state block either");
-                false
-            }
-            Err(e) => {
-                log::warn!("run_chat_turn: state catch-up request failed: {e}");
-                false
-            }
-        }
-    };
-
-    // Defensive only -- turn 1's system prompt no longer mentions rulesets
-    // at all (see `rules::build_chat_system_content`'s doc comment), so a
-    // well-behaved model has no reason to emit either fence here. Stripped
-    // in case one shows up anyway; never acted on -- that's the dispatch
-    // pass's job below.
+    // Defensive only -- turn 1's system prompt no longer mentions state or
+    // rulesets at all (see `rules::build_chat_system_content`'s doc
+    // comment), so a well-behaved model has no reason to emit any of these
+    // fences here. Stripped in case one shows up anyway; never acted on --
+    // that's the follow-up call's job.
     let stored_reply = rules::strip_web_search_blocks(&rules::strip_image_prompt_blocks(
         &rules::strip_ruleset_requests(&rules::strip_state_blocks(&reply)),
     ));
@@ -204,33 +215,9 @@ pub async fn run_chat_turn(
         .map(|m| auto_title_from(&m.content));
     chat_session::save_history(session_id, &full_history, title_hint.as_deref())?;
 
-    // Turn 2: dispatch. Just the exchange that was just had, not the full
-    // history -- `state.md` already carries forward anything durable, so
-    // re-sending everything would be wasted tokens on every single turn for
-    // what's a classification-shaped task.
-    let last_user_message = full_history
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
-    let dispatch = run_dispatch_turn(
-        cfg,
-        session_id,
-        persona_content.as_deref(),
-        &last_user_message,
-        &stored_reply,
-    )
-    .await;
-
     Ok(ChatTurnOutcome {
         reply: stored_reply,
         thinking,
-        state_updated,
-        ruleset_loaded: dispatch.ruleset_loaded,
-        ruleset_error: dispatch.ruleset_error,
-        image_prompt_requested: dispatch.image_prompt_requested,
-        web_search_requested: dispatch.web_search_requested,
         dropped: trimmed.dropped,
         condensed: trimmed.condensed,
         summarized: trimmed.summarized,
@@ -239,36 +226,32 @@ pub async fn run_chat_turn(
     })
 }
 
-/// Cheap safety net for turn 1 skipping its mandatory ` ```state``` ` block
-/// -- small models forgetting an "always include this" instruction is the
-/// recurring failure mode this whole turn/dispatch/reaction split exists to
-/// guard against (see the module doc comment), and the state block is no
-/// exception. Asks for *only* the missing block, given the reply that was
-/// just generated and the old state, rather than regenerating the whole
-/// reply (which would risk changing its voice or content on a retry).
-/// `Ok(None)` if even this narrowly-scoped follow-up didn't produce a
-/// usable block -- treated the same as "nothing to update this turn", not a
-/// hard failure.
-async fn run_state_catchup_turn(
+/// The dedicated state-update turn's own completion, temperature-locked the
+/// same as dispatch (a mechanical restate-and-classify task, not a creative
+/// one). Given the exchange that just happened and the previous raw JSON,
+/// extracts+validates the new JSON via `rules::extract_json_state_block` +
+/// `serde_json::from_str`. `Ok(None)` (not an error) if the model produced
+/// nothing usable this turn -- treated exactly like "state didn't change",
+/// never surfaced to whatever's waiting on the reply this update follows.
+async fn run_state_json_turn(
     cfg: &AppConfig,
     session_id: &str,
     persona_content: Option<&str>,
     last_reply: &str,
 ) -> anyhow::Result<Option<String>> {
-    let state = chat_session::read_state(session_id);
-    let mut system_content = String::from(
-        "Your last reply was missing its mandatory ```state``` block. Given that reply, your \
-         persona (if any) and your previous state below, output ONLY the complete, current \
-         ```state``` block now -- restate every field, updated wherever the reply implies \
-         something changed. Nothing else: no reply, no commentary, just the one fenced block.",
-    );
+    let previous_raw = chat_session::read_raw_state(session_id);
+    let mut system_content = rules::CHAT_STATE_UPDATE_PROMPT.to_string();
     if let Some(persona) = persona_content {
         system_content.push_str("\n\n");
         system_content.push_str(persona);
     }
-    if !state.trim().is_empty() {
-        system_content.push_str("\n\n## Your previous state\n");
-        system_content.push_str(state.trim());
+    if !previous_raw.trim().is_empty() {
+        system_content.push_str("\n\n## Your previous state (JSON)\n");
+        system_content.push_str(&crate::context::truncate_with_note(
+            previous_raw.trim(),
+            8000,
+            "previous state",
+        ));
     }
     let messages = vec![
         ChatMessage::text("system", system_content),
@@ -282,7 +265,140 @@ async fn run_state_catchup_turn(
         &messages,
     )
     .await?;
-    Ok(rules::extract_state_block(&reply))
+    let Some(raw_json) = rules::extract_json_state_block(&reply) else {
+        return Ok(None);
+    };
+    // Validated here, not just handed straight to `update_raw_state` --
+    // `state.json` must always be valid JSON for the *next* turn's own
+    // read of it to mean anything, unlike `state.md` (display/context only,
+    // safe to cap with blind truncation -- see `rules::append_state_block`).
+    if serde_json::from_str::<serde_json::Value>(&raw_json).is_err() {
+        log::warn!(
+            "run_state_json_turn: model's ```state``` block wasn't valid JSON: {raw_json:?}"
+        );
+        return Ok(None);
+    }
+    Ok(Some(raw_json))
+}
+
+/// The whole dedicated state-update turn: raw JSON first, then the derived
+/// `state.md` summary -- see the module doc comment and
+/// `rules::is_precise_field`'s doc comment for the fidelity-drift reasoning
+/// behind splitting fields this way. Always runs both halves back to back
+/// (unlike `run_turn_followup`'s own use of these same two pieces, which
+/// awaits only the first) -- turns 3/4 have nothing downstream in the same
+/// round that needs the raw JSON fresher than "eventually," so there's no
+/// reason to split them here. Never fails outward -- every error is logged
+/// and simply means state doesn't change this round, same "not a hard
+/// failure of anything the user is waiting on" contract as dispatch.
+pub async fn run_state_update_turn(
+    cfg: &AppConfig,
+    session_id: &str,
+    persona_content: Option<&str>,
+    last_reply: &str,
+) {
+    let raw_json = match run_state_json_turn(cfg, session_id, persona_content, last_reply).await {
+        Ok(Some(json)) => json,
+        Ok(None) => {
+            log::warn!("run_state_update_turn: produced no usable state JSON this turn");
+            return;
+        }
+        Err(e) => {
+            log::warn!("run_state_update_turn: state JSON request failed: {e}");
+            return;
+        }
+    };
+    if let Err(e) = chat_session::update_raw_state(session_id, &raw_json) {
+        log::warn!("run_state_update_turn: failed to write state.json: {e}");
+        return;
+    }
+    finish_state_update(cfg, session_id, &raw_json).await;
+}
+
+/// The narrative-summarize half of state-update, split out of
+/// `run_state_update_turn` so `run_turn_followup` can await the raw-JSON
+/// half alone (dispatch needs it fresh) while spawning just this slower
+/// half detached (nothing needs *it* fresh -- see the module doc comment).
+/// `raw_json` is the value already just written to `state.json`, not
+/// re-read from disk, since the caller already has it on hand either way.
+async fn finish_state_update(cfg: &AppConfig, session_id: &str, raw_json: &str) {
+    let fields = rules::parse_state_fields(raw_json);
+    let (precise, narrative) = rules::partition_state_fields(fields);
+    let narrative_summary = if narrative.is_empty() {
+        String::new()
+    } else {
+        let narrative_json = serde_json::to_string(
+            &narrative
+                .iter()
+                .map(|f| (f.name.clone(), f.value.clone()))
+                .collect::<std::collections::HashMap<_, _>>(),
+        )
+        .unwrap_or_default();
+        let messages = vec![
+            ChatMessage::text("system", rules::CHAT_STATE_SUMMARY_PROMPT),
+            ChatMessage::text("user", narrative_json),
+        ];
+        match crate::llm::send_chat(
+            &cfg.endpoint,
+            &cfg.model,
+            &cfg.api_key,
+            DISPATCH_TEMPERATURE,
+            &messages,
+        )
+        .await
+        {
+            Ok(summary) => summary.trim().to_string(),
+            Err(e) => {
+                // Never silently drop the narrative fields just because the
+                // summarize call itself failed -- fall back to a plain
+                // mechanical listing rather than lose that information.
+                log::warn!(
+                    "finish_state_update: summarize call failed, falling back to a plain listing: {e}"
+                );
+                rules::plain_field_listing(&narrative)
+            }
+        }
+    };
+    let markdown = rules::build_state_markdown(&precise, &narrative_summary);
+    if let Err(e) = chat_session::update_state(session_id, &markdown) {
+        log::warn!("finish_state_update: failed to write state.md: {e}");
+    }
+}
+
+/// Thin `tokio::spawn` wrapper around `run_state_update_turn` -- not
+/// awaited by the GUI/`--server` (see the module doc comment for why:
+/// nothing there should have to wait on this to get its own result back),
+/// which is free to drop the returned handle immediately -- dropping a
+/// `JoinHandle` does not cancel the task, it just stops listening for its
+/// result, so the update keeps running to completion regardless. The
+/// handle exists at all for `chat_cli.rs`: a short-lived process can (and,
+/// confirmed live, does) exit before a detached task gets a chance to run,
+/// silently discarding the update -- `chat_cli.rs` collects these and
+/// drains them before the process exits instead of dropping them. Takes
+/// owned values rather than borrows since a spawned task must be `'static`.
+fn spawn_state_update(
+    cfg: AppConfig,
+    session_id: String,
+    persona_content: Option<String>,
+    last_reply: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        run_state_update_turn(&cfg, &session_id, persona_content.as_deref(), &last_reply).await;
+    })
+}
+
+/// Same reasoning and same CLI-drain contract as `spawn_state_update`, just
+/// for `finish_state_update` alone -- used by `run_turn_followup`, which
+/// awaits the raw-JSON half itself and only spawns this slower, narrative
+/// half detached.
+fn spawn_finish_state_update(
+    cfg: AppConfig,
+    session_id: String,
+    raw_json: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        finish_state_update(&cfg, &session_id, &raw_json).await;
+    })
 }
 
 struct DispatchOutcome {
@@ -303,10 +419,12 @@ impl DispatchOutcome {
     }
 }
 
-/// Turn 2 -- see the module doc comment for why this is a separate
-/// completion from turn 1. Never fails the overall turn: a network hiccup
-/// or an unparseable reply here is logged and simply means nothing
-/// happened this turn, exactly as if the model had said "none" on purpose.
+/// Turn 2's dispatch half -- see the module doc comment for why this is a
+/// separate completion from turn 1, and `run_turn_followup`'s doc comment
+/// for why it now reads raw JSON instead of the `state.md` summary. Never
+/// fails the overall turn: a network hiccup or an unparseable reply here is
+/// logged and simply means nothing happened this turn, exactly as if the
+/// model had said "none" on purpose.
 async fn run_dispatch_turn(
     cfg: &AppConfig,
     session_id: &str,
@@ -314,8 +432,14 @@ async fn run_dispatch_turn(
     last_user_message: &str,
     last_assistant_reply: &str,
 ) -> DispatchOutcome {
+    // At INFO, not DEBUG -- unlike the raw-reply log further down (only
+    // useful once something's already gone wrong), whether dispatch ran at
+    // all this turn is worth seeing in the plain log, not just when
+    // debugging: it's the app's own record of every "did the model decide
+    // to use a tool this turn" check, silent turns included.
+    log::info!("dispatch turn: evaluating session {session_id}");
     let mut outcome = DispatchOutcome::none();
-    let state = chat_session::read_state(session_id);
+    let state = chat_session::read_raw_state(session_id);
     // Offering `web-search` when SearXNG has no `base_url` set would just
     // lead the model to request a search that's guaranteed to fail (turn 4
     // still answers in character, apologizing for the error, but that's a
@@ -421,6 +545,68 @@ async fn run_dispatch_turn(
     outcome
 }
 
+/// Turn 2 as a whole -- see the module doc comment. Called separately from
+/// `run_chat_turn`, only after the caller has already shown turn 1's reply,
+/// so neither half of this can add latency to that. Spawns the state-update
+/// turn detached (`spawn_state_update`, never awaited) and awaits+returns
+/// only the dispatch decision, which is the one half anything downstream
+/// (image generation, web search) actually needs a result from.
+///
+/// Dispatch reads the raw JSON state, not the `state.md` summary turn 1/3/4
+/// get: when the image-generation ruleset is already loaded, this same
+/// completion is what writes the ` ```image-prompt``` ` fence, and that
+/// needs precise visual detail (exact clothing/appearance) a summary would
+/// already have compressed away. The state-update turn always reads/writes
+/// the raw JSON regardless, since maintaining it *is* that turn's job.
+pub async fn run_turn_followup(
+    cfg: &AppConfig,
+    session_id: &str,
+    persona_content: Option<&str>,
+    last_user_message: &str,
+    last_assistant_reply: &str,
+) -> TurnFollowupOutcome {
+    // Awaited before dispatch, not spawned alongside it -- see the module
+    // doc comment for why dispatch specifically needs this turn's fresh
+    // raw JSON rather than last turn's.
+    let state_update_handle =
+        match run_state_json_turn(cfg, session_id, persona_content, last_assistant_reply).await {
+            Ok(Some(raw_json)) => match chat_session::update_raw_state(session_id, &raw_json) {
+                Ok(()) => Some(spawn_finish_state_update(
+                    cfg.clone(),
+                    session_id.to_string(),
+                    raw_json,
+                )),
+                Err(e) => {
+                    log::warn!("run_turn_followup: failed to write state.json: {e}");
+                    None
+                }
+            },
+            Ok(None) => {
+                log::warn!("run_turn_followup: produced no usable state JSON this turn");
+                None
+            }
+            Err(e) => {
+                log::warn!("run_turn_followup: state JSON request failed: {e}");
+                None
+            }
+        };
+    let dispatch = run_dispatch_turn(
+        cfg,
+        session_id,
+        persona_content,
+        last_user_message,
+        last_assistant_reply,
+    )
+    .await;
+    TurnFollowupOutcome {
+        ruleset_loaded: dispatch.ruleset_loaded,
+        ruleset_error: dispatch.ruleset_error,
+        image_prompt_requested: dispatch.image_prompt_requested,
+        web_search_requested: dispatch.web_search_requested,
+        state_update_handle,
+    }
+}
+
 /// Defensive fallback for a near-miss `rules::extract_ruleset_request`
 /// won't catch: a model that confuses the ruleset's *name* with a fence's
 /// own language tag, writing e.g. ` ```image-generation-prompt``` ` instead
@@ -507,6 +693,14 @@ pub async fn generate_and_save_image(
 pub struct TurnReply {
     pub text: Option<String>,
     pub thinking: Option<String>,
+    /// `Some` only when this turn actually produced text and so spawned its
+    /// own follow-up state-update (see `spawn_state_update`'s doc comment
+    /// for why this exists at all -- GUI/`--server` callers drop it
+    /// immediately via `TurnReply -> TurnReply*Result/Response`'s `From`
+    /// impls, which don't reference this field; `chat_cli.rs`'s
+    /// `run_full_image_generation`/`run_full_web_search` wrappers surface
+    /// it so the CLI can drain it before the process exits).
+    pub state_update_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Runs turn 3 and persists the result if it produced one, folding `Never`
@@ -527,6 +721,7 @@ pub async fn run_and_persist_image_reaction(
         return TurnReply {
             text: None,
             thinking: None,
+            state_update_handle: None,
         };
     }
     match run_image_reaction_turn(
@@ -541,13 +736,29 @@ pub async fn run_and_persist_image_reaction(
         Ok(TurnReply {
             text: Some(text),
             thinking,
+            ..
         }) => {
             if let Err(e) = chat_session::append_assistant_message(session_id, &text) {
                 log::warn!("run_and_persist_image_reaction: failed to save reaction: {e}");
             }
+            // Also gets its own follow-up state-update, same as turn 1 --
+            // confirmed explicitly: a character's reaction to a generated
+            // image should be able to update state too, not just the
+            // original reply that requested it.
+            let persona_content = chat_session::load_session(session_id)
+                .ok()
+                .and_then(|(meta, _)| meta.persona)
+                .and_then(|name| persona::load_persona(&name).ok());
+            let handle = spawn_state_update(
+                cfg.clone(),
+                session_id.to_string(),
+                persona_content,
+                text.clone(),
+            );
             TurnReply {
                 text: Some(text),
                 thinking,
+                state_update_handle: Some(handle),
             }
         }
         // `Optional` mode's own considered choice not to comment -- not a
@@ -559,6 +770,7 @@ pub async fn run_and_persist_image_reaction(
             TurnReply {
                 text: None,
                 thinking: None,
+                state_update_handle: None,
             }
         }
     }
@@ -578,6 +790,9 @@ pub struct ImageGenerationResult {
     /// the commentary on it isn't worth treating as an overall failure of
     /// this whole function.
     pub reaction: Option<String>,
+    /// See `TurnReply::state_update_handle`'s doc comment -- `chat_cli.rs`
+    /// (this function's only caller) drains it before exiting.
+    pub state_update_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub async fn run_full_image_generation(
@@ -600,6 +815,7 @@ pub async fn run_full_image_generation(
     Ok(ImageGenerationResult {
         path: image.path,
         reaction: reaction.text,
+        state_update_handle: reaction.state_update_handle,
     })
 }
 
@@ -712,10 +928,6 @@ pub async fn run_image_reaction_turn(
 
     let thinking = rules::extract_thinking_block(&reply);
     let reply = rules::strip_thinking_blocks(&reply);
-    let state_block = rules::extract_state_block(&reply);
-    if let Some(new_state) = &state_block {
-        chat_session::update_state(session_id, new_state)?;
-    }
     let stored_reply = rules::strip_web_search_blocks(&rules::strip_image_prompt_blocks(
         &rules::strip_ruleset_requests(&rules::strip_state_blocks(&reply)),
     ));
@@ -726,11 +938,13 @@ pub async fn run_image_reaction_turn(
         return Ok(TurnReply {
             text: None,
             thinking,
+            state_update_handle: None,
         });
     }
     Ok(TurnReply {
         text: Some(stored_reply),
         thinking,
+        state_update_handle: None,
     })
 }
 
@@ -753,13 +967,28 @@ pub async fn run_and_persist_search_answer(
         Ok(TurnReply {
             text: Some(text),
             thinking,
+            ..
         }) => {
             if let Err(e) = chat_session::append_assistant_message(session_id, &text) {
                 log::warn!("run_and_persist_search_answer: failed to save answer: {e}");
             }
+            // Same reasoning as `run_and_persist_image_reaction`'s own
+            // follow-up: the answer is a real in-character continuation too,
+            // so it gets a chance to update state, not just turn 1's reply.
+            let persona_content = chat_session::load_session(session_id)
+                .ok()
+                .and_then(|(meta, _)| meta.persona)
+                .and_then(|name| persona::load_persona(&name).ok());
+            let handle = spawn_state_update(
+                cfg.clone(),
+                session_id.to_string(),
+                persona_content,
+                text.clone(),
+            );
             TurnReply {
                 text: Some(text),
                 thinking,
+                state_update_handle: Some(handle),
             }
         }
         // The answer turn always attempts a reply (see this function's doc
@@ -772,6 +1001,7 @@ pub async fn run_and_persist_search_answer(
             TurnReply {
                 text: None,
                 thinking: None,
+                state_update_handle: None,
             }
         }
     }
@@ -794,6 +1024,9 @@ pub struct WebSearchResult {
     /// answer turn, so the persona can apologize in character instead of a
     /// raw technical error reaching the user.
     pub answer: Option<String>,
+    /// See `TurnReply::state_update_handle`'s doc comment -- `chat_cli.rs`
+    /// (this function's only caller) drains it before exiting.
+    pub state_update_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub async fn run_full_web_search(
@@ -816,6 +1049,7 @@ pub async fn run_full_web_search(
         results,
         search_error,
         answer: answer.text,
+        state_update_handle: answer.state_update_handle,
     })
 }
 
@@ -890,16 +1124,13 @@ pub async fn run_search_answer_turn(
 
     let thinking = rules::extract_thinking_block(&reply);
     let reply = rules::strip_thinking_blocks(&reply);
-    let state_block = rules::extract_state_block(&reply);
-    if let Some(new_state) = &state_block {
-        chat_session::update_state(session_id, new_state)?;
-    }
     let stored_reply = rules::strip_web_search_blocks(&rules::strip_image_prompt_blocks(
         &rules::strip_ruleset_requests(&rules::strip_state_blocks(&reply)),
     ));
     Ok(TurnReply {
         text: Some(stored_reply),
         thinking,
+        state_update_handle: None,
     })
 }
 

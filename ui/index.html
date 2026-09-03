@@ -191,8 +191,18 @@
   <div id="chatStateDialog" class="app-dialog-overlay" hidden>
    <div class="app-dialog-inner chat-state-dialog">
     <h3>Remembered state for this chat</h3>
+    <p class="explain">
+      Updates in the background after a reply, not before it -- if you just
+      sent a message, this may still show the previous turn's state for a
+      few seconds. Use Refresh rather than reopening.
+    </p>
+    <div class="chat-state-tabs" role="tablist">
+      <button type="button" class="chat-state-tab active" data-tab="summary">Summary</button>
+      <button type="button" class="chat-state-tab" data-tab="raw">Raw JSON</button>
+    </div>
     <pre id="chatStateContent" class="cmd chat-state-content"></pre>
     <div class="dialog-actions">
+      <button id="chatStateRefreshBtn" type="button">Refresh</button>
       <button id="chatStateCloseBtn" type="button">Close</button>
     </div>
    </div>
