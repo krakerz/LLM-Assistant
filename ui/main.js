@@ -1941,10 +1941,12 @@ document.getElementById("newPersonaSaveBtn").addEventListener("click", async () 
 document.getElementById("deletePersonaBtn").addEventListener("click", async () => {
   const name = personaSelect.value;
   if (!name) return;
-  if (!confirm(`Delete persona "${name}"? This can't be undone.`)) return;
+  if (!confirm(`Delete persona "${name}"? It's moved to personas/.trash, not permanently removed.`))
+    return;
   try {
     await invoke("delete_persona", { name });
     await loadPersonaList();
+    alert(`"${name}" moved to personas/.trash -- not permanently deleted.`);
   } catch (err) {
     alert(`Delete failed: ${err}`);
   }

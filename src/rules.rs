@@ -163,6 +163,14 @@ string keys, string values, no nesting -- restating every field your character s
 just what changed. The shape looks like this:\n\n```state\n{\"<field name>\": \"<its current value>\", \"<another field name>\": \"<its current value>\"}\n```\n\n\
 That's a format example, not a suggestion for what to track -- never invent or copy example field \
 names like these literally; only ever include fields your actual persona/character sheet defines.\n\n\
+Read the user's own message in the exchange too, not just your reply -- if it wraps part of itself \
+in `//...//` (the same narration convention your own replies use), that's the user describing their \
+own action or intention, not something spoken aloud. Fold it into whatever field your character \
+sheet defines for tracking the user's own action or state, if it defines one -- never invent one \
+that doesn't exist. Inside that narration, \"you\" or your own character's name means you (the \
+persona) are the one being acted upon or addressed, and \"I\"/\"me\" means the user themselves -- \
+never swap the two. For example, \"// offering you an ice cream // // blushing //\" means the user \
+is offering YOU an ice cream, and the user themselves is blushing, not your character.\n\n\
 This replaces everything in your previous state, so anything you leave out is gone -- carry every \
 field forward with its current value even if this exchange didn't touch it. If a field has \
 genuinely stopped applying, don't delete it either -- set its value to \"none\" so the field itself \

@@ -788,6 +788,20 @@ details.bubble.thinking > .bubble.assistant {
   font: inherit;
 }
 
+/* Every dialog textarea in the list above resizes vertically only -- the
+   browser's own default (`resize: both`) let a drag on the handle fight the
+   dialog's own fixed `width: min(560px, 90vw)` (`.app-dialog-inner`),
+   growing the textarea wider than its container rather than the container
+   ever actually changing size. Height staying freely adjustable is the
+   whole point of a resize handle here (a persona/ruleset/rules file can be
+   any length); width just was never meant to be part of that. */
+#settingsDialog textarea,
+#addPathDialog textarea,
+#newPersonaDialog textarea,
+#rulesetDialog textarea {
+  resize: vertical;
+}
+
 /* The shorthand `background` above resets the base `select` rule's
    gradient-drawn dropdown arrow -- restore just that piece, plus the extra
    right padding it needs, without touching the width:100%/border/etc. above. */

@@ -1356,6 +1356,27 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            // `bundle.icon` in tauri.conf.json only reaches the window/taskbar
+            // icon once the app is actually installed via .deb/AppImage (it's
+            // baked into the desktop entry Linux reads the icon from) -- a
+            // plain dev binary run directly has no such entry, so the window
+            // manager falls back to a generic default. Setting it here at
+            // runtime works unconditionally, dev binary or installed package
+            // alike, since it talks to the windowing backend directly rather
+            // than relying on desktop-entry registration.
+            if let Some(window) = app.get_webview_window("main") {
+                match tauri::image::Image::from_bytes(include_bytes!("../icons/128x128.png")) {
+                    Ok(icon) => {
+                        if let Err(e) = window.set_icon(icon) {
+                            log::warn!("failed to set window icon: {e}");
+                        }
+                    }
+                    Err(e) => log::warn!("failed to decode window icon: {e}"),
+                }
+            }
+            Ok(())
+        })
         .manage(AppState {
             root: Mutex::new(cli_root),
             current_send: Mutex::new(None),

@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [1.18.0] — 2026-09-04
+
+### Changed
+- Deleting a persona now moves it into `personas/.trash/` instead of removing it -- a real session lost one to a misclick with no way back
+- Deleting a persona now also confirms afterward where it went, not just before
+- The `--server` favicon is now a cropped close-up of just the character's face, not the full app icon shrunk down -- much more legible at actual favicon size
+- The GUI window now gets the new app icon at runtime, not just the packaged `.deb`/AppImage -- a dev binary run directly has no desktop entry for the window manager to read an icon from at all, so it fell back to a generic default
+- Dialog textareas (persona/ruleset editors, Settings' rules/system-prompt fields) now only resize vertically -- dragging one wider used to fight the dialog's own fixed width instead of ever actually changing it
+
+### Fixed
+- The state-update turn never actually saw the user's own message, only its own prior reply -- despite its own prompt already saying "given the exchange." Anything the user conveyed themselves (an action or intention wrapped in `//...//`, the same narration convention replies use) was invisible to it entirely. Now included, with explicit "you"/persona-name-means-the-persona, "I"/"me"-means-the-user attribution so it isn't misread backwards
+
 ## [1.17.0] — 2026-09-04
 
 ### Changed

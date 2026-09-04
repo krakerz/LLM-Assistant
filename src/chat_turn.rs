@@ -289,10 +289,23 @@ pub async fn run_chat_turn_streaming(
 /// `serde_json::from_str`. `Ok(None)` (not an error) if the model produced
 /// nothing usable this turn -- treated exactly like "state didn't change",
 /// never surfaced to whatever's waiting on the reply this update follows.
+///
+/// `last_user_message` is `None` for turns 3/4 (image reaction, search
+/// answer) -- those are triggered by a generated image or search result
+/// landing, not a fresh user message, so there's nothing of that shape to
+/// include; the user message that actually led there already went through
+/// its own state update back on turn 1/2. `Some` for turn 1/2's own call
+/// (`run_turn_followup`) -- previously always omitted here regardless
+/// (`CHAT_STATE_UPDATE_PROMPT` says "given the exchange," but the message
+/// sent was only ever the reply, never what the user actually said), so
+/// anything the user's own message conveyed -- an action or intention
+/// wrapped in `//...//`, the same narration convention their own replies
+/// use -- was invisible to this turn entirely.
 async fn run_state_json_turn(
     cfg: &AppConfig,
     session_id: &str,
     persona_content: Option<&str>,
+    last_user_message: Option<&str>,
     last_reply: &str,
 ) -> anyhow::Result<Option<String>> {
     let previous_raw = chat_session::read_raw_state(session_id);
@@ -309,9 +322,15 @@ async fn run_state_json_turn(
             "previous state",
         ));
     }
+    let exchange = match last_user_message.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(user_message) => {
+            format!("The user's message was:\n{user_message}\n\nYour reply was:\n{last_reply}")
+        }
+        None => format!("Your reply was:\n{last_reply}"),
+    };
     let messages = vec![
         ChatMessage::text("system", system_content),
-        ChatMessage::text("user", format!("Your last reply was:\n{last_reply}")),
+        ChatMessage::text("user", exchange),
     ];
     let reply = crate::llm::send_chat(
         &cfg.endpoint,
@@ -353,17 +372,18 @@ pub async fn run_state_update_turn(
     persona_content: Option<&str>,
     last_reply: &str,
 ) {
-    let raw_json = match run_state_json_turn(cfg, session_id, persona_content, last_reply).await {
-        Ok(Some(json)) => json,
-        Ok(None) => {
-            log::warn!("run_state_update_turn: produced no usable state JSON this turn");
-            return;
-        }
-        Err(e) => {
-            log::warn!("run_state_update_turn: state JSON request failed: {e}");
-            return;
-        }
-    };
+    let raw_json =
+        match run_state_json_turn(cfg, session_id, persona_content, None, last_reply).await {
+            Ok(Some(json)) => json,
+            Ok(None) => {
+                log::warn!("run_state_update_turn: produced no usable state JSON this turn");
+                return;
+            }
+            Err(e) => {
+                log::warn!("run_state_update_turn: state JSON request failed: {e}");
+                return;
+            }
+        };
     if let Err(e) = chat_session::update_raw_state(session_id, &raw_json) {
         log::warn!("run_state_update_turn: failed to write state.json: {e}");
         return;
@@ -624,28 +644,35 @@ pub async fn run_turn_followup(
     // Awaited before dispatch, not spawned alongside it -- see the module
     // doc comment for why dispatch specifically needs this turn's fresh
     // raw JSON rather than last turn's.
-    let state_update_handle =
-        match run_state_json_turn(cfg, session_id, persona_content, last_assistant_reply).await {
-            Ok(Some(raw_json)) => match chat_session::update_raw_state(session_id, &raw_json) {
-                Ok(()) => Some(spawn_finish_state_update(
-                    cfg.clone(),
-                    session_id.to_string(),
-                    raw_json,
-                )),
-                Err(e) => {
-                    log::warn!("run_turn_followup: failed to write state.json: {e}");
-                    None
-                }
-            },
-            Ok(None) => {
-                log::warn!("run_turn_followup: produced no usable state JSON this turn");
-                None
-            }
+    let state_update_handle = match run_state_json_turn(
+        cfg,
+        session_id,
+        persona_content,
+        Some(last_user_message),
+        last_assistant_reply,
+    )
+    .await
+    {
+        Ok(Some(raw_json)) => match chat_session::update_raw_state(session_id, &raw_json) {
+            Ok(()) => Some(spawn_finish_state_update(
+                cfg.clone(),
+                session_id.to_string(),
+                raw_json,
+            )),
             Err(e) => {
-                log::warn!("run_turn_followup: state JSON request failed: {e}");
+                log::warn!("run_turn_followup: failed to write state.json: {e}");
                 None
             }
-        };
+        },
+        Ok(None) => {
+            log::warn!("run_turn_followup: produced no usable state JSON this turn");
+            None
+        }
+        Err(e) => {
+            log::warn!("run_turn_followup: state JSON request failed: {e}");
+            None
+        }
+    };
     let dispatch = run_dispatch_turn(
         cfg,
         session_id,
