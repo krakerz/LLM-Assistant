@@ -15,6 +15,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Fixed
 - The state-update turn never actually saw the user's own message, only its own prior reply -- despite its own prompt already saying "given the exchange." Anything the user conveyed themselves (an action or intention wrapped in `//...//`, the same narration convention replies use) was invisible to it entirely. Now included, with explicit "you"/persona-name-means-the-persona, "I"/"me"-means-the-user attribution so it isn't misread backwards
+- A real session showed dispatch correctly load a needed ruleset (`web-search`) and then immediately answer "none" instead of actually using it, wasting the round trip. Dispatch now gets one extra, more forceful nudge specifically for that exact moment ("you just loaded this because it applies -- use it now") instead of accepting "none" right after a fresh load. Improves reliability but isn't a full fix -- live-tested against the same real session's model, which still sometimes skips or abandons a tool request even with the nudge; this is a small local model's own decision-making, not something the app can fully guarantee
 
 ## [1.17.0] — 2026-09-04
 

@@ -133,8 +133,14 @@ const DISPATCH_TEMPERATURE: f32 = 0.1;
 /// "Load a ruleset, then use it" is the only legitimate reason a dispatch
 /// decision needs more than one attempt -- unlike operation mode's
 /// user-configurable step chain, there's no reason a real decision would
-/// ever need more, so this is a plain constant, not a new config knob.
-const MAX_DISPATCH_ATTEMPTS: u32 = 2;
+/// ever need more, so this is a plain constant, not a new config knob. 3,
+/// not 2: a real session showed a small model correctly requesting and
+/// loading `web-search` on attempt 1, then answering "none" instead of
+/// actually using it on attempt 2 -- the newly-loaded protocol was right
+/// there in the prompt, it just didn't follow through immediately. One
+/// extra attempt gives that a second chance without letting a genuinely
+/// indecisive model loop forever (still a hard cap, not unlimited).
+const MAX_DISPATCH_ATTEMPTS: u32 = 3;
 
 /// `history` is the caller's live copy, already including the new user
 /// message. The updated history -- reply appended, any ` ```state ``` `
@@ -526,6 +532,14 @@ async fn run_dispatch_turn(
         .map(|cfg| !cfg.base_url.trim().is_empty())
         .unwrap_or(false);
 
+    // Set right after a ruleset is freshly loaded (below), cleared the
+    // instant it's actually used for a nudge -- see the "none" handling at
+    // the bottom of the loop for why this exists: a real session showed the
+    // model correctly requesting and loading `web-search`, then answering
+    // "none" on the very next attempt instead of actually using the
+    // protocol just injected for it.
+    let mut just_loaded: Option<String> = None;
+
     for _ in 0..MAX_DISPATCH_ATTEMPTS {
         let loaded_names = chat_session::read_loaded_rulesets(session_id);
         let available_rulesets: Vec<ruleset::RulesetSummary> = ruleset::list_rulesets()
@@ -539,13 +553,24 @@ async fn run_dispatch_turn(
             .filter_map(|name| ruleset::load_ruleset(name).ok().map(|c| (name.clone(), c)))
             .collect();
 
-        let system_content = rules::build_dispatch_system_content(
+        let mut system_content = rules::build_dispatch_system_content(
             persona_content,
             &state,
             cfg.chat_state_max_tokens,
             &available_rulesets,
             &loaded_rulesets,
         );
+        // A direct, forceful nudge for the exact failure above -- reworded
+        // instead of trusting the general "already loaded" instruction a
+        // second time, since that's precisely what didn't work the first
+        // time around.
+        if let Some(name) = &just_loaded {
+            system_content.push_str(&format!(
+                "\n\n---\nYou just loaded \"{name}\" because it applies to the exchange below \
+                -- if that's still true, use its own fence NOW. Answering \"none\" right after \
+                loading a ruleset for this exact exchange means you loaded it for nothing."
+            ));
+        }
         // Deliberately ONE trailing "user"-role message, not a separate
         // user/assistant pair -- ending the list on an "assistant" message
         // is out-of-distribution for how chat templates expect to elicit a
@@ -607,6 +632,7 @@ async fn run_dispatch_turn(
                     return outcome;
                 }
                 log::info!("dispatch turn: loaded ruleset \"{name}\"");
+                just_loaded = Some(name.clone());
                 outcome.ruleset_loaded = Some(name);
                 continue; // retry now that this ruleset's content is available
             } else {
@@ -615,7 +641,14 @@ async fn run_dispatch_turn(
                 return outcome;
             }
         }
-        // "none" or unparseable -- nothing to do this turn.
+        // "none" or unparseable. If this is right after a fresh load,
+        // give it exactly one nudged retry (see `just_loaded` above)
+        // instead of accepting "none" immediately -- `.take()` clears it,
+        // so a second "none" after the nudge is final either way, and the
+        // loop's own attempt cap still bounds this regardless.
+        if just_loaded.take().is_some() {
+            continue;
+        }
         return outcome;
     }
     outcome
