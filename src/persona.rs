@@ -4,10 +4,12 @@
 //! display name. No schema, so an existing character card can be dropped in
 //! as-is.
 //!
-//! Deliberately not soft-deleted into a trash directory the way operation
-//! mode's sandboxed files are: these are small, hand-authored text files
-//! outside any working folder, not something a model can destroy by
-//! surprise. If that turns out wrong in practice, add it then.
+//! Deleting one moves it into `personas/.trash/` (see `delete_persona`)
+//! rather than actually removing the file -- these are small, hand-authored
+//! character sheets that can represent real writing effort, and a real
+//! session lost one to a misclick with no way back. Not swept or capped the
+//! way `chat_log.rs`'s rotation is; small text files, no real reason to ever
+//! reclaim the space automatically.
 
 use crate::paths::{app_config_dir, sanitize_filename};
 use std::fs;
@@ -104,9 +106,36 @@ pub fn save_new_persona(name: &str, content: &str) -> anyhow::Result<PersonaSumm
     Ok(PersonaSummary { name })
 }
 
+/// Moves the persona file into `personas/.trash/` instead of removing it --
+/// timestamped (falling back to a numeric suffix on a same-second collision,
+/// same pattern `chat_session::new_session_id` already uses) so deleting two
+/// different personas named the same thing, or the same name twice, never
+/// clobbers an earlier trashed copy. Recreating a persona under that name
+/// works immediately either way -- `save_new_persona`/`import_persona` only
+/// ever check the live `personas/` path, never `.trash/`.
 pub fn delete_persona(name: &str) -> anyhow::Result<()> {
-    fs::remove_file(persona_path(name))?;
-    Ok(())
+    let path = persona_path(name);
+    let trash_dir = personas_dir().join(".trash");
+    fs::create_dir_all(&trash_dir)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("persona path has no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let base = trash_dir.join(format!("{timestamp}-{file_name}"));
+    if !base.exists() {
+        fs::rename(&path, &base)?;
+        return Ok(());
+    }
+    for n in 2.. {
+        let candidate = trash_dir.join(format!("{timestamp}-{n}-{file_name}"));
+        if !candidate.exists() {
+            fs::rename(&path, &candidate)?;
+            return Ok(());
+        }
+    }
+    unreachable!()
 }
 
 /// Overwrites an existing persona's content -- the "Edit" button's save,
@@ -191,6 +220,48 @@ mod tests {
         save_new_persona("Temp", "x").unwrap();
         delete_persona("Temp").unwrap();
         assert!(list_personas().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_moves_it_into_trash_instead_of_removing_it() {
+        let dir = scratch("delete_trash");
+        save_new_persona("Temp", "the actual content").unwrap();
+        delete_persona("Temp").unwrap();
+        let trashed: Vec<_> = fs::read_dir(personas_dir().join(".trash"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(
+            trashed.len(),
+            1,
+            "expected exactly one trashed file: {trashed:?}"
+        );
+        let content = fs::read_to_string(trashed[0].path()).unwrap();
+        assert_eq!(content, "the actual content");
+        // Recreating under the same name works immediately -- .trash/ never
+        // collides with the live path save_new_persona checks.
+        save_new_persona("Temp", "a fresh persona").unwrap();
+        assert_eq!(load_persona("Temp").unwrap(), "a fresh persona");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_twice_under_the_same_name_keeps_both_trashed_copies() {
+        let dir = scratch("delete_trash_twice");
+        save_new_persona("Temp", "first").unwrap();
+        delete_persona("Temp").unwrap();
+        save_new_persona("Temp", "second").unwrap();
+        delete_persona("Temp").unwrap();
+        let trashed: Vec<_> = fs::read_dir(personas_dir().join(".trash"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(
+            trashed.len(),
+            2,
+            "expected both trashed copies to survive: {trashed:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

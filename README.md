@@ -36,6 +36,9 @@ guessing from the command *text* whether it's safe (unreliable -- see
   character sheet you write or import) and as many independent, permanently
   kept conversations as you want. A persona can track whatever it wants to
   persist for the whole conversation -- RPG-style stats are the common case.
+  Deleting a persona moves it into `personas/.trash/` rather than actually
+  removing it, the same "nothing is really gone" guarantee as file-ops
+  mode's sandbox.
 - **Serve chat mode over the web** -- `llm-assistant --server` leaves chat
   mode running headless behind a small, optionally password-protected HTTP
   server, sharing the same config and sessions as the desktop app -- see
