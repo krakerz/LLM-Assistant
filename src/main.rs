@@ -53,11 +53,6 @@ fn shim_dir(app: &AppHandle) -> PathBuf {
         .join("shims")
 }
 
-/// Shared by the picker, CLI arg, and headless: `.temp-trash` must exist.
-fn activate_root(root: &std::path::Path) -> Result<(), String> {
-    fs::create_dir_all(root.join(".temp-trash")).map_err(|e| e.to_string())
-}
-
 /// `llm-assistant /some/folder` starts with that folder already open.
 fn resolve_cli_root() -> Option<PathBuf> {
     let arg = std::env::args().nth(1)?;
@@ -158,7 +153,6 @@ async fn pick_and_set_root(
         return Err("Selected path is not a directory".into());
     }
 
-    activate_root(&root)?;
     *state.root.lock().unwrap() = Some(root.clone());
     log::info!("pick_and_set_root: root set to {}", root.display());
 
@@ -375,9 +369,16 @@ fn run_command(
     let shims = shim_dir(&app);
     sandbox::ensure_shims(&shims).map_err(|e| e.to_string())?;
     let scratch = cfg.memory_enabled.then(memory::temp_dir);
-    let outcome =
-        sandbox::run_sandboxed(&root, &shims, &cfg.granted_paths, scratch.as_deref(), &cmd)
-            .map_err(|e| e.to_string())?;
+    let trash_base = sandbox::resolve_trash_dir(&cfg);
+    let outcome = sandbox::run_sandboxed(
+        &root,
+        &shims,
+        &cfg.granted_paths,
+        scratch.as_deref(),
+        &trash_base,
+        &cmd,
+    )
+    .map_err(|e| e.to_string())?;
     // Here, not the frontend: the only place with both the command and its
     // real exit code.
     memory::record_command(&cfg, &cmd, outcome.exit_code);
@@ -487,11 +488,23 @@ async fn send_message(
         model: &cfg.model,
         api_key: &cfg.api_key,
     });
+    // The index of the *current* task's own opening message -- everything
+    // before it belongs to a previous task `memory::start_task` already
+    // archived into `completed.md`, so `fit_to_budget` can drop it outright
+    // rather than condensing/summarizing it like turns with no such
+    // backstop. `None` when memory is off: without it there's no
+    // independent record to lean on, so every turn stays equally
+    // irreplaceable, same as before this existed.
+    let archived_before = cfg
+        .memory_enabled
+        .then(|| history.iter().rposition(|m| m.role == "user"))
+        .flatten();
     let trimmed = context::fit_to_budget(
         context::estimate_tokens(&system_content),
         history,
         cfg.max_context_tokens as usize,
         summarizer,
+        archived_before,
     )
     .await;
     if trimmed.condensed > 0 {
@@ -1357,14 +1370,7 @@ fn main() {
 
     let cli_root = resolve_cli_root();
     if let Some(root) = &cli_root {
-        if let Err(e) = activate_root(root) {
-            log::warn!(
-                "failed to activate CLI-provided root {}: {e}",
-                root.display()
-            );
-        } else {
-            log::info!("preloaded root from CLI argument: {}", root.display());
-        }
+        log::info!("preloaded root from CLI argument: {}", root.display());
     }
 
     tauri::Builder::default()

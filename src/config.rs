@@ -39,6 +39,15 @@ pub struct AppConfig {
     pub granted_paths: Vec<GrantedPath>,
     #[serde(default)]
     pub auto_approve: Vec<String>,
+    /// Where soft-deleted files actually live on disk (see
+    /// `sandbox::resolve_trash_dir`) -- empty means the built-in default
+    /// (`<app-config-dir>/trash`), same "empty means unset" convention as
+    /// `api_key`. Deliberately outside the sandboxed working folder: a
+    /// model kept fetching/listing the old `.temp-trash/` despite an
+    /// explicit instruction to ignore it, so it's no longer bound into the
+    /// sandbox anywhere a plain `ls` from the working folder could find it.
+    #[serde(default)]
+    pub sandbox_trash_dir: String,
     /// Propose -> run -> respond cycles chained without the user. 0 = no
     /// limit. Generous by default since the UI collapses intermediate steps.
     #[serde(default = "default_max_auto_steps")]
@@ -216,6 +225,7 @@ impl Default for AppConfig {
             chat_temperature: default_chat_temperature(),
             granted_paths: vec![],
             auto_approve: vec![],
+            sandbox_trash_dir: String::new(),
             max_auto_steps: default_max_auto_steps(),
             disable_builtin_rules: false,
             max_context_tokens: default_max_context_tokens(),

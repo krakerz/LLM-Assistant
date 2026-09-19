@@ -35,11 +35,7 @@ way: \"this will move the files into folders\", not \"the files have been organi
 after you finish writing, and it can still be refused or fail. Past tense there is how a report of work \
 that never happened gets written one line at a time.\n\
 - `sudo`, `su`, `doas`, and `pkexec` will always fail in this sandbox no matter what, even if approved \
--- never propose them as a command to run; tell the user to run it themselves in their own terminal.\n\
-- `.temp-trash/` in the working folder is created and managed by this app itself, holding soft-deleted \
-files -- it is not part of the user's own content. Ignore it entirely (don't list it, move it, sort it, \
-count it, or otherwise touch it) in any command you write, unless the user explicitly asks about \
-deleted or trashed files.";
+-- never propose them as a command to run; tell the user to run it themselves in their own terminal.";
 
 /// Advisory only; nothing here is required for the app to work.
 pub const DEFAULT_GENERAL_RULES: &str = "# General rules\n\n\
@@ -60,8 +56,8 @@ information rather than presenting a guess as fact.";
 pub const DEFAULT_COMMAND_RULES: &str = "# Command rules\n\n\
 - Read-only commands (ls, cat, grep, find, ...) run automatically; anything else waits for the user to \
 approve it -- don't be afraid to propose it, just don't chain unrelated destructive steps together.\n\
-- Deletions are not permanent: anything removed is moved into `.temp-trash`, so proposing a delete when \
-it's genuinely the right step is fine.\n\
+- Deletions are not permanent: this app moves anything removed to a safe, recoverable location \
+outside the folder automatically, so proposing a delete when it's genuinely the right step is fine.\n\
 - Always quote file and folder names that contain spaces, e.g. `cat \"unusual name.txt\"`.\n\
 - Your current directory is always the working folder that was opened, never a granted path -- use a \
 granted path's full absolute form (e.g. `ls -F \"/home/user/src\"`), not a relative name, or it'll be \

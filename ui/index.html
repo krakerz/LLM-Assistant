@@ -215,8 +215,8 @@
     <p id="confirmContext" class="confirm-context"></p>
     <p class="explain">
       It writes, deletes, or otherwise changes something — or uses pipes/redirects the sandbox can't
-      pre-check. Deletes inside the folder are soft: they land in <code>.temp-trash/</code>, not gone
-      for good. Review the command(s) below.
+      pre-check. Deletes inside the folder are soft: they move to an app-managed trash location
+      outside the folder, not gone for good. Review the command(s) below.
     </p>
     <pre id="confirmCmd" class="cmd"></pre>
     <ul id="confirmSteps" class="confirm-steps" hidden></ul>
@@ -344,6 +344,12 @@
         <ul id="grantedList" class="granted-list"></ul>
         <button id="grantQuickAddBtn" type="button" class="quick-add-btn">+ Add another folder…</button>
       </fieldset>
+
+      <label>Where soft-deleted files actually live on disk. Kept outside the sandboxed folder on
+        purpose — nowhere a listing command run from inside the folder can ever find it. Leave blank
+        to use the built-in default (a "trash" folder next to the app's own config).
+        <input id="cfgSandboxTrashDir" type="text" placeholder="(default: app config dir)/trash" />
+      </label>
 
       <fieldset>
         <legend>Always-allowed programs</legend>
