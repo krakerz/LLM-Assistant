@@ -1,14 +1,18 @@
 //! Linux-only. Confines proposed commands to the working folder (plus
 //! granted paths) with `bwrap`, and shims destructive tools to soft-delete
-//! into `.temp-trash/`.
+//! into an app-managed trash directory mounted at `/trash` inside the
+//! sandbox -- deliberately not a child of the working folder itself (see
+//! `resolve_trash_dir`/`run_sandboxed`'s doc comments for why).
 //!
 //! We never try to judge "is this command safe" from its text. The sandbox
 //! makes "outside the folder" impossible and the shims make "destructive
 //! inside it" recoverable. The only text-based judgment is "can this run
 //! without asking", which only has to be conservative in one direction.
 
-use crate::config::GrantedPath;
+use crate::config::{AppConfig, GrantedPath};
+use std::collections::hash_map::RandomState;
 use std::fs;
+use std::hash::{BuildHasher, Hasher};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -81,10 +85,14 @@ pub struct RunOutcome {
 // `mv`/`cp`/`mkdir` would re-enter the shim directory and loop forever.
 const SHIM_PATH_RESET: &str = "PATH=/usr/bin:/bin:/usr/local/bin\nexport PATH\n";
 
-// rm/rmdir: move the target into .temp-trash keeping its relative path, so a
-// restore is just moving it back. Each invocation gets its own timestamped
-// subfolder, or deleting the same path twice would have `mv -f` clobber the
-// first copy.
+// rm/rmdir: move the target into the trash directory `run_sandboxed` bound
+// in at `TRASH_ROOT`, keeping its relative path, so a restore is just moving
+// it back. `TRASH_ROOT` is already unique per command execution (see
+// `run_sandboxed`), so this shim doesn't mint its own subfolder the way it
+// used to -- but it still has to guard against trashing the *same* relative
+// path twice within one execution (e.g. `rm a; touch a; rm a`), which would
+// otherwise have the second `mv -f` clobber the first copy: on a collision,
+// append `.2`, `.3`, ... until a free name turns up.
 //
 // `rmdir` still refuses a non-empty directory, exactly as the real one does.
 // That refusal is a signal the model actively relies on -- observed: asked to
@@ -94,7 +102,7 @@ const SHIM_PATH_RESET: &str = "PATH=/usr/bin:/bin:/usr/local/bin\nexport PATH\n"
 // success. Recoverable from the trash is not the same as not having happened.
 const TRASH_SHIM_SCRIPT: &str = r#"tool="@TOOL@"
 status=0
-trash_root="${TRASH_ROOT:-$PWD/.temp-trash}/$(date +%Y%m%d-%H%M%S-%N)"
+trash_root="${TRASH_ROOT:-$PWD/.temp-trash}"
 for arg in "$@"; do
   case "$arg" in
     -*) continue ;;
@@ -109,6 +117,11 @@ for arg in "$@"; do
     *) rel="$arg" ;;
   esac
   dest="$trash_root/$rel"
+  if [ -e "$dest" ]; then
+    n=2
+    while [ -e "$dest.$n" ]; do n=$((n + 1)); done
+    dest="$dest.$n"
+  fi
   mkdir -p "$(dirname "$dest")"
   if ! mv -f -- "$arg" "$dest" 2>/dev/null; then
     echo "$tool: cannot remove '$arg'" >&2
@@ -118,8 +131,12 @@ done
 exit $status
 "#;
 
-/// mv/cp/truncate: copy what's about to be overwritten into `.temp-trash`,
-/// then `exec` the real tool with `"$@"` untouched.
+/// mv/cp/truncate: copy what's about to be overwritten into the trash
+/// directory `run_sandboxed` bound in at `TRASH_ROOT`, then `exec` the real
+/// tool with `"$@"` untouched. Same collision handling as `TRASH_SHIM_SCRIPT`
+/// -- `TRASH_ROOT` is fixed for the whole command execution now, so this
+/// guards against overwriting the same relative path's trashed copy twice
+/// in one run.
 ///
 /// Operand scan: skip `-*` until a bare `--`, treat the last operand as the
 /// destination (a directory means victims are `dest/basename(src)`). `@ALL@`
@@ -134,7 +151,7 @@ if [ -z "$real" ]; then
   exit 127
 fi
 
-trash_root="${TRASH_ROOT:-$PWD/.temp-trash}/$(date +%Y%m%d-%H%M%S-%N)"
+trash_root="${TRASH_ROOT:-$PWD/.temp-trash}"
 
 keep() {
   [ -e "$1" ] || return 0
@@ -143,6 +160,11 @@ keep() {
     *) rel="$1" ;;
   esac
   dest="$trash_root/$rel"
+  if [ -e "$dest" ]; then
+    n=2
+    while [ -e "$dest.$n" ]; do n=$((n + 1)); done
+    dest="$dest.$n"
+  fi
   mkdir -p "$(dirname "$dest")" 2>/dev/null || return 0
   cp -a -- "$1" "$dest" 2>/dev/null || :
 }
@@ -214,15 +236,56 @@ pub fn ensure_shims(shim_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `scratch`, when given, is bound read-write -- the model's only writable
-/// path outside the working folder. Passed in rather than read from
-/// `memory::`, so the security module doesn't depend on the feature that
-/// happens to use it.
+/// `cfg.sandbox_trash_dir` empty means the built-in default -- resolved here
+/// (not stored pre-resolved anywhere) so a config change takes effect on the
+/// very next command, same "never trust a stale copy" convention the rest of
+/// the app follows. Passed into `run_sandboxed` by the caller rather than
+/// read from `AppConfig` directly inside it, matching how `granted`/`scratch`
+/// already work -- this module stays config-shape-agnostic beyond the one
+/// field it actually needs.
+pub fn resolve_trash_dir(cfg: &AppConfig) -> PathBuf {
+    if cfg.sandbox_trash_dir.trim().is_empty() {
+        crate::paths::app_config_dir().join("trash")
+    } else {
+        PathBuf::from(&cfg.sandbox_trash_dir)
+    }
+}
+
+/// One identifier per `run_sandboxed` call -- day-granularity date (not a
+/// fine-grained timestamp, so the trash directory doesn't fragment into one
+/// folder per second) plus a short random suffix for uniqueness between
+/// runs on the same day. Same dependency-free trick `server.rs`'s
+/// `generate_session_token` uses (`RandomState`'s per-call OS-seeded key),
+/// just one draw instead of four -- a trash folder name doesn't need
+/// session-token-grade entropy, only enough that two runs on the same day
+/// never collide.
+fn generate_trash_run_id() -> String {
+    let date = chrono::Local::now().format("%Y%m%d");
+    let random = RandomState::new().build_hasher().finish();
+    format!("{date}-{random:016x}")
+}
+
+/// `scratch`, when given, is bound read-write -- the model's only other
+/// writable path outside the working folder. Passed in rather than read
+/// from `memory::`, so the security module doesn't depend on the feature
+/// that happens to use it.
+///
+/// `trash_base` (see `resolve_trash_dir`) is where trash for *this* run
+/// lands, but only this run's own subfolder is ever bound into the sandbox
+/// -- at a fixed path (`/trash`) that is deliberately not a child of `root`
+/// or anywhere else the sandboxed process would think to look. A plain
+/// `ls`/`ls -R` from inside the working folder can never show it, and even
+/// a command that explicitly tried `ls /trash` would only ever see this
+/// one run's own trashed files, never another run's or another folder's --
+/// added after a real session showed the model repeatedly listing the old
+/// `.temp-trash/` (which lived inside the working folder itself) despite an
+/// explicit instruction to leave it alone.
 pub fn run_sandboxed(
     root: &Path,
     shim_dir: &Path,
     granted: &[GrantedPath],
     scratch: Option<&Path>,
+    trash_base: &Path,
     cmd: &str,
 ) -> anyhow::Result<RunOutcome> {
     let mut c = Command::new("bwrap");
@@ -280,8 +343,12 @@ pub fn run_sandboxed(
     // make root read-only.
     c.arg("--bind").arg(root).arg(root);
 
+    let run_trash_dir = trash_base.join(generate_trash_run_id());
+    fs::create_dir_all(&run_trash_dir)?;
+    let sandbox_trash_path = Path::new("/trash");
+    c.arg("--bind").arg(&run_trash_dir).arg(sandbox_trash_path);
+
     let path_env = format!("{}:/usr/bin:/bin", shim_dir.display());
-    let trash_root = root.join(".temp-trash");
 
     c.arg("--chdir")
         .arg(root)
@@ -290,7 +357,7 @@ pub fn run_sandboxed(
         .arg(&path_env)
         .arg("--setenv")
         .arg("TRASH_ROOT")
-        .arg(&trash_root)
+        .arg(sandbox_trash_path)
         .arg("sh")
         .arg("-c")
         .arg(cmd);
@@ -336,7 +403,6 @@ pub fn default_shim_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{thread::sleep, time::Duration};
 
     /// Ubuntu 24.04 and many CI runners refuse the loopback setup that
     /// `--unshare-net` triggers. Tests skip rather than fail on those, since
@@ -362,47 +428,44 @@ mod tests {
         }
     }
 
-    // Deleting the same path twice must land in two distinct trash batches,
-    // not have `mv -f` overwrite the first.
+    // Deleting the same path twice, in two separate approved commands, must
+    // land in two distinct trash batches, not have `mv -f` overwrite the
+    // first. Each `run_sandboxed` call draws its own random run ID, so --
+    // unlike the old per-shim nanosecond timestamp -- this no longer needs
+    // to force a delay between the two calls to guarantee they differ.
     #[test]
     fn repeated_rm_of_same_path_does_not_clobber_earlier_trash() {
         if !sandbox_available() {
             return;
         }
-        let root =
-            std::env::temp_dir().join(format!("llm-assistant-sandbox-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let (root, shim_dir, trash_base) = scratch("repeated-rm");
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::write(root.join("sub/note.txt"), "version1").unwrap();
 
-        let shim_dir = root.join("shims");
-        ensure_shims(&shim_dir).unwrap();
-
-        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "rm sub/note.txt").unwrap();
+        let outcome =
+            run_sandboxed(&root, &shim_dir, &[], None, &trash_base, "rm sub/note.txt").unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
 
-        // Force a distinct nanosecond-precision timestamp for the second rm.
-        sleep(Duration::from_millis(20));
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::write(root.join("sub/note.txt"), "version2").unwrap();
-        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "rm sub/note.txt").unwrap();
+        let outcome =
+            run_sandboxed(&root, &shim_dir, &[], None, &trash_base, "rm sub/note.txt").unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
 
-        let trash_root = root.join(".temp-trash");
-        let mut timestamp_dirs: Vec<PathBuf> = fs::read_dir(&trash_root)
+        let mut run_dirs: Vec<PathBuf> = fs::read_dir(&trash_base)
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.is_dir())
             .collect();
-        timestamp_dirs.sort();
+        run_dirs.sort();
         assert_eq!(
-            timestamp_dirs.len(),
+            run_dirs.len(),
             2,
-            "expected two separate trash batches, got {timestamp_dirs:?}"
+            "expected two separate trash batches, got {run_dirs:?}"
         );
 
-        let contents: Vec<String> = timestamp_dirs
+        let contents: Vec<String> = run_dirs
             .iter()
             .map(|d| fs::read_to_string(d.join("sub/note.txt")).unwrap())
             .collect();
@@ -416,10 +479,60 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&trash_base);
     }
 
-    /// Fresh folder + shims, named per test so parallel runs don't collide.
-    fn scratch(name: &str) -> (PathBuf, PathBuf) {
+    // Trashing the *same* relative path twice within one command execution
+    // (one `run_sandboxed` call, so one fixed `TRASH_ROOT` for both deletes)
+    // must not have the second `mv -f` clobber the first -- the shim's own
+    // collision suffix (`.2`, `.3`, ...) is what's supposed to catch this
+    // now that a fresh per-shim-call timestamp no longer does.
+    #[test]
+    fn same_path_trashed_twice_in_one_command_keeps_both_copies() {
+        if !sandbox_available() {
+            return;
+        }
+        let (root, shim_dir, trash_base) = scratch("same-path-one-run");
+        fs::write(root.join("note.txt"), "version1").unwrap();
+
+        let outcome = run_sandboxed(
+            &root,
+            &shim_dir,
+            &[],
+            None,
+            &trash_base,
+            "rm note.txt && echo version2 > note.txt && rm note.txt",
+        )
+        .unwrap();
+        assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+
+        let trashed = trashed_files(&trash_base);
+        assert_eq!(
+            trashed.len(),
+            2,
+            "expected both trashed copies to survive under distinct names: {trashed:?}"
+        );
+        let contents: Vec<&String> = trashed.iter().map(|(_, text)| text).collect();
+        assert!(
+            contents.contains(&&"version1\n".to_string())
+                || contents.contains(&&"version1".to_string()),
+            "first trashed copy was lost: {trashed:?}"
+        );
+        assert!(
+            contents.contains(&&"version2\n".to_string()),
+            "second trashed copy was lost: {trashed:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&trash_base);
+    }
+
+    /// Fresh folder + shims + an external trash base, named per test so
+    /// parallel runs don't collide. The trash base is deliberately a
+    /// sibling of `root`, not a child of it -- exercising the same
+    /// outside-the-working-folder shape `run_sandboxed` actually uses now,
+    /// not just a renamed `.temp-trash`.
+    fn scratch(name: &str) -> (PathBuf, PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "llm-assistant-sandbox-{name}-{}",
             std::process::id()
@@ -428,7 +541,12 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let shim_dir = root.join("shims");
         ensure_shims(&shim_dir).unwrap();
-        (root, shim_dir)
+        let trash_base = std::env::temp_dir().join(format!(
+            "llm-assistant-sandbox-{name}-trash-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&trash_base);
+        (root, shim_dir, trash_base)
     }
 
     // `mv` over an existing target destroys it as permanently as `rm`, and
@@ -438,11 +556,19 @@ mod tests {
         if !sandbox_available() {
             return;
         }
-        let (root, shim_dir) = scratch("mv-overwrite");
+        let (root, shim_dir, trash_base) = scratch("mv-overwrite");
         fs::write(root.join("new.txt"), "incoming").unwrap();
         fs::write(root.join("old.txt"), "about to be destroyed").unwrap();
 
-        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "mv new.txt old.txt").unwrap();
+        let outcome = run_sandboxed(
+            &root,
+            &shim_dir,
+            &[],
+            None,
+            &trash_base,
+            "mv new.txt old.txt",
+        )
+        .unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
         assert_eq!(
             fs::read_to_string(root.join("old.txt")).unwrap(),
@@ -450,15 +576,16 @@ mod tests {
             "the move itself must still happen exactly as asked"
         );
 
-        let trashed = trashed_files(&root.join(".temp-trash"));
+        let trashed = trashed_files(&trash_base);
         assert!(
             trashed
                 .iter()
                 .any(|(_, text)| text == "about to be destroyed"),
-            "the overwritten file should be recoverable from .temp-trash: {trashed:?}"
+            "the overwritten file should be recoverable from trash: {trashed:?}"
         );
 
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&trash_base);
     }
 
     #[test]
@@ -466,25 +593,27 @@ mod tests {
         if !sandbox_available() {
             return;
         }
-        let (root, shim_dir) = scratch("mv-into-dir");
+        let (root, shim_dir, trash_base) = scratch("mv-into-dir");
         fs::create_dir_all(root.join("dest")).unwrap();
         fs::write(root.join("note.txt"), "new version").unwrap();
         fs::write(root.join("dest/note.txt"), "old version").unwrap();
 
-        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "mv note.txt dest").unwrap();
+        let outcome =
+            run_sandboxed(&root, &shim_dir, &[], None, &trash_base, "mv note.txt dest").unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
         assert_eq!(
             fs::read_to_string(root.join("dest/note.txt")).unwrap(),
             "new version"
         );
 
-        let trashed = trashed_files(&root.join(".temp-trash"));
+        let trashed = trashed_files(&trash_base);
         assert!(
             trashed.iter().any(|(_, text)| text == "old version"),
             "dest/note.txt should have been preserved before being replaced: {trashed:?}"
         );
 
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&trash_base);
     }
 
     #[test]
@@ -492,26 +621,35 @@ mod tests {
         if !sandbox_available() {
             return;
         }
-        let (root, shim_dir) = scratch("cp-overwrite");
+        let (root, shim_dir, trash_base) = scratch("cp-overwrite");
         fs::write(root.join("src.txt"), "incoming").unwrap();
         fs::write(root.join("dst.txt"), "about to be destroyed").unwrap();
 
-        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "cp src.txt dst.txt").unwrap();
+        let outcome = run_sandboxed(
+            &root,
+            &shim_dir,
+            &[],
+            None,
+            &trash_base,
+            "cp src.txt dst.txt",
+        )
+        .unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
         assert_eq!(
             fs::read_to_string(root.join("dst.txt")).unwrap(),
             "incoming"
         );
 
-        let trashed = trashed_files(&root.join(".temp-trash"));
+        let trashed = trashed_files(&trash_base);
         assert!(
             trashed
                 .iter()
                 .any(|(_, text)| text == "about to be destroyed"),
-            "expected the clobbered destination in .temp-trash: {trashed:?}"
+            "expected the clobbered destination in trash: {trashed:?}"
         );
 
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&trash_base);
     }
 
     // Destroys content without deleting or replacing, so neither the rm shim
@@ -521,20 +659,29 @@ mod tests {
         if !sandbox_available() {
             return;
         }
-        let (root, shim_dir) = scratch("truncate");
+        let (root, shim_dir, trash_base) = scratch("truncate");
         fs::write(root.join("log.txt"), "important history").unwrap();
 
-        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "truncate -s 0 log.txt").unwrap();
+        let outcome = run_sandboxed(
+            &root,
+            &shim_dir,
+            &[],
+            None,
+            &trash_base,
+            "truncate -s 0 log.txt",
+        )
+        .unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
         assert_eq!(fs::read_to_string(root.join("log.txt")).unwrap(), "");
 
-        let trashed = trashed_files(&root.join(".temp-trash"));
+        let trashed = trashed_files(&trash_base);
         assert!(
             trashed.iter().any(|(_, text)| text == "important history"),
-            "expected the pre-truncation contents in .temp-trash: {trashed:?}"
+            "expected the pre-truncation contents in trash: {trashed:?}"
         );
 
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&trash_base);
     }
 
     // Regression test for the PATH reset: shims call mv/cp/mkdir internally,
@@ -544,20 +691,23 @@ mod tests {
         if !sandbox_available() {
             return;
         }
-        let (root, shim_dir) = scratch("shim-recursion");
+        let (root, shim_dir, trash_base) = scratch("shim-recursion");
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::write(root.join("sub/a.txt"), "content").unwrap();
 
-        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "rm sub/a.txt").unwrap();
+        let outcome =
+            run_sandboxed(&root, &shim_dir, &[], None, &trash_base, "rm sub/a.txt").unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
 
         fs::write(root.join("x.txt"), "x").unwrap();
         fs::write(root.join("y.txt"), "y").unwrap();
-        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "mv x.txt y.txt").unwrap();
+        let outcome =
+            run_sandboxed(&root, &shim_dir, &[], None, &trash_base, "mv x.txt y.txt").unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
         assert_eq!(fs::read_to_string(root.join("y.txt")).unwrap(), "x");
 
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&trash_base);
     }
 
     // Observed in a real session: asked to clean up leftover folders, the
@@ -569,13 +719,20 @@ mod tests {
         if !sandbox_available() {
             return;
         }
-        let (root, shim_dir) = scratch("rmdir-non-empty");
+        let (root, shim_dir, trash_base) = scratch("rmdir-non-empty");
         fs::create_dir_all(root.join("empty_one")).unwrap();
         fs::create_dir_all(root.join("archive")).unwrap();
         fs::write(root.join("archive/keep.txt"), "the user's file").unwrap();
 
-        let outcome =
-            run_sandboxed(&root, &shim_dir, &[], None, "rmdir empty_one archive").unwrap();
+        let outcome = run_sandboxed(
+            &root,
+            &shim_dir,
+            &[],
+            None,
+            &trash_base,
+            "rmdir empty_one archive",
+        )
+        .unwrap();
         assert_ne!(outcome.exit_code, 0, "must fail like the real rmdir");
         assert!(
             outcome.stderr.contains("Directory not empty"),
@@ -592,6 +749,7 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&trash_base);
     }
 
     // rmdir needs the same structural redirect as rm: a real one removes its
@@ -601,25 +759,25 @@ mod tests {
         if !sandbox_available() {
             return;
         }
-        let root = std::env::temp_dir().join(format!(
-            "llm-assistant-sandbox-rmdir-test-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let (root, shim_dir, trash_base) = scratch("rmdir-moves");
         fs::create_dir_all(root.join("empty_folder")).unwrap();
 
-        let shim_dir = root.join("shims");
-        ensure_shims(&shim_dir).unwrap();
-
-        let outcome = run_sandboxed(&root, &shim_dir, &[], None, "rmdir empty_folder").unwrap();
+        let outcome = run_sandboxed(
+            &root,
+            &shim_dir,
+            &[],
+            None,
+            &trash_base,
+            "rmdir empty_folder",
+        )
+        .unwrap();
         assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
 
         assert!(
             !root.join("empty_folder").exists(),
             "empty_folder should no longer be at its original location"
         );
-        let trash_root = root.join(".temp-trash");
-        let moved: Vec<PathBuf> = fs::read_dir(&trash_root)
+        let moved: Vec<PathBuf> = fs::read_dir(&trash_base)
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path().join("empty_folder"))
@@ -632,5 +790,6 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&trash_base);
     }
 }

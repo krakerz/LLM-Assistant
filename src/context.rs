@@ -14,6 +14,15 @@ const TRIM_MARKER: &str = "[...older turns of this conversation were dropped to 
 context window. Don't assume anything about what was removed -- if an earlier detail matters, ask \
 the user or re-check it with a command.]";
 
+/// Distinct from `TRIM_MARKER` -- this drop isn't a budget-forced loss, it's
+/// turns whose facts already live safely elsewhere (see `fit_to_budget`'s
+/// `archived_before` parameter), so the wording says where to actually look
+/// instead of just "don't assume anything".
+const ARCHIVED_TASK_MARKER: &str =
+    "[...turns from an earlier, already-completed task were dropped \
+here -- that task's commands and their real exit codes are still in the session record above, this \
+was only its chat transcript.]";
+
 /// Must match `formatCommandFeedback` in `ui/main.js` and `headless.rs`
 /// exactly -- condensing recognizes a finished step by this prefix.
 pub const COMMAND_OUTPUT_PREFIX: &str = "[command output, exit ";
@@ -315,10 +324,67 @@ impl FitOutcome {
     }
 }
 
+/// Keeps the sacred first message (`trim_to_budget` never drops it either),
+/// replaces everything up to (not including) `boundary` with one
+/// `ARCHIVED_TASK_MARKER` message, and keeps `boundary..` untouched. Called
+/// only when `boundary` is known to be the start of the *current*,
+/// not-yet-archived task -- see `fit_to_budget`'s `archived_before`
+/// parameter. A no-op if there's nothing real to drop (`boundary < 2`) or
+/// `boundary` is out of range.
+fn drop_archived_prefix(history: Vec<ChatMessage>, boundary: usize) -> Vec<ChatMessage> {
+    if boundary < 2 || boundary >= history.len() {
+        return history;
+    }
+    let mut out = Vec::with_capacity(history.len() - boundary + 2);
+    out.push(history[0].clone());
+    out.push(ChatMessage::text("user", ARCHIVED_TASK_MARKER));
+    out.extend_from_slice(&history[boundary..]);
+    out
+}
+
 /// Condense, then summarize (only if opted in *and* the mechanical passes
 /// already gave up -- `dropped > 0` is that signal), then drop. A failed
 /// summarizer falls back to the mechanical result.
+///
+/// `archived_before`, when `Some(idx)`, is the index of the current
+/// (not-yet-archived) task's own opening message -- operation mode's
+/// `memory.rs` already has an independent, app-written record of every
+/// command that ran (with its real exit code) for everything before it, so
+/// that prefix is dropped outright as a first pass whenever the turn is
+/// over budget at all, rather than being condensed/summarized/dropped
+/// piecemeal like turns with no such backstop. `None` for chat mode, which
+/// has no `memory.rs` equivalent (its own `state.json`/`state.md` is a
+/// different mechanism entirely). Doesn't change condensing/summarizing/
+/// dropping's own logic at all -- it only shrinks what those passes ever
+/// see, and reports the extra drop honestly rather than letting it vanish
+/// from the turn's `dropped` count.
 pub async fn fit_to_budget(
+    system_tokens: usize,
+    history: Vec<ChatMessage>,
+    budget: usize,
+    summarizer: Option<Summarizer<'_>>,
+    archived_before: Option<usize>,
+) -> FitOutcome {
+    let mut archived_dropped = 0;
+    let history = match archived_before {
+        Some(idx) if budget != 0 && idx >= 2 && idx < history.len() => {
+            let total: usize =
+                system_tokens + history.iter().map(estimate_message_tokens).sum::<usize>();
+            if total > budget {
+                archived_dropped = idx - 1;
+                drop_archived_prefix(history, idx)
+            } else {
+                history
+            }
+        }
+        _ => history,
+    };
+    let mut outcome = fit_to_budget_inner(system_tokens, history, budget, summarizer).await;
+    outcome.dropped += archived_dropped;
+    outcome
+}
+
+async fn fit_to_budget_inner(
     system_tokens: usize,
     history: Vec<ChatMessage>,
     budget: usize,
@@ -624,7 +690,7 @@ mod tests {
     /// here must resolve without one.
     #[tokio::test]
     async fn no_summarizer_configured_falls_back_to_mechanical_trimming() {
-        let out = fit_to_budget(50, history(40), 600, None).await;
+        let out = fit_to_budget(50, history(40), 600, None, None).await;
         assert!(out.dropped > 0);
         assert!(out.summary.is_none());
         assert!(out.rewritten_history.is_none());
@@ -639,10 +705,57 @@ mod tests {
             model: "none",
             api_key: "",
         };
-        let out = fit_to_budget(20, chain(6), 400, Some(s)).await;
+        let out = fit_to_budget(20, chain(6), 400, Some(s), None).await;
         assert!(out.condensed > 0);
         assert_eq!(out.dropped, 0);
         assert!(out.summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn archived_task_prefix_is_dropped_outright_not_condensed() {
+        // 20 messages standing in for a previous, already-archived task,
+        // plus one more for the current task's own opening message.
+        let mut h = history(20);
+        let boundary = h.len();
+        h.push(msg("user", "please check something in the new task"));
+
+        let out = fit_to_budget(50, h, 300, None, Some(boundary)).await;
+
+        assert!(
+            out.messages
+                .iter()
+                .any(|m| m.content == ARCHIVED_TASK_MARKER),
+            "expected the archived-task marker, not a generic trim/condense: {:?}",
+            out.messages.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            out.condensed, 0,
+            "the archived prefix should be dropped outright, never condensed"
+        );
+        assert!(
+            out.dropped > 0,
+            "the archived prefix's messages must still count toward `dropped`"
+        );
+        assert!(
+            out.messages
+                .iter()
+                .any(|m| m.content.contains("please check something in the new task")),
+            "the current task's own message must survive: {:?}",
+            out.messages.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn archived_before_is_a_no_op_when_everything_already_fits() {
+        let h = history(4);
+        let out = fit_to_budget(20, h, 100_000, None, Some(2)).await;
+        assert_eq!(out.dropped, 0);
+        assert!(
+            !out.messages
+                .iter()
+                .any(|m| m.content == ARCHIVED_TASK_MARKER),
+            "nothing needed dropping, so the archived-prefix pass shouldn't have run at all"
+        );
     }
 
     #[tokio::test]
@@ -652,7 +765,7 @@ mod tests {
             model: "none",
             api_key: "",
         };
-        let out = fit_to_budget(50, history(40), 600, Some(s)).await;
+        let out = fit_to_budget(50, history(40), 600, Some(s), None).await;
         assert!(
             out.summary.is_none(),
             "a failed call must not fabricate one"

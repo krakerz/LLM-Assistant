@@ -1466,6 +1466,7 @@ function renderSettings() {
   document.getElementById("cfgConfirmFadeAfter").value = currentConfig.confirm_fade_after;
   document.getElementById("cfgMemoryEnabled").checked = !!currentConfig.memory_enabled;
   document.getElementById("cfgMemoryMaxTokens").value = currentConfig.memory_max_tokens;
+  document.getElementById("cfgSandboxTrashDir").value = currentConfig.sandbox_trash_dir || "";
   document.getElementById("cfgChatStateMaxTokens").value = currentConfig.chat_state_max_tokens;
   document.getElementById("cfgChatShowThinking").checked = !!currentConfig.chat_show_thinking;
   document.getElementById("cfgChatPersistThinking").checked = !!currentConfig.chat_persist_thinking;
@@ -1705,6 +1706,7 @@ document.getElementById("settingsSaveBtn").addEventListener("click", async () =>
     0,
     parseInt(document.getElementById("cfgMemoryMaxTokens").value, 10) || 0,
   );
+  currentConfig.sandbox_trash_dir = document.getElementById("cfgSandboxTrashDir").value.trim();
   currentConfig.chat_state_max_tokens = Math.max(
     0,
     parseInt(document.getElementById("cfgChatStateMaxTokens").value, 10) || 0,

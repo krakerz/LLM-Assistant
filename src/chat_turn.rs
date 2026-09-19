@@ -232,6 +232,9 @@ async fn prepare_chat_turn(
         history.to_vec(),
         cfg.max_context_tokens as usize,
         summarizer,
+        // Chat mode has no `memory.rs` equivalent -- its own persistence is
+        // `state.json`/`state.md`, a different mechanism entirely.
+        None,
     )
     .await;
 

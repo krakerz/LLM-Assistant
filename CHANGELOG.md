@@ -7,6 +7,9 @@ All notable changes to this project are documented here. The format follows [Kee
 ## [1.18.0] — 2026-09-04
 
 ### Changed
+- Soft-deleted files now move to a location outside the sandboxed folder entirely, instead of a `.temp-trash/` folder inside it that the model kept fetching and listing despite being told to ignore it — the location is configurable in Settings (File Operations tab)
+- Trashed files from one approved command now land in a single folder instead of fragmenting into one per individual `rm`/`mv`/etc. sub-command
+- When the session record (memory) is on, operation mode now drops a previous completed task's chat history outright once a new task starts, instead of condensing or summarizing it, since the session record already keeps its facts — reduces context usage and how often long sessions need to compact
 - Deleting a persona now moves it into `personas/.trash/` instead of removing it -- a real session lost one to a misclick with no way back
 - Deleting a persona now also confirms afterward where it went, not just before
 - The `--server` favicon is now a cropped close-up of just the character's face, not the full app icon shrunk down -- much more legible at actual favicon size

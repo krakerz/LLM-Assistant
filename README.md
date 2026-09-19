@@ -24,7 +24,7 @@ guessing from the command *text* whether it's safe (unreliable -- see
   immediately; anything else -- writes, deletes, pipes/redirects -- shows you
   the raw command plus the model's explanation and waits for your approval.
 - Deletions aren't permanent: `rm` inside the sandbox moves targets into
-  `.temp-trash/` (preserving their layout) instead of deleting them.
+  a configurable trash location outside the working folder instead of deleting them.
 - `sudo`/`su`/`doas`/`pkexec` are blocked outright -- shown as a command to
   run yourself, not a prompt that would just fail.
 

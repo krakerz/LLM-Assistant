@@ -17,7 +17,7 @@ use crate::config::AppConfig;
 use crate::llm::{self, ChatMessage};
 use crate::rules::to_plain_text;
 use crate::sandbox::Classification;
-use crate::{activate_root, config, context, memory, rules, sandbox};
+use crate::{config, context, memory, rules, sandbox};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -48,11 +48,7 @@ struct Setup {
 }
 
 impl Setup {
-    fn load(root: &Path) -> Option<Setup> {
-        if let Err(e) = activate_root(root) {
-            eprintln!("error: {e}");
-            return None;
-        }
+    fn load() -> Option<Setup> {
         let shims = sandbox::default_shim_dir();
         if let Err(e) = sandbox::ensure_shims(&shims) {
             eprintln!("error setting up sandbox shims: {e}");
@@ -115,7 +111,7 @@ pub fn run_chat(root: PathBuf) -> ! {
 }
 
 async fn run_async(root: PathBuf, message: String) -> i32 {
-    let Some(setup) = Setup::load(&root) else {
+    let Some(setup) = Setup::load() else {
         return 1;
     };
 
@@ -128,7 +124,7 @@ async fn run_async(root: PathBuf, message: String) -> i32 {
 }
 
 async fn run_chat_async(root: PathBuf) -> i32 {
-    let Some(mut setup) = Setup::load(&root) else {
+    let Some(mut setup) = Setup::load() else {
         return 1;
     };
 
@@ -181,11 +177,17 @@ async fn wrap_up(setup: &Setup, history: &mut Vec<ChatMessage>, system_content: 
     history.push(ChatMessage::text("user", rules::FINAL_ANSWER_PROMPT));
     // Same budget as every other turn: this used to send the whole
     // untrimmed history.
+    let archived_before = setup
+        .cfg
+        .memory_enabled
+        .then(|| history.iter().rposition(|m| m.role == "user"))
+        .flatten();
     let trimmed = context::fit_to_budget(
         context::estimate_tokens(system_content),
         history.clone(),
         setup.cfg.max_context_tokens as usize,
         None,
+        archived_before,
     )
     .await;
     let mut messages = vec![ChatMessage::text("system", system_content.to_string())];
@@ -250,11 +252,16 @@ async fn run_turn(setup: &Setup, root: &Path, history: &mut Vec<ChatMessage>) {
             model: &cfg.model,
             api_key: &cfg.api_key,
         });
+        let archived_before = cfg
+            .memory_enabled
+            .then(|| history.iter().rposition(|m| m.role == "user"))
+            .flatten();
         let trimmed = context::fit_to_budget(
             context::estimate_tokens(&system_content),
             history.clone(),
             cfg.max_context_tokens as usize,
             summarizer,
+            archived_before,
         )
         .await;
         if trimmed.condensed > 0 {
@@ -389,7 +396,15 @@ async fn run_turn(setup: &Setup, root: &Path, history: &mut Vec<ChatMessage>) {
         }
 
         let scratch = cfg.memory_enabled.then(memory::temp_dir);
-        match sandbox::run_sandboxed(root, shims, &cfg.granted_paths, scratch.as_deref(), &cmd) {
+        let trash_base = sandbox::resolve_trash_dir(cfg);
+        match sandbox::run_sandboxed(
+            root,
+            shims,
+            &cfg.granted_paths,
+            scratch.as_deref(),
+            &trash_base,
+            &cmd,
+        ) {
             Ok(outcome) => {
                 last_executed = Some(cmd.clone());
                 *executed_counts.entry(cmd.clone()).or_insert(0) += 1;
