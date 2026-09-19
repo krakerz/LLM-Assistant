@@ -266,6 +266,27 @@ pub fn record_blocked(cfg: &AppConfig, cmd: &str, why: &str) {
     append_entry(PROGRESS, &format!("- NOT run ({why}): {cmd}"));
 }
 
+/// Resets the current session's whole record in place -- intent, folder
+/// snapshot, in-progress steps, and every archived task's summary, plus the
+/// model's own `temp/` scratch. Backs the GUI's Clear/Unmount buttons: before
+/// this, both only reset the *visible* chat (the frontend's own history
+/// array), while this record -- fixed for the whole app process's lifetime
+/// by `CURRENT_SESSION`'s `OnceLock`, nothing else ever touched it -- kept
+/// accumulating regardless, so the very next message still got "here's what
+/// you asked before and what I did" context from a conversation the user
+/// had just wiped from view. Deliberately not gated on `cfg.memory_enabled`:
+/// clearing stale state is safe (and worth doing) even while memory is off,
+/// so nothing leaks back in if it's turned on again later without
+/// restarting the app.
+pub fn clear_session() {
+    let dir = session_dir();
+    let _ = fs::write(dir.join(INTENT), "");
+    let _ = fs::write(dir.join(ORIGINAL_STATE), "");
+    let _ = fs::write(dir.join(PROGRESS), "");
+    let _ = fs::write(dir.join(COMPLETED), "");
+    clear_temp();
+}
+
 /// The system-block addition, or `None` when off or empty.
 ///
 /// `memory_max_tokens` is the only thing capping this: it goes in the system
@@ -464,6 +485,38 @@ mod tests {
         assert!(block.contains("organize my downloads"), "{block}");
         assert!(block.contains("ran: mkdir -p A -> exit 0"), "{block}");
         assert!(block.contains("NOT run (the user denied it)"), "{block}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_session_wipes_everything_build_block_would_have_read() {
+        let dir = scratch("clear-session");
+        start_task(&cfg(0), None, "organize my downloads");
+        record_command(&cfg(0), "mkdir -p A", 0);
+        // A second task, so something real ends up in COMPLETED too, not
+        // just the still-open PROGRESS/INTENT of the first.
+        start_task(&cfg(0), None, "now delete the junk folder");
+        record_command(&cfg(0), "rm -rf junk", 0);
+        assert!(
+            build_block(&cfg(0)).is_some(),
+            "sanity check: should have a block before clearing"
+        );
+
+        clear_session();
+
+        assert!(
+            build_block(&cfg(0)).is_none(),
+            "expected nothing left to report right after clear_session"
+        );
+        // A fresh task afterward should read as the *first* thing that ever
+        // happened, not carry any trace of what came before the clear.
+        start_task(&cfg(0), None, "brand new task");
+        let block = build_block(&cfg(0)).expect("expected a block for the new task");
+        assert!(!block.contains("organize my downloads"), "{block}");
+        assert!(!block.contains("delete the junk folder"), "{block}");
+        assert!(!block.contains("mkdir -p A"), "{block}");
+        assert!(block.contains("brand new task"), "{block}");
 
         let _ = fs::remove_dir_all(&dir);
     }

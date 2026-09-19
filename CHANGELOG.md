@@ -12,9 +12,13 @@ All notable changes to this project are documented here. The format follows [Kee
 - The `--server` favicon is now a cropped close-up of just the character's face, not the full app icon shrunk down -- much more legible at actual favicon size
 - The GUI window now gets the new app icon at runtime, not just the packaged `.deb`/AppImage -- a dev binary run directly has no desktop entry for the window manager to read an icon from at all, so it fell back to a generic default
 - Dialog textareas (persona/ruleset editors, Settings' rules/system-prompt fields) now only resize vertically -- dragging one wider used to fight the dialog's own fixed width instead of ever actually changing it
+- Every dialog now has a viewport-safe max-height with its own scrollbar (previously only Settings did) -- a long model-generated explanation in the command-approval dialog had no cap at all, growing the dialog taller than the screen with the actual command and Approve/Deny buttons pushed out of reach
+- The command-approval dialog is now wider and percentage-driven (`min(90%, 720px)`) instead of stuck at the same fixed 560px every other small dialog uses, and the explanation box scrolls on its own (220px cap) so a long plan doesn't have to be scrolled past just to see the command
 
 ### Fixed
 - The state-update turn never actually saw the user's own message, only its own prior reply -- despite its own prompt already saying "given the exchange." Anything the user conveyed themselves (an action or intention wrapped in `//...//`, the same narration convention replies use) was invisible to it entirely. Now included, with explicit "you"/persona-name-means-the-persona, "I"/"me"-means-the-user attribution so it isn't misread backwards
+- A real session showed dispatch correctly load a needed ruleset (`web-search`) and then immediately answer "none" instead of actually using it, wasting the round trip. Dispatch now gets one extra, more forceful nudge specifically for that exact moment ("you just loaded this because it applies -- use it now") instead of accepting "none" right after a fresh load. Improves reliability but isn't a full fix -- live-tested against the same real session's model, which still sometimes skips or abandons a tool request even with the nudge; this is a small local model's own decision-making, not something the app can fully guarantee
+- File-ops mode's Clear and Unmount buttons only ever reset the visible chat -- the session record (what was asked, what ran) is fixed for the whole app process's lifetime and nothing reset it, so the next message after either still carried "here's what you asked before and what I did" context from a conversation that was just wiped from view. Both now also reset that record
 
 ## [1.17.0] — 2026-09-04
 
