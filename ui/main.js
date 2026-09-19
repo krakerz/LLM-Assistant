@@ -654,6 +654,16 @@ document.getElementById("clearChatBtn").addEventListener("click", async () => {
   history = [];
   resetApprovalFade();
   chatLog.innerHTML = "";
+  // Otherwise the session record (what was asked, what ran) survives a
+  // Clear untouched -- it's fixed for the whole app process's lifetime, not
+  // reset by anything the frontend does on its own -- so the very next
+  // message would still carry "here's what you asked before and what I
+  // did" context from the conversation that was just wiped from view.
+  try {
+    await invoke("clear_memory_session");
+  } catch (err) {
+    console.error("clear_memory_session failed:", err);
+  }
   logToFile("[system] --- chat cleared ---");
   if (rootPath.textContent && rootPath.textContent !== "No folder selected") {
     appendBubble("system", `Working in: ${rootPath.textContent}`);

@@ -464,6 +464,15 @@ details.bubble.thinking > .bubble.assistant {
   border-radius: 10px;
   padding: 18px;
   width: min(560px, 90vw);
+  /* Universal safety net -- no dialog's own content should ever be able to
+     push it taller than the viewport with no way to reach what scrolled
+     off (a long model-generated explanation in #confirmDialog did exactly
+     that: no scrollbar anywhere, so the top of the dialog -- and the actual
+     command plus the Approve/Deny buttons -- ended up unreachable). Was
+     only on #settingsDialog's own override before; every dialog needs the
+     same guarantee, not just the one that happened to hit it first. */
+  max-height: 85vh;
+  overflow-y: auto;
   font-size: var(--ui-font-size);
 }
 
@@ -490,6 +499,21 @@ details.bubble.thinking > .bubble.assistant {
   padding: 8px 12px;
   font-size: 13.5px;
   white-space: pre-wrap;
+  /* A model's own explanation can run to a full multi-step plan (a real
+     one seen: several numbered paragraphs) with nothing capping it before
+     -- scrolls in its own box now, same idea as .confirm-steps just below,
+     so the actual command and the Approve/Deny buttons stay reachable
+     without scrolling past a wall of reasoning first. */
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+/* Wider than the base dialog and percentage-driven rather than a low fixed
+   ceiling -- a proposed command (and the explanation above it) can run
+   long, and 560px meant most of the window's actual width went unused on
+   anything but a narrow one. */
+#confirmDialog .app-dialog-inner {
+  width: min(90%, 720px);
 }
 
 .confirm-context:empty {
@@ -540,11 +564,10 @@ details.bubble.thinking > .bubble.assistant {
 }
 
 /* Wider than the base dialog: labels here grew into full explanatory
-   sentences, and at 560px nearly every one wraps across nine or ten lines. */
+   sentences, and at 560px nearly every one wraps across nine or ten lines.
+   max-height/overflow-y come from the base .app-dialog-inner rule now. */
 #settingsDialog .app-dialog-inner {
   width: min(760px, 92vw);
-  max-height: 85vh;
-  overflow-y: auto;
 }
 
 /* Active tab is a full filled chip (accent-tinted background + accent

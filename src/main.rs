@@ -194,6 +194,11 @@ fn unmount_root(state: State<AppState>) -> Option<String> {
     if let Some(root) = &old {
         log::info!("unmount_root: cleared root {}", root.display());
     }
+    // Going back to chat-only shouldn't leave the just-unmounted folder's
+    // session record (what was asked, what ran) sitting around ready to
+    // leak into whatever's opened next -- see `memory::clear_session`'s doc
+    // comment.
+    memory::clear_session();
     old.map(|p| p.display().to_string())
 }
 
@@ -566,6 +571,14 @@ async fn send_message(
             Err(join_err.to_string())
         }
     }
+}
+
+/// Backs the "Clear" button -- see `memory::clear_session`'s doc comment
+/// for why this needs its own command rather than just relying on the
+/// frontend wiping its own chat history array.
+#[tauri::command]
+fn clear_memory_session() {
+    memory::clear_session();
 }
 
 /// A new top-level user message is this app's task boundary.
@@ -1415,6 +1428,7 @@ fn main() {
             send_message,
             stop_generation,
             start_memory_task,
+            clear_memory_session,
             record_blocked_command,
             append_chat_log,
             list_personas,
