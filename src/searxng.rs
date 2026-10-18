@@ -1,22 +1,13 @@
-//! Real web search via a self-hosted SearXNG instance, the same
-//! `` ```web-search``` `` pseudo-tool pattern the ComfyUI integration
-//! established for `` ```image-prompt``` ``: the dispatch pass (see
-//! `chat_turn`'s module doc comment) fires the fence, `search` here does
-//! the actual HTTP round-trip, and `chat_turn::run_search_answer_turn`
-//! feeds the real results back to the model for a real answer -- turn 1
-//! never has real information, only "let me check" (same reasoning as
-//! image generation's reaction turn).
+//! Real web search via a self-hosted SearXNG instance. `chat_director` decides
+//! when a search is needed, `search` here does the HTTP round-trip, and
+//! `chat_turn::web_search` feeds the real results back to the model for an
+//! answer grounded in what was found rather than a guess.
 //!
 //! Stored separately from `config.toml` (`<app-config-dir>/searxng.json`),
-//! same reasoning as `comfyui::ComfyUiConfig`.
-//!
-//! The `web-search` ruleset (renamed from `other-tools` once its role
-//! narrowed to specifically this) holds *content-policy* guidance only
-//! (what NOT to search for or return -- NSFW, politics, whatever the user
-//! wants filtered) -- the mechanical fence syntax and the actual request
-//! are both app-controlled, same reasoning as `comfyui::IMAGE_PROMPT_PROTOCOL`.
+//! same reasoning as `comfyui::ComfyUiConfig`. The `web-search` ruleset file
+//! holds only content-policy guidance for the answer (what not to return).
 
-use crate::paths::app_config_dir;
+use crate::paths::{app_config_dir, write_atomic};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -55,12 +46,15 @@ fn config_path() -> PathBuf {
 pub fn load_or_init() -> anyhow::Result<SearxngConfig> {
     let path = config_path();
     match std::fs::read_to_string(&path) {
-        Ok(text) => Ok(serde_json::from_str(&text)?),
-        Err(_) => {
+        Ok(text) => {
+            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let cfg = SearxngConfig::default();
             save(&cfg)?;
             Ok(cfg)
         }
+        Err(e) => Err(anyhow::anyhow!("{}: {e}", path.display())),
     }
 }
 
@@ -69,7 +63,12 @@ pub fn save(cfg: &SearxngConfig) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, serde_json::to_string_pretty(cfg)?)?;
+    // 0600: `api_key` lives in here.
+    write_atomic(
+        &path,
+        serde_json::to_string_pretty(cfg)?.as_bytes(),
+        Some(0o600),
+    )?;
     Ok(())
 }
 
@@ -142,17 +141,6 @@ pub async fn search(cfg: &SearxngConfig, query: &str) -> anyhow::Result<Vec<Sear
         .take(cfg.max_results.max(1) as usize)
         .collect())
 }
-
-/// The mechanical fence explanation, injected by
-/// `rules::build_dispatch_system_content` whenever `ruleset::WEB_SEARCH_RULESET_NAME`
-/// is loaded, regardless of that file's own content -- same reasoning as
-/// `comfyui::IMAGE_PROMPT_PROTOCOL`.
-pub const WEB_SEARCH_PROTOCOL: &str = "\
-Request a real web search with a fenced block on its own:\n\n\
-```web-search\nquery: what to search for\n```\n\n\
-This actually runs a search and the real results come back afterward, as a follow-up message -- \
-you have no way to know what it'll find from here, so don't guess or make up results yourself. If \
-nothing is configured yet, the app will say so plainly rather than silently doing nothing.";
 
 #[cfg(test)]
 mod tests {

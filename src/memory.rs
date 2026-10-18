@@ -1,18 +1,12 @@
-//! Per-session working record, injected into the system block each turn and
-//! living *outside* the trimmed history so it survives `context.rs`.
+//! Per-session working record, kept outside the trimmed history so it
+//! survives `context.rs`. The app writes everything in it (the user's words,
+//! a folder listing it read itself, the real outcome of every action); the
+//! model writes only `temp/`. A model-written progress note is the thing
+//! already caught reporting a reorganization that never happened.
 //!
-//! Solves a chain losing track of itself within one session: once early turns
-//! are trimmed, the model can't tell whether the `mkdir` it proposed twenty
-//! steps ago ever ran.
-//!
-//! **The app writes everything injected; the model writes only `temp/`.**
-//! That split is the whole design -- a model writing its own progress notes
-//! is the one already caught reporting a reorganization that never happened,
-//! and in a file that lie would outlive the transcript contradicting it.
-//!
-//! - `intent.md` -- the user's messages verbatim, not a paraphrase.
-//! - `original-state.md` -- folder listing read by the app at task start.
-//! - `progress.md` -- commands that ran, with real exit codes, plus denials.
+//! - `intent.md` -- the user's messages verbatim.
+//! - `original-state.md` -- folder listing, taken once per folder session.
+//! - `progress.md` -- actions this task, with real outcomes, plus denials.
 //! - `completed.md` -- previous tasks' ledgers.
 
 use crate::config::AppConfig;
@@ -26,7 +20,7 @@ use std::sync::OnceLock;
 /// Oldest deleted first, same as `chat_log::MAX_LOG_FILES`.
 const MAX_SESSIONS: usize = 5;
 
-/// Fixed at startup so every command invocation writes to the same session.
+/// Fixed at startup so every action writes to the same session.
 static CURRENT_SESSION: OnceLock<PathBuf> = OnceLock::new();
 
 const INTENT: &str = "intent.md";
@@ -34,6 +28,8 @@ const ORIGINAL_STATE: &str = "original-state.md";
 const PROGRESS: &str = "progress.md";
 const COMPLETED: &str = "completed.md";
 const TEMP_DIR: &str = "temp";
+/// Exists once this session's folder snapshot was taken.
+const SNAPSHOT_MARKER: &str = ".snapshot-taken";
 
 /// On-disk cap, separate from the injected block's token cap.
 const MAX_ENTRIES: usize = 200;
@@ -51,15 +47,19 @@ fn is_session_dir(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
-/// Timestamp-suffixed, so lexicographic order is chronological.
+/// `session-<timestamp>-<pid>`: lexicographic order is chronological, and the
+/// pid keeps two launches in the same second apart.
 pub fn init() -> anyhow::Result<PathBuf> {
     let root = memory_root();
     fs::create_dir_all(&root)?;
 
+    let mine = format!("-{}", std::process::id());
     let mut existing: Vec<PathBuf> = fs::read_dir(&root)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| is_session_dir(p))
+        .filter(|p| Some(p) != CURRENT_SESSION.get())
+        .filter(|p| !p.to_string_lossy().ends_with(&mine))
         .collect();
     existing.sort();
     while existing.len() >= MAX_SESSIONS {
@@ -68,8 +68,9 @@ pub fn init() -> anyhow::Result<PathBuf> {
     }
 
     let dir = root.join(format!(
-        "session-{}",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
+        "session-{}-{}",
+        chrono::Local::now().format("%Y%m%d-%H%M%S"),
+        std::process::id()
     ));
     fs::create_dir_all(dir.join(TEMP_DIR))?;
     let _ = CURRENT_SESSION.set(dir.clone());
@@ -139,17 +140,21 @@ fn write_entries(name: &str, entries: &[String]) {
     let _ = fs::write(path, format!("{}\n", entries.join("\n")));
 }
 
-/// Archives the last task, clears scratch, re-snapshots the folder. Triggered
-/// by the user speaking, not by the model declaring itself done -- that
-/// judgment is the one this record exists to not depend on.
+/// Archives the last task and records the new request. Triggered by the user
+/// speaking, not by the model declaring itself done. The folder snapshot is
+/// taken only for a session's first task, and `temp/` is kept: both outlive a
+/// single task.
 pub fn start_task(cfg: &AppConfig, root: Option<&Path>, message: &str) {
     if !cfg.memory_enabled {
         return;
     }
     archive_progress();
-    clear_temp();
     append_entry(INTENT, &format!("- {message}"));
-    snapshot_state(root);
+    let marker = session_dir().join(SNAPSHOT_MARKER);
+    if !marker.exists() {
+        snapshot_state(root);
+        let _ = fs::write(marker, "");
+    }
 }
 
 fn archive_progress() {
@@ -177,8 +182,7 @@ fn clear_temp() {
     let _ = fs::create_dir_all(&temp);
 }
 
-/// Directories never worth snapshotting: huge, machine-generated, and not
-/// what "what did this folder look like" means to anyone.
+/// Directories never worth snapshotting: huge and machine-generated.
 const SNAPSHOT_SKIP: &[&str] = &[
     ".temp-trash",
     ".git",
@@ -192,105 +196,96 @@ const SNAPSHOT_SKIP: &[&str] = &[
     ".cache",
 ];
 
-/// Bounds on the walk. Depth and count together keep it fast enough to stay
-/// on the calling thread -- a background thread would only add a race where
-/// the first turn reads a snapshot that isn't written yet.
 const SNAPSHOT_MAX_DEPTH: usize = 3;
 const SNAPSHOT_MAX_ENTRIES: usize = 150;
+const SNAPSHOT_TRUNCATED: &str = "- [...truncated, folder is larger than this snapshot]";
 
-fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<String>) {
-    if depth > SNAPSHOT_MAX_DEPTH || out.len() >= SNAPSHOT_MAX_ENTRIES {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut rows: Vec<(String, bool, PathBuf)> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if SNAPSHOT_SKIP.contains(&name.as_str()) {
-                return None;
+/// Breadth-first, so when the cap hits it cuts the deepest paths and every
+/// top-level entry survives. Symlinks are listed, never followed.
+fn walk(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut queue = std::collections::VecDeque::from([(root.to_path_buf(), String::new(), 1)]);
+    while let Some((dir, prefix, depth)) = queue.pop_front() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut rows: Vec<(String, bool, PathBuf)> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if SNAPSHOT_SKIP.contains(&name.as_str()) {
+                    return None;
+                }
+                let path = e.path();
+                let is_dir = fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
+                Some((name, is_dir, path))
+            })
+            .collect();
+        // Directories first, then alphabetical: the shape is what's being read.
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        for (name, is_dir, path) in rows {
+            if out.len() >= SNAPSHOT_MAX_ENTRIES {
+                out.push(SNAPSHOT_TRUNCATED.into());
+                return out;
             }
-            let path = e.path();
-            let is_dir = path.is_dir();
-            Some((name, is_dir, path))
-        })
-        .collect();
-    // Directories first, then alphabetical: the shape is what's being read.
-    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-
-    for (name, is_dir, path) in rows {
-        if out.len() >= SNAPSHOT_MAX_ENTRIES {
-            out.push("- [...truncated, folder is larger than this snapshot]".into());
-            return;
-        }
-        let rel = format!("{prefix}{name}");
-        out.push(format!("- {rel}{}", if is_dir { "/" } else { "" }));
-        if is_dir {
-            walk(&path, &format!("{rel}/"), depth + 1, out);
+            let rel = format!("{prefix}{name}");
+            out.push(format!("- {rel}{}", if is_dir { "/" } else { "" }));
+            if is_dir && depth < SNAPSHOT_MAX_DEPTH {
+                queue.push_back((path, format!("{rel}/"), depth + 1));
+            }
         }
     }
+    out
 }
 
-/// Read directly, not through the sandbox: a fact about the folder rather
-/// than the result of a command the model could have shaped, and it costs no
-/// turn. Recursive, because the top level alone doesn't answer "put it back
-/// how it was" -- observed: asked to revert a reorganization, the model had
-/// to grope for the original layout one failed `mv` at a time.
+/// Read directly, not through the sandbox: a fact about the folder, not the
+/// result of a command the model could have shaped, and it costs no turn.
 fn snapshot_state(root: Option<&Path>) {
     let path = session_dir().join(ORIGINAL_STATE);
     let Some(root) = root else {
         let _ = fs::write(path, "");
         return;
     };
-    let mut out = Vec::new();
-    walk(root, "", 1, &mut out);
+    let out = walk(root);
     let _ = fs::write(path, format!("{}\n", out.join("\n")));
 }
 
-/// Called with `run_command`'s own result, so it cannot disagree with it.
-pub fn record_command(cfg: &AppConfig, cmd: &str, exit_code: i32) {
+/// Called with the action's own outcome, so it cannot disagree with it.
+pub fn record_action(cfg: &AppConfig, description: &str, ok: bool) {
     if !cfg.memory_enabled {
         return;
     }
-    append_entry(PROGRESS, &format!("- ran: {cmd} -> exit {exit_code}"));
+    let outcome = if ok { "ok" } else { "FAILED" };
+    append_entry(PROGRESS, &format!("- {description} -> {outcome}"));
 }
 
 /// A denial, stop, or skipped step. Recorded as firmly as a success --
 /// "nothing happened" is what this app is worst at holding on to.
-pub fn record_blocked(cfg: &AppConfig, cmd: &str, why: &str) {
+pub fn record_blocked(cfg: &AppConfig, what: &str, why: &str) {
     if !cfg.memory_enabled {
         return;
     }
-    append_entry(PROGRESS, &format!("- NOT run ({why}): {cmd}"));
+    append_entry(PROGRESS, &format!("- NOT done ({why}): {what}"));
 }
 
-/// Resets the current session's whole record in place -- intent, folder
-/// snapshot, in-progress steps, and every archived task's summary, plus the
-/// model's own `temp/` scratch. Backs the GUI's Clear/Unmount buttons: before
-/// this, both only reset the *visible* chat (the frontend's own history
-/// array), while this record -- fixed for the whole app process's lifetime
-/// by `CURRENT_SESSION`'s `OnceLock`, nothing else ever touched it -- kept
-/// accumulating regardless, so the very next message still got "here's what
-/// you asked before and what I did" context from a conversation the user
-/// had just wiped from view. Deliberately not gated on `cfg.memory_enabled`:
-/// clearing stale state is safe (and worth doing) even while memory is off,
-/// so nothing leaks back in if it's turned on again later without
-/// restarting the app.
+/// Resets the session's whole record in place (intent, folder snapshot,
+/// progress, archive, and `temp/`). Backs the GUI's Clear/Unmount: wiping only
+/// the visible chat would let the next message inherit "what you asked before"
+/// from a conversation the user just cleared. Not gated on `memory_enabled`,
+/// so nothing leaks back in if it is switched on later.
 pub fn clear_session() {
     let dir = session_dir();
     let _ = fs::write(dir.join(INTENT), "");
     let _ = fs::write(dir.join(ORIGINAL_STATE), "");
     let _ = fs::write(dir.join(PROGRESS), "");
     let _ = fs::write(dir.join(COMPLETED), "");
+    let _ = fs::remove_file(dir.join(SNAPSHOT_MARKER));
     clear_temp();
 }
 
-/// The system-block addition, or `None` when off or empty.
-///
-/// `memory_max_tokens` is the only thing capping this: it goes in the system
-/// block, which `context.rs` never trims.
+/// The record block, or `None` when off or empty. The agent appends it to the
+/// last request message; `memory_max_tokens` is the only thing capping it.
 pub fn build_block(cfg: &AppConfig) -> Option<String> {
     if !cfg.memory_enabled {
         return None;
@@ -320,9 +315,15 @@ pub fn build_block(cfg: &AppConfig) -> Option<String> {
             progress.remove(0);
             cut.progress += 1;
         } else if state.len() > 1 {
-            // From the end: the walk is breadth-first-ish, so the deepest
-            // paths go before the top-level shape.
-            state.pop();
+            // From the end: the walk is breadth-first, so the deepest paths
+            // go first. A truncation marker stays last.
+            let n = state.len();
+            let idx = if n > 2 && state[n - 1] == SNAPSHOT_TRUNCATED {
+                n - 2
+            } else {
+                n - 1
+            };
+            state.remove(idx);
             cut.state += 1;
         } else if intent.len() > 1 {
             intent.remove(0);
@@ -356,7 +357,7 @@ fn render(
     let mut out = String::from(
         "# Session record (kept by the app, not by you)\n\n\
          Recorded from what actually happened: the user's own words, a listing the app read \
-         itself, and the real exit code of every command. You did not write this and it is not a \
+         itself, and the real outcome of every action. You did not write this and it is not a \
          summary, so prefer it over your own recollection and never contradict it. It survives \
          trimming of the turns above.\n",
     );
@@ -394,13 +395,13 @@ fn render(
         }
     }
 
-    out.push_str("\n## Commands run for the current task\n");
+    out.push_str("\n## Actions taken for the current task\n");
     if progress.is_empty() {
-        out.push_str("- nothing has run yet for this task\n");
+        out.push_str("- nothing has been done yet for this task\n");
     } else {
         if cut.progress > 0 {
             out.push_str(&format!(
-                "- [{} earlier command(s) dropped from this list to save space -- they did run]\n",
+                "- [{} earlier action(s) dropped from this list to save space -- they did happen]\n",
                 cut.progress
             ));
         }
@@ -425,26 +426,10 @@ fn render(
     }
 
     out.push_str(
-        "\nA command not listed here did NOT run, however sure you are that it did. Use this to \
+        "\nAn action not listed here did NOT happen, however sure you are that it did. Use this to \
          avoid redoing finished work and to resume a task interrupted partway.\n",
     );
     out
-}
-
-/// The note telling the model where its scratch directory is. Separate from
-/// `build_block` because it's about capability rather than record, and it's
-/// only true while a sandbox is actually available to write in.
-pub fn scratch_note(cfg: &AppConfig) -> Option<String> {
-    if !cfg.memory_enabled {
-        return None;
-    }
-    Some(format!(
-        "You have a scratch directory at {} that is writable and is cleared at the start of every \
-         new task. Use it for working notes or intermediate files instead of writing them into the \
-         user's folder. Nothing in it is read back into this prompt automatically -- read it with a \
-         command if you want it.",
-        temp_dir().display()
-    ))
 }
 
 #[cfg(test)]
@@ -478,13 +463,13 @@ mod tests {
     fn records_what_ran_and_what_did_not() {
         let dir = scratch("records");
         start_task(&cfg(0), None, "organize my downloads");
-        record_command(&cfg(0), "mkdir -p A", 0);
+        record_action(&cfg(0), "mkdir -p A", true);
         record_blocked(&cfg(0), "rm -rf .", "the user denied it");
 
         let block = build_block(&cfg(0)).expect("expected a memory block");
         assert!(block.contains("organize my downloads"), "{block}");
-        assert!(block.contains("ran: mkdir -p A -> exit 0"), "{block}");
-        assert!(block.contains("NOT run (the user denied it)"), "{block}");
+        assert!(block.contains("mkdir -p A -> ok"), "{block}");
+        assert!(block.contains("NOT done (the user denied it)"), "{block}");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -493,11 +478,11 @@ mod tests {
     fn clear_session_wipes_everything_build_block_would_have_read() {
         let dir = scratch("clear-session");
         start_task(&cfg(0), None, "organize my downloads");
-        record_command(&cfg(0), "mkdir -p A", 0);
+        record_action(&cfg(0), "mkdir -p A", true);
         // A second task, so something real ends up in COMPLETED too, not
         // just the still-open PROGRESS/INTENT of the first.
         start_task(&cfg(0), None, "now delete the junk folder");
-        record_command(&cfg(0), "rm -rf junk", 0);
+        record_action(&cfg(0), "rm -rf junk", true);
         assert!(
             build_block(&cfg(0)).is_some(),
             "sanity check: should have a block before clearing"
@@ -525,14 +510,13 @@ mod tests {
     fn disabled_produces_nothing_at_all() {
         let dir = scratch("disabled");
         start_task(&cfg(0), None, "do a thing");
-        record_command(&cfg(0), "ls", 0);
+        record_action(&cfg(0), "ls", true);
 
         let off = AppConfig {
             memory_enabled: false,
             ..Default::default()
         };
         assert!(build_block(&off).is_none());
-        assert!(scratch_note(&off).is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -548,7 +532,7 @@ mod tests {
             ..Default::default()
         };
         start_task(&off, None, "something private");
-        record_command(&off, "ls", 0);
+        record_action(&off, "ls", true);
         record_blocked(&off, "rm -rf .", "denied");
 
         let files: Vec<String> = fs::read_dir(session_dir())
@@ -569,9 +553,9 @@ mod tests {
     fn a_new_task_archives_the_previous_ledger_and_keeps_intent() {
         let dir = scratch("archive");
         start_task(&cfg(0), None, "first request");
-        record_command(&cfg(0), "mkdir A", 0);
+        record_action(&cfg(0), "mkdir A", true);
         start_task(&cfg(0), None, "second request");
-        record_command(&cfg(0), "mkdir B", 0);
+        record_action(&cfg(0), "mkdir B", true);
 
         let block = build_block(&cfg(0)).unwrap();
         // Both requests are still intent; only B is current progress.
@@ -593,11 +577,15 @@ mod tests {
         let dir = scratch("cap");
         start_task(&cfg(0), None, "first request");
         for i in 0..40 {
-            record_command(&cfg(0), &format!("mkdir folder-number-{i}"), 0);
+            record_action(&cfg(0), &format!("mkdir folder-number-{i}"), true);
         }
         start_task(&cfg(0), None, "second request");
         for i in 0..40 {
-            record_command(&cfg(0), &format!("mv file-number-{i} folder-number-{i}"), 0);
+            record_action(
+                &cfg(0),
+                &format!("mv file-number-{i} folder-number-{i}"),
+                true,
+            );
         }
 
         let uncapped = build_block(&cfg(0)).unwrap();
@@ -625,7 +613,7 @@ mod tests {
     fn an_impossible_budget_overshoots_out_loud() {
         let dir = scratch("impossible-cap");
         start_task(&cfg(0), None, "a request");
-        record_command(&cfg(0), "ls", 0);
+        record_action(&cfg(0), "ls", true);
 
         let block = build_block(&cfg(10)).unwrap();
         assert!(estimate_tokens(&block) > 10, "sanity: the floor is bigger");
@@ -638,12 +626,71 @@ mod tests {
     }
 
     #[test]
-    fn a_new_task_clears_scratch_but_keeps_the_directory() {
-        let dir = scratch("scratch-clear");
+    fn a_new_task_keeps_scratch_and_the_original_snapshot() {
+        let dir = scratch("keeps");
+        let root = dir.join("work");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("before.txt"), "x").unwrap();
+        start_task(&cfg(0), Some(&root), "first");
         fs::write(temp_dir().join("notes.txt"), "working").unwrap();
-        start_task(&cfg(0), None, "next thing");
-        assert!(temp_dir().is_dir(), "scratch dir must still exist");
-        assert!(!temp_dir().join("notes.txt").exists());
+        fs::write(root.join("after.txt"), "x").unwrap();
+
+        start_task(&cfg(0), Some(&root), "second");
+        assert!(temp_dir().join("notes.txt").exists());
+        let block = build_block(&cfg(0)).unwrap();
+        assert!(block.contains("before.txt"), "{block}");
+        assert!(
+            !block.contains("after.txt"),
+            "the snapshot is the folder as it was at the session's start: {block}"
+        );
+
+        clear_session();
+        start_task(&cfg(0), Some(&root), "third");
+        let block = build_block(&cfg(0)).unwrap();
+        assert!(
+            block.contains("after.txt"),
+            "re-taken after a clear: {block}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_snapshot_cap_keeps_every_top_level_entry_and_says_so_once() {
+        let dir = scratch("bfs");
+        let root = dir.join("work");
+        for i in 0..5 {
+            let deep = root.join(format!("d{i}/sub"));
+            fs::create_dir_all(&deep).unwrap();
+            for j in 0..40 {
+                fs::write(deep.join(format!("f{j}.txt")), "x").unwrap();
+            }
+        }
+        fs::write(root.join("zzz-last-top-level.txt"), "x").unwrap();
+
+        let out = walk(&root);
+        assert_eq!(out.len(), SNAPSHOT_MAX_ENTRIES + 1);
+        assert!(out.iter().any(|l| l == "- zzz-last-top-level.txt"));
+        assert!((0..5).all(|i| out.iter().any(|l| l == &format!("- d{i}/"))));
+        assert_eq!(out.iter().filter(|l| *l == SNAPSHOT_TRUNCATED).count(), 1);
+        assert_eq!(out.last().unwrap(), SNAPSHOT_TRUNCATED);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_snapshot_does_not_follow_symlinks() {
+        let dir = scratch("symlink");
+        let root = dir.join("work");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        let out = walk(&root);
+        assert!(out.iter().any(|l| l == "- link"), "{out:?}");
+        assert!(!out.iter().any(|l| l.contains("secret")), "{out:?}");
 
         let _ = fs::remove_dir_all(&dir);
     }

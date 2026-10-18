@@ -3,15 +3,15 @@
 //! WebUI's ComfyUI integration uses -- everything the workflow doesn't need
 //! touched (LoRA nodes, seed handling, the Image Saver node) stays exactly
 //! as the user set it up; only the handful of mapped fields get overwritten
-//! per-request from the model's ` ```image-prompt``` ` block (see
-//! `rules::extract_image_prompt_request`).
+//! per-request from the prompt the chat director's builder writes
+//! (`chat_director::build_image_prompt`).
 //!
 //! Stored separately from `config.toml` (`<app-config-dir>/comfyui.json`)
 //! since the pasted workflow JSON can be several KB -- same reasoning
 //! personas/rulesets live in their own files instead of being crammed into
 //! one config blob.
 
-use crate::paths::app_config_dir;
+use crate::paths::{app_config_dir, sanitize_filename, write_atomic};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -45,14 +45,9 @@ pub struct ComfyUiMapping {
     pub steps: String,
 }
 
-/// Whether turn 3 (`chat_turn::run_image_reaction_turn`) must always
-/// continue the conversation in character once a fresh image lands, gets to
-/// decide for itself -- based on how turn 1 just went and the session's own
-/// `state.md` -- whether continuing right now fits at all, or never runs at
-/// all. `Always` is the original, simpler behavior and stays the default so
-/// existing configs (missing this field entirely) don't change behavior.
-/// `Never` skips turn 3 entirely (no extra request at all), for anyone who
-/// just wants the image with no follow-up.
+/// What the character does once a generated image lands: always continue the
+/// conversation in character, decide for herself whether continuing fits
+/// (`Optional`), or say nothing (`Never`, no extra request at all).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ReactionMode {
@@ -79,6 +74,13 @@ pub struct ComfyUiConfig {
     pub filename_pattern: String,
     #[serde(default)]
     pub reaction_mode: ReactionMode,
+    /// Unload the chat model for the duration of an image generation
+    /// (`gpu::with_image_slot`), for running both on one GPU.
+    #[serde(default)]
+    pub unload_llm_during_generation: bool,
+    /// Ask ComfyUI to drop its models and cached memory after each image.
+    #[serde(default)]
+    pub free_after_generation: bool,
 }
 
 fn default_output_dir() -> String {
@@ -102,6 +104,8 @@ impl Default for ComfyUiConfig {
             output_dir: default_output_dir(),
             filename_pattern: default_filename_pattern(),
             reaction_mode: ReactionMode::default(),
+            unload_llm_during_generation: false,
+            free_after_generation: false,
         }
     }
 }
@@ -113,12 +117,15 @@ fn config_path() -> PathBuf {
 pub fn load_or_init() -> anyhow::Result<ComfyUiConfig> {
     let path = config_path();
     match std::fs::read_to_string(&path) {
-        Ok(text) => Ok(serde_json::from_str(&text)?),
-        Err(_) => {
+        Ok(text) => {
+            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let cfg = ComfyUiConfig::default();
             save(&cfg)?;
             Ok(cfg)
         }
+        Err(e) => Err(anyhow::anyhow!("{}: {e}", path.display())),
     }
 }
 
@@ -127,14 +134,13 @@ pub fn save(cfg: &ComfyUiConfig) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, serde_json::to_string_pretty(cfg)?)?;
+    write_atomic(&path, serde_json::to_string_pretty(cfg)?.as_bytes(), None)?;
     Ok(())
 }
 
-/// One image request's optional overrides, straight from a
-/// ` ```image-prompt``` ` block (see `rules::extract_image_prompt_request`).
-/// Anything left `None` keeps whatever value is already in the pasted
-/// workflow JSON for that mapped field.
+/// One image request's optional overrides. Anything left `None` keeps
+/// whatever value is already in the pasted workflow JSON for that mapped
+/// field.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImagePromptFields {
     #[serde(default)]
@@ -156,29 +162,6 @@ pub struct ImagePromptFields {
     #[serde(default)]
     pub steps: Option<i64>,
 }
-
-/// The `` ```image-prompt``` `` fence's actual mechanics -- injected by
-/// `rules::build_dispatch_system_content` whenever the
-/// `ruleset::IMAGE_GENERATION_RULESET_NAME` ruleset is loaded, independent
-/// of that ruleset file's own content. See `ruleset::IMAGE_GENERATION_RULESET_NAME`'s
-/// doc comment for why this lives in the app rather than the file.
-pub const IMAGE_PROMPT_PROTOCOL: &str = "\
-Request an image with a fenced block on its own, one `key: value` pair per line, only the fields \
-you actually want to set:
-
-```image-prompt
-positive: a description of what the image should contain
-negative: things to avoid, if the workflow uses a negative prompt
-```
-
-All fields are optional and independent -- anything you leave out keeps whatever value is already \
-configured in the app's saved ComfyUI workflow, it does not get cleared. The recognized keys are \
-`positive`, `negative`, `width`/`height` (whole numbers), `steps` (a whole number), `cfg` (a \
-number, may have a decimal), `sampler`/`scheduler` (must match a value the configured workflow \
-actually supports -- when unsure, omit and let the workflow's own default apply), and \
-`checkpoint` (a model/checkpoint filename). A field only does something if it's been mapped in \
-Settings' \"Image Gen\" tab -- an unmapped field here is just ignored, not an error. If nothing is \
-configured yet, the app will say so plainly rather than silently doing nothing.";
 
 /// Splits a `"node_id.input_key"` mapping string and writes `value` into
 /// `workflow[node_id]["inputs"][input_key]`. Errors (rather than silently
@@ -269,6 +252,9 @@ pub fn apply_mapping(
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const POLL_TIMEOUT: Duration = Duration::from_secs(300);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per HTTP request, not for the whole generation -- `POLL_TIMEOUT` bounds that.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One image downloaded from ComfyUI. `filename` is ComfyUI's own name
 /// (extension included) for the saved output -- `render_filename` reuses
@@ -276,6 +262,32 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(300);
 pub struct GeneratedImage {
     pub bytes: Vec<u8>,
     pub filename: String,
+}
+
+/// `POST {base_url}/free`: ComfyUI unloads its models and frees cached VRAM.
+/// Never fatal -- the image is already made.
+pub async fn free_memory(cfg: &ComfyUiConfig) {
+    let started = std::time::Instant::now();
+    let base_url = cfg.base_url.trim().trim_end_matches('/');
+    let res = async {
+        reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()?
+            .post(format!("{base_url}/free"))
+            .json(&serde_json::json!({ "unload_models": true, "free_memory": true }))
+            .send()
+            .await?
+            .error_for_status()
+    }
+    .await;
+    match res {
+        Ok(_) => log::info!(
+            "gpu: comfyui freed in {:.1}s",
+            started.elapsed().as_secs_f32()
+        ),
+        Err(e) => log::warn!("gpu: freeing ComfyUI's memory failed: {e}"),
+    }
 }
 
 /// POSTs the mapped workflow to `{base_url}/prompt`, polls
@@ -299,7 +311,10 @@ pub async fn generate_image(
     apply_mapping(&mut workflow, &cfg.mapping, fields)?;
 
     let base_url = cfg.base_url.trim().trim_end_matches('/');
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()?;
     let client_id = format!(
         "llm-assistant-{}-{}",
         std::process::id(),
@@ -338,6 +353,9 @@ pub async fn generate_image(
             if let Some(found) = find_first_image(entry) {
                 break found;
             }
+            if let Some(reason) = poll_failure(entry) {
+                anyhow::bail!("ComfyUI failed to generate the image: {reason}");
+            }
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     };
@@ -360,18 +378,23 @@ pub async fn generate_image(
     Ok(GeneratedImage { bytes, filename })
 }
 
-/// Scans a `/history/{prompt_id}` entry's `outputs` for the first node with
-/// an `images` array, returning `(subfolder, filename, type)` for the first
-/// image -- matches the single-image-output shape every ComfyUI workflow
-/// (including the sample one this feature was built against) produces.
+/// Scans a `/history/{prompt_id}` entry's `outputs` for an `images` array
+/// and returns `(subfolder, filename, type)` for its first image. Nodes
+/// without images (text/metadata outputs) are skipped, and a saved
+/// `type == "output"` image wins over a `temp` preview.
 fn find_first_image(history_entry: &serde_json::Value) -> Option<(String, String, String)> {
     let outputs = history_entry.get("outputs")?.as_object()?;
+    let mut temp_fallback = None;
     for node_output in outputs.values() {
-        let images = node_output.get("images")?.as_array()?;
+        let Some(images) = node_output.get("images").and_then(|v| v.as_array()) else {
+            continue;
+        };
         let Some(first) = images.first() else {
             continue;
         };
-        let filename = first.get("filename")?.as_str()?.to_string();
+        let Some(filename) = first.get("filename").and_then(|v| v.as_str()) else {
+            continue;
+        };
         let subfolder = first
             .get("subfolder")
             .and_then(|v| v.as_str())
@@ -382,7 +405,42 @@ fn find_first_image(history_entry: &serde_json::Value) -> Option<(String, String
             .and_then(|v| v.as_str())
             .unwrap_or("output")
             .to_string();
-        return Some((subfolder, filename, file_type));
+        let found = (subfolder, filename.to_string(), file_type);
+        if found.2 == "output" {
+            return Some(found);
+        }
+        temp_fallback.get_or_insert(found);
+    }
+    temp_fallback
+}
+
+/// Why a history entry that has no image will never get one: ComfyUI marked
+/// it `error` (its `execution_error` message is surfaced when present), or it
+/// finished without producing any image output.
+fn poll_failure(entry: &serde_json::Value) -> Option<String> {
+    let status = entry.get("status")?;
+    if status.get("status_str").and_then(|v| v.as_str()) == Some("error") {
+        let detail = status
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .and_then(|msgs| {
+                msgs.iter().find_map(|m| {
+                    let pair = m.as_array()?;
+                    if pair.first()?.as_str()? != "execution_error" {
+                        return None;
+                    }
+                    let data = pair.get(1)?;
+                    let msg = data.get("exception_message")?.as_str()?.trim();
+                    Some(match data.get("node_type").and_then(|v| v.as_str()) {
+                        Some(node) => format!("{msg} (node {node})"),
+                        None => msg.to_string(),
+                    })
+                })
+            });
+        return Some(detail.unwrap_or_else(|| "execution error (see ComfyUI's console)".into()));
+    }
+    if status.get("completed").and_then(|v| v.as_bool()) == Some(true) {
+        return Some("the workflow finished but produced no image output".into());
     }
     None
 }
@@ -406,42 +464,102 @@ fn url_component(s: &str) -> String {
 /// Renders `filename_pattern`'s two placeholders and appends `source_filename`'s
 /// own extension (ComfyUI's own choice for the format it actually saved in --
 /// assuming PNG would be wrong for a workflow configured to save JPEG/WEBP).
+/// The stem is sanitized: a pattern or id containing `/` must not escape the
+/// output dir.
 pub fn render_filename(pattern: &str, session_id: &str, source_filename: &str) -> String {
     let ext = Path::new(source_filename)
         .extension()
         .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty() && e.bytes().all(|b| b.is_ascii_alphanumeric()))
         .unwrap_or("png");
     let stem = pattern.replace("{session}", session_id).replace(
         "{timestamp}",
         &chrono::Local::now().format("%Y%m%d-%H%M%S").to_string(),
     );
-    format!("{stem}.{ext}")
+    format!("{}.{ext}", sanitize_filename(&stem, "image"))
 }
 
 /// Saves `image` under `cfg.output_dir`/`render_filename(...)`, creating the
-/// directory if it doesn't exist yet, and returns the full path.
+/// directory if it doesn't exist yet, and returns the full path. Never
+/// overwrites: a taken name gets `-2`, `-3`, ... before the extension
+/// (`create_new` makes the check-and-claim atomic).
 pub fn save_generated_image(
     cfg: &ComfyUiConfig,
     session_id: &str,
     image: &GeneratedImage,
 ) -> anyhow::Result<PathBuf> {
+    use std::io::Write;
     let dir = PathBuf::from(&cfg.output_dir);
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(render_filename(
-        &cfg.filename_pattern,
-        session_id,
-        &image.filename,
-    ));
-    std::fs::write(&path, &image.bytes)?;
-    Ok(path)
+    let name = render_filename(&cfg.filename_pattern, session_id, &image.filename);
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) => (stem.to_string(), ext.to_string()),
+        None => (name.clone(), "png".to_string()),
+    };
+    for n in 1.. {
+        let candidate = if n == 1 {
+            dir.join(&name)
+        } else {
+            dir.join(format!("{stem}-{n}.{ext}"))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                file.write_all(&image.bytes)?;
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    unreachable!()
+}
+
+const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
+
+/// The only paths a client may ask the app to read back or copy out: a real
+/// image file inside `output_dir`, after resolving symlinks and `..`.
+fn validate_under(path: &Path, root: &Path) -> anyhow::Result<PathBuf> {
+    let root = root
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("can't resolve the image output folder: {e}"))?;
+    let resolved = path
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("can't resolve image path: {e}"))?;
+    if !resolved.starts_with(&root) {
+        anyhow::bail!("image path is outside the configured output folder");
+    }
+    let is_image = resolved
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
+    if !resolved.is_file() || !is_image {
+        anyhow::bail!("not an image file");
+    }
+    Ok(resolved)
+}
+
+/// See `validate_under`; the root is the configured `ComfyUiConfig.output_dir`.
+pub fn validate_generated_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let cfg = load_or_init()?;
+    validate_under(path, Path::new(&cfg.output_dir))
 }
 
 /// Reads an already-saved generated image back as a `data:` URL, for
 /// redisplaying one when a chat session is reopened, or right after
 /// `save_generated_image` for the live turn that just created it.
 pub fn read_as_data_url(path: &Path) -> anyhow::Result<String> {
-    let bytes = std::fs::read(path)?;
-    let mime = match path.extension().and_then(|e| e.to_str()) {
+    let path = validate_generated_path(path)?;
+    let bytes = std::fs::read(&path)?;
+    let mime = match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("jpg") | Some("jpeg") => "image/jpeg",
         Some("webp") => "image/webp",
         Some("gif") => "image/gif",
@@ -569,6 +687,101 @@ mod tests {
     fn render_filename_falls_back_to_png_without_a_source_extension() {
         let name = render_filename("{session}", "sess", "no-extension-filename");
         assert!(name.ends_with(".png"));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("llm-assistant-comfy-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn validate_under_accepts_images_inside_and_rejects_the_rest() {
+        let dir = scratch("validate");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let ok = out.join("a.PNG");
+        std::fs::write(&ok, b"x").unwrap();
+        let txt = out.join("a.txt");
+        std::fs::write(&txt, b"x").unwrap();
+        let outside = dir.join("secret.png");
+        std::fs::write(&outside, b"x").unwrap();
+
+        assert!(validate_under(&ok, &out).is_ok());
+        assert!(validate_under(&txt, &out).is_err(), "non-image extension");
+        assert!(validate_under(&outside, &out).is_err(), "outside the dir");
+        let traversal = out.join("..").join("secret.png");
+        assert!(validate_under(&traversal, &out).is_err(), "traversal");
+        assert!(validate_under(&out.join("missing.png"), &out).is_err());
+        assert!(validate_under(&ok, &dir.join("no-such-root")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_the_same_name_twice_never_overwrites() {
+        let dir = scratch("collision");
+        let cfg = ComfyUiConfig {
+            output_dir: dir.display().to_string(),
+            filename_pattern: "{session}".to_string(),
+            ..Default::default()
+        };
+        let image = |b: &[u8]| GeneratedImage {
+            bytes: b.to_vec(),
+            filename: "ComfyUI_1.png".to_string(),
+        };
+        let a = save_generated_image(&cfg, "sess", &image(b"a")).unwrap();
+        let b = save_generated_image(&cfg, "sess", &image(b"b")).unwrap();
+        let c = save_generated_image(&cfg, "sess", &image(b"c")).unwrap();
+        assert_eq!(a.file_name().unwrap(), "sess.png");
+        assert_eq!(b.file_name().unwrap(), "sess-2.png");
+        assert_eq!(c.file_name().unwrap(), "sess-3.png");
+        assert_eq!(std::fs::read(&a).unwrap(), b"a");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_filename_cannot_escape_the_output_dir() {
+        let name = render_filename("{session}", "../../x", "a.png");
+        assert!(!name.contains('/') && !name.starts_with('.'), "{name}");
+        let name = render_filename(".hidden", "s", "a.png");
+        assert!(!name.starts_with('.'));
+    }
+
+    #[test]
+    fn find_first_image_skips_imageless_nodes_and_prefers_output() {
+        let entry = serde_json::json!({ "outputs": {
+            "1": { "text": ["hi"] },
+            "2": { "images": [] },
+            "3": { "images": [{ "filename": "t.png", "type": "temp" }] },
+            "4": { "images": [{ "filename": "o.png", "subfolder": "s", "type": "output" }] },
+        }});
+        assert_eq!(
+            find_first_image(&entry),
+            Some(("s".into(), "o.png".into(), "output".into()))
+        );
+        let temp_only = serde_json::json!({ "outputs": {
+            "1": { "images": [{ "filename": "t.png", "type": "temp" }] } }});
+        assert_eq!(find_first_image(&temp_only).unwrap().1, "t.png");
+        assert!(find_first_image(&serde_json::json!({ "outputs": {} })).is_none());
+    }
+
+    #[test]
+    fn poll_failure_reports_errors_and_empty_completions() {
+        let err = serde_json::json!({ "status": { "status_str": "error", "messages": [
+            ["execution_start", {}],
+            ["execution_error", { "exception_message": "Out of memory", "node_type": "KSampler" }]
+        ]}});
+        assert_eq!(poll_failure(&err).unwrap(), "Out of memory (node KSampler)");
+        let bare = serde_json::json!({ "status": { "status_str": "error" } });
+        assert!(poll_failure(&bare).is_some());
+        let empty = serde_json::json!({ "status": { "status_str": "success", "completed": true } });
+        assert!(poll_failure(&empty).is_some());
+        let running =
+            serde_json::json!({ "status": { "status_str": "success", "completed": false } });
+        assert!(poll_failure(&running).is_none());
+        assert!(poll_failure(&serde_json::json!({})).is_none());
     }
 
     #[test]

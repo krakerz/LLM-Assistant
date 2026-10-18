@@ -1,22 +1,16 @@
 //! `llm-assistant --persona-chat [--persona <name>] [--session <id>]` --
 //! chat mode's own terminal REPL, entirely separate from operation mode's
 //! `llm-assistant <folder> --chat` (`headless.rs`): no folder, no sandbox,
-//! no shell commands, ever. Same shared turn as the GUI's chat mode
-//! (`chat_turn::run_chat_turn`), so the two can't drift.
+//! no shell commands, ever. It drives the same library functions as the GUI
+//! (`chat_turn`), and history always lives on disk, so nothing here can
+//! overwrite what a follow-up wrote. A decided photo is rendered too; a
+//! terminal can't show it, so the saved path is printed.
 //!
 //! Also handles `--list-personas` and `--list-sessions`, small utility
 //! flags for finding out what to pass to `--persona`/`--session`.
-//!
-//! An `` ```image-prompt``` `` request actually runs here too (same
-//! `chat_turn::run_full_image_generation` the GUI uses) -- this is a
-//! terminal, so there's nowhere to render the result, but printing the
-//! saved file's path is enough to inspect it by hand afterward, and turned
-//! out to be a much faster way to debug dispatch-pass reliability than
-//! going back and forth through the GUI.
 
-use crate::llm::ChatMessage;
 use crate::rules::to_plain_text;
-use crate::{chat_session, chat_turn, comfyui, config, persona, searxng};
+use crate::{chat_session, chat_turn, config, persona};
 use std::io::{self, BufRead, Write};
 
 pub fn list_personas() {
@@ -90,7 +84,7 @@ async fn run_async(opts: Options) -> i32 {
             return 1;
         }
     };
-    let (meta, mut history) = match chat_session::load_session(&session_id) {
+    let (meta, history) = match chat_session::load_session(&session_id) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error loading session: {e}");
@@ -98,20 +92,16 @@ async fn run_async(opts: Options) -> i32 {
         }
     };
 
-    let persona_content = match &meta.persona {
-        Some(name) => persona::load_persona(name).ok(),
-        None => None,
-    };
-
     println!("llm-assistant -- persona chat: {}", meta.title);
     if let Some(p) = &meta.persona {
         println!("persona: {p}");
     }
     println!("session: {session_id}");
-    println!("Type a message and press Enter. Ctrl+D or Ctrl+C to exit.");
+    println!(
+        "Type a message (or /pic [hint] for a photo) and press Enter. Ctrl+D or Ctrl+C to exit."
+    );
 
-    // Replay scrollback when resuming an existing session -- otherwise the
-    // conversation would look like it started from nothing.
+    // Replay scrollback when resuming an existing session.
     for m in &history {
         match m.role.as_str() {
             "user" => println!("\n>>> {}", m.content),
@@ -120,19 +110,13 @@ async fn run_async(opts: Options) -> i32 {
                     println!("\n🧠 {}", to_plain_text(t));
                 }
                 println!("\n{}", to_plain_text(&m.content));
+                for path in &m.generated_images {
+                    println!("[image: {path}]");
+                }
             }
             _ => {}
         }
     }
-
-    // A `tokio::spawn`'d state-update task keeps running even after its
-    // `JoinHandle` is dropped -- but not if the *process itself* exits
-    // first, which this short-lived CLI does the moment stdin closes.
-    // Confirmed live: without this, state.json/state.md silently never got
-    // written at all if the update was still in flight at exit. Collected
-    // here and drained just before returning, rather than awaited inline
-    // per turn, so a slow state-update still doesn't delay the next prompt.
-    let mut pending_state_updates: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     let stdin = io::stdin();
     loop {
@@ -156,162 +140,100 @@ async fn run_async(opts: Options) -> i32 {
             continue;
         }
 
-        // Hot-reload, matching every other long-running entry point in this
-        // app: config.toml edited mid-session takes effect on the next turn.
+        // Hot-reload, matching every other long-running entry point: a
+        // config.toml edited mid-session takes effect on the next turn.
         if let Ok(reloaded) = config::load_or_init() {
             cfg = reloaded;
         }
+        run_turn(&cfg, &session_id, text).await;
+    }
 
-        history.push(ChatMessage::text("user", text));
-        match chat_turn::run_chat_turn(&cfg, &session_id, history.clone()).await {
-            Ok(turn1) => {
-                if let Some(rewritten) = &turn1.rewritten_history {
-                    history = rewritten.clone();
-                }
-                history.push(ChatMessage::text("assistant", turn1.reply.clone()));
+    // A short-lived process would otherwise exit before the background state
+    // update finishes, silently dropping it.
+    chat_turn::flush_background(&session_id).await;
+    0
+}
 
-                if let Some(thinking) = &turn1.thinking {
-                    println!("\n🧠 {}", to_plain_text(thinking));
-                }
-                println!("\n{}", to_plain_text(&turn1.reply));
+/// One user message, then its follow-ups, printed in order.
+async fn run_turn(cfg: &config::AppConfig, session_id: &str, text: &str) {
+    let input = chat_turn::SendInput {
+        session_id: session_id.to_string(),
+        text: text.to_string(),
+        images: Vec::new(),
+    };
+    let turn1 = match chat_turn::send_user_message(cfg, input, |_| {}).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("\nerror: {e}");
+            return;
+        }
+    };
+    if let Some(thinking) = &turn1.thinking {
+        println!("\n🧠 {}", to_plain_text(thinking));
+    }
+    println!("\n{}", to_plain_text(&turn1.reply));
+    if let Some(summary) = &turn1.summary {
+        eprintln!("\n[summarized old messages to fit the context budget]\n{summary}");
+    }
+    if turn1.dropped > 0 {
+        eprintln!(
+            "\n[dropped {} old message(s) to fit the context budget]",
+            turn1.dropped
+        );
+    }
+    if turn1.assistant_message_id.is_empty() {
+        return;
+    }
 
-                // Turn 2: dispatch + state-update, run only now that the
-                // reply above is already shown -- see chat_turn.rs's module
-                // doc comment. Blocking here is fine for a terminal (no
-                // "thinking" indicator to manage the way the GUI has).
-                let outcome = chat_turn::run_turn_followup(
-                    &cfg,
-                    &session_id,
-                    persona_content.as_deref(),
-                    text,
-                    &turn1.reply,
-                )
-                .await;
-                if let Some(handle) = outcome.state_update_handle {
-                    pending_state_updates.push(handle);
-                }
-                if let Some(name) = &outcome.ruleset_loaded {
-                    println!("\n[loaded ruleset: {name}]");
-                }
-                if let Some(err) = &outcome.ruleset_error {
-                    println!("\n[{err}]");
-                }
-                if let Some(fields) = &outcome.image_prompt_requested {
-                    println!("\n[requested an image -- generating now, this may take a while...]");
-                    match comfyui::load_or_init() {
-                        Ok(comfy_cfg) => {
-                            match chat_turn::run_full_image_generation(
-                                &cfg,
-                                &comfy_cfg,
-                                &session_id,
-                                fields,
-                            )
-                            .await
-                            {
-                                // Doesn't render -- this is a terminal, not a
-                                // GUI -- just the saved location, to check by
-                                // hand afterward.
-                                Ok(result) => {
-                                    println!("[image saved to: {}]", result.path.display());
-                                    if let Some(handle) = result.state_update_handle {
-                                        pending_state_updates.push(handle);
-                                    }
-                                    // A missing reaction isn't necessarily a
-                                    // failure -- `Never` never asks at all,
-                                    // and `Optional` can legitimately decide
-                                    // not to comment. Only `Always` coming
-                                    // back empty is an actual problem worth
-                                    // pointing at the log.
-                                    match (&result.reaction, comfy_cfg.reaction_mode) {
-                                        (Some(reaction), _) => {
-                                            println!("\n{}", to_plain_text(reaction))
-                                        }
-                                        (None, comfyui::ReactionMode::Never) => {}
-                                        (None, comfyui::ReactionMode::Optional) => {
-                                            println!(
-                                                "[no reaction this time -- the persona decided not to comment, or the request failed; see the log]"
-                                            );
-                                        }
-                                        (None, comfyui::ReactionMode::Always) => {
-                                            println!("[reaction turn failed -- see the log]");
-                                        }
-                                    }
-                                }
-                                Err(e) => println!("[image generation failed: {e}]"),
-                            }
-                        }
-                        Err(e) => println!("[could not load ComfyUI config: {e}]"),
-                    }
-                }
-                if let Some(query) = &outcome.web_search_requested {
-                    println!("\n[searching the web for: {query}...]");
-                    match searxng::load_or_init() {
-                        Ok(searxng_cfg) => {
-                            match chat_turn::run_full_web_search(
-                                &cfg,
-                                &searxng_cfg,
-                                &session_id,
-                                query,
-                            )
-                            .await
-                            {
-                                Ok(result) => {
-                                    // The search itself failing still gets
-                                    // an answer turn (an in-character
-                                    // apology) rather than short-circuiting
-                                    // -- see `search_error`'s doc comment.
-                                    match &result.search_error {
-                                        Some(err) => println!("[search itself failed: {err}]"),
-                                        None => {
-                                            println!("[{} result(s) found]", result.results.len());
-                                            for r in &result.results {
-                                                println!("  - {} ({})", r.title, r.url);
-                                            }
-                                        }
-                                    }
-                                    match &result.answer {
-                                        Some(answer) => println!("\n{}", to_plain_text(answer)),
-                                        None => println!("[answer turn failed -- see the log]"),
-                                    }
-                                    if let Some(handle) = result.state_update_handle {
-                                        pending_state_updates.push(handle);
-                                    }
-                                }
-                                Err(e) => println!("[web search failed: {e}]"),
-                            }
-                        }
-                        Err(e) => println!("[could not load SearXNG config: {e}]"),
-                    }
-                }
-                if let Some(summary) = &turn1.summary {
-                    eprintln!(
-                        "\n[summarized {} old message(s) to fit the context budget]\n{summary}",
-                        turn1.summarized
-                    );
-                }
-                if turn1.dropped > 0 {
-                    eprintln!(
-                        "\n[dropped {} old message(s) to fit the context budget]",
-                        turn1.dropped
-                    );
+    let plan = match chat_turn::run_followup(
+        cfg,
+        session_id,
+        &turn1.assistant_message_id,
+        turn1.photo_forced,
+        turn1.photo_hint.clone(),
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("\n[follow-up failed: {e}]");
+            return;
+        }
+    };
+
+    if let Some(image) = &plan.image {
+        println!("\n[sending a photo -- generating now, this may take a while...]");
+        match chat_turn::generate_image(
+            cfg,
+            session_id,
+            &turn1.assistant_message_id,
+            &image.fields,
+            None,
+        )
+        .await
+        {
+            Ok(result) => {
+                println!("[image saved to: {}]", result.image_path);
+                if let Some(reaction) = &result.reaction {
+                    println!("\n{}", to_plain_text(&reaction.text));
                 }
             }
-            Err(e) => {
-                // The failed turn's user message was already pushed onto
-                // `history` above -- pop it back off, or the next successful
-                // turn would silently resend a message the model never saw
-                // a reply persisted for.
-                history.pop();
-                eprintln!("\nerror: {e}");
-            }
+            Err(e) => println!("[image generation failed: {e}]"),
         }
     }
-
-    // See `pending_state_updates`'s doc comment at the top of this
-    // function -- without this drain, any state-update still in flight
-    // when stdin closes gets silently killed along with the process.
-    for handle in pending_state_updates {
-        let _ = handle.await;
+    if let Some(query) = &plan.search_query {
+        println!("\n[searching the web for: {query}...]");
+        match chat_turn::web_search(cfg, session_id, query).await {
+            Ok(result) => {
+                println!("[{}]", result.results_summary.replace('\n', "\n "));
+                match &result.answer {
+                    Some(answer) => println!("\n{}", to_plain_text(&answer.text)),
+                    None => println!(
+                        "[no answer -- the results didn't help, or the answer turn failed]"
+                    ),
+                }
+            }
+            Err(e) => println!("[web search failed: {e}]"),
+        }
     }
-    0
 }
