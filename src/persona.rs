@@ -4,12 +4,9 @@
 //! display name. No schema, so an existing character card can be dropped in
 //! as-is.
 //!
-//! Deleting one moves it into `personas/.trash/` (see `delete_persona`)
-//! rather than actually removing the file -- these are small, hand-authored
-//! character sheets that can represent real writing effort, and a real
-//! session lost one to a misclick with no way back. Not swept or capped the
-//! way `chat_log.rs`'s rotation is; small text files, no real reason to ever
-//! reclaim the space automatically.
+//! Deleting one moves it into `personas/.trash/` rather than removing the
+//! file: these are hand-authored and can represent real writing effort. The
+//! trash is never swept.
 
 use crate::paths::{app_config_dir, sanitize_filename};
 use std::fs;
@@ -20,9 +17,8 @@ pub struct PersonaSummary {
     pub name: String,
 }
 
-// `XDG_CONFIG_HOME` is a process-wide env var, not thread-local, so it can't
-// isolate parallel tests (see the identical fix and note in `memory.rs`).
-// This override lets each test point at its own scratch directory instead.
+// `XDG_CONFIG_HOME` is process-wide, so tests isolate through this
+// thread-local instead.
 #[cfg(test)]
 thread_local! {
     static TEST_PERSONAS_DIR: std::cell::RefCell<Option<PathBuf>> =
@@ -102,7 +98,7 @@ pub fn save_new_persona(name: &str, content: &str) -> anyhow::Result<PersonaSumm
         anyhow::bail!("a persona named \"{name}\" already exists");
     }
     fs::create_dir_all(personas_dir())?;
-    fs::write(&dest, content)?;
+    crate::paths::write_atomic(&dest, content.as_bytes(), None)?;
     Ok(PersonaSummary { name })
 }
 
@@ -148,7 +144,7 @@ pub fn update_persona(name: &str, content: &str) -> anyhow::Result<()> {
     if !dest.exists() {
         anyhow::bail!("no persona named \"{name}\" to edit");
     }
-    fs::write(&dest, content)?;
+    crate::paths::write_atomic(&dest, content.as_bytes(), None)?;
     Ok(())
 }
 

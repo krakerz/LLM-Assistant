@@ -1,37 +1,15 @@
-//! On-demand tool/capability rulesets: plain `.md` files under
-//! `<app-config-dir>/rulesets/`, freeform, same shape as `persona.rs`. The
-//! model is never handed their content by default -- only their names (and
-//! an optional one-line hint, see below), via
-//! `rules::build_ruleset_availability_note` -- and only pulls one in mid
-//! conversation by requesting it with a ` ```ruleset <name> ``` ` fence (see
-//! `rules::extract_ruleset_request`). Once loaded for a chat session it
-//! stays loaded for the rest of it (`chat_session::add_loaded_ruleset`).
+//! The two user-editable preference texts, plain `.md` files under
+//! `<app-config-dir>/rulesets/` (same shape as `persona.rs`):
 //!
-//! **The hint line**: a ruleset file's first line, if it starts with `> `,
-//! is shown alongside its name in the availability note as a concrete
-//! trigger condition (e.g. "use this when the user asks for an image").
-//! Added after a real session where a small local model, told only the bare
-//! names "image-generation-prompt"/"web-search", never once connected a
-//! direct "generate me a beach image" request to either -- an abstract
-//! "request one if a task calls for it" instruction asks the model to
-//! reason its way to relevance, which is exactly the kind of indirect
-//! inference small models are worst at; a concrete "if X, request Y" is the
-//! kind of instruction they follow far more reliably. Optional and
-//! convention-based (not a required frontmatter field) so an existing
-//! ruleset without one still works exactly as before, just without a hint.
+//! - `image-generation-prompt`: style rules for the image prompt builder,
+//!   passed to it verbatim (`chat_director::build_image_prompt`).
+//! - `web-search`: content policy for the search answer
+//!   (`chat_turn::web_search`).
 //!
-//! Two ruleset slots always exist -- `image-generation-prompt` (for the
-//! ComfyUI integration) and `web-search` (content-policy guidance for the
-//! `searxng` web search tool) -- both ship *blank*, and both have their hint
-//! guaranteed by the app regardless of file content (`IMAGE_GENERATION_HINT`/
-//! `WEB_SEARCH_HINT`), after the same real regression happened to each:
-//! a user filling the file in with their own real content, dropping the
-//! `> ...` hint line in the process, silently lost the trigger condition
-//! that made dispatch ever request it. The ruleset editor's "see an
-//! example" popup (`example_for`) shows what the file *could* contain
-//! without that ever being written to disk, so an empty file stays a
-//! deliberate, stable state rather than something to "fix" back to a
-//! template.
+//! Both are always used; there is no on-demand loading. They ship blank: the
+//! editor's "see an example" popup (`example_for`) shows what a file could
+//! contain without ever writing it to disk, so an empty file stays a
+//! deliberate state.
 
 use crate::paths::{app_config_dir, sanitize_filename};
 use std::fs;
@@ -40,20 +18,10 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RulesetSummary {
     pub name: String,
-    /// This ruleset file's own `> ...` first-line hint, if it has one --
-    /// see the module doc comment.
-    pub hint: Option<String>,
 }
 
-/// A ruleset file's first line, if it starts with `> ` -- see the module
-/// doc comment for why this exists.
-fn extract_hint(content: &str) -> Option<String> {
-    let first_line = content.lines().next()?.trim();
-    first_line.strip_prefix("> ").map(|s| s.trim().to_string())
-}
-
-// See the identical fix/note in `persona.rs`/`memory.rs`: `XDG_CONFIG_HOME`
-// is process-wide, not thread-local, so it can't isolate parallel tests.
+// `XDG_CONFIG_HOME` is process-wide, so tests isolate through this
+// thread-local instead.
 #[cfg(test)]
 thread_local! {
     static TEST_RULESETS_DIR: std::cell::RefCell<Option<PathBuf>> =
@@ -77,44 +45,10 @@ pub(crate) fn ruleset_path_for_test(name: &str) -> PathBuf {
     ruleset_path(name)
 }
 
-/// The one ruleset name the app treats as special -- `rules::build_dispatch_system_content`
-/// always injects `comfyui::IMAGE_PROMPT_PROTOCOL` (the actual
-/// `` ```image-prompt``` `` fence mechanics) alongside this ruleset's own
-/// content, regardless of what that content says. This keeps the mechanical
-/// part working even if the file is edited down to nothing but personal
-/// tag preferences -- which is exactly what happened in a real session:
-/// hand-editing this ruleset replaced the (then file-only) protocol
-/// explanation entirely, and image generation silently stopped working
-/// until that was noticed and fixed by hand. Making the protocol
-/// app-controlled instead of file-content-dependent means that class of
-/// bug can't recur.
+/// Style rules for the image prompt builder.
 pub const IMAGE_GENERATION_RULESET_NAME: &str = "image-generation-prompt";
 
-/// This ruleset's hint, guaranteed by `list_rulesets` regardless of what
-/// the file's own first line says -- same reasoning, and the same real
-/// failure mode, as `comfyui::IMAGE_PROMPT_PROTOCOL`: a user simplifying
-/// this ruleset down to just their own tag preferences (exactly the
-/// compact style this file is *meant* to support) silently deleted the
-/// `> ...` hint line along with everything else, and the model went right
-/// back to never requesting it -- the first bug this hint was added to fix
-/// in the first place. A hint this specific ruleset needs to always carry
-/// can't be allowed to depend on a file the user is explicitly encouraged
-/// to trim down.
-pub const IMAGE_GENERATION_HINT: &str = "Use this the moment the user asks to see, generate, \
-draw, create, or make an image, picture, photo, or drawing of anything -- request it \
-immediately, don't just describe what the image would look like in words instead.";
-
-/// This ruleset ships *blank* -- the hint (`IMAGE_GENERATION_HINT`) and
-/// fence mechanics (`comfyui::IMAGE_PROMPT_PROTOCOL`) are both guaranteed
-/// to the *model* regardless of what the file says, so there's nothing
-/// mechanical a fresh file actually needs to contain. Writing a real
-/// template into the file by default turned out to be the wrong call
-/// though: it reads as content the user is expected to keep and prune,
-/// when really it's just documentation of what's possible. This constant
-/// is that documentation instead -- served to the ruleset editor's "see an
-/// example" popup (`get_ruleset_example`) on request, never written to
-/// disk, so the file itself stays whatever the user actually typed, blank
-/// included.
+/// Shown by the editor's "see an example" popup; never written to disk.
 pub const IMAGE_GENERATION_EXAMPLE: &str = "\
 - Always start `positive` with: masterpiece, best quality
 - Always include in `negative`: bad hands, blurry, watermark
@@ -129,41 +63,10 @@ pub const IMAGE_GENERATION_EXAMPLE: &str = "\
 Any field left out keeps whatever value the workflow already has \
 configured for it -- only include the ones you actually want to fix.";
 
-/// The second (and, so far, last) ruleset name the app treats as special --
-/// same reasoning as `IMAGE_GENERATION_RULESET_NAME`. Renamed from
-/// "other-tools" once its role narrowed from "free-form notes about tools
-/// that aren't wired in" to specifically "the real web search tool's
-/// content-policy guidance" -- `searxng` made web search an
-/// actually-executed pseudo-tool rather than reference text, so the name
-/// should say what it's actually for. The URL/API key/result count live in
-/// Settings' "Web Search" tab (`searxng::SearxngConfig`), not this file, and
-/// the fence mechanics (`searxng::WEB_SEARCH_PROTOCOL`) are app-guaranteed
-/// the same way `comfyui::IMAGE_PROMPT_PROTOCOL` is. This file's only job
-/// now is what a search should never return -- NSFW results, political
-/// topics, whatever the user wants filtered.
+/// Content policy for the search answer: what a search should never return.
 pub const WEB_SEARCH_RULESET_NAME: &str = "web-search";
 
-/// Guaranteed by `list_rulesets` regardless of file content -- see
-/// `WEB_SEARCH_RULESET_NAME`'s doc comment. The direct phrasing examples were
-/// added after a real session: the user, mid-roleplay, asked "can you find
-/// me an info for X?" and the dispatch pass answered "none" -- the model
-/// stayed in character and had the persona narrate "let me check my
-/// information base" instead of actually requesting a search, exactly the
-/// failure this hint now calls out by name rather than leaving to inference.
-pub const WEB_SEARCH_HINT: &str = "Use this the moment the user asks something that needs \
-current or real-world information you don't already know -- news, prices, who/what/when \
-questions, anything you'd otherwise have to guess at. This includes direct phrasing like \
-\"find me some info/information on X\", \"look up X\", \"search for X\", or \"can you check X \
-for me\" -- treat these exactly like a real search request, even if they interrupt an unrelated \
-topic or come mid-roleplay. Request a real web search immediately rather than answering from \
-memory, making something up, or -- the easy mistake here -- just having the persona narrate \
-\"let me look that up\" in character without actually requesting one.";
-
-/// Reference-only, shown by the ruleset editor's "see an example" popup --
-/// never written to disk. See `IMAGE_GENERATION_EXAMPLE`'s doc comment for
-/// why: the mechanics are guaranteed by the app regardless of what this
-/// file says, so there's nothing mechanical left for the seed to restate --
-/// this is purely content-policy guidance now, so the example shows that.
+/// See `IMAGE_GENERATION_EXAMPLE`.
 pub const WEB_SEARCH_EXAMPLE: &str = "\
 - Never return NSFW content in a search result or summary, even if the search itself turns some up
 - Don't search for or discuss political topics -- decline and steer the conversation elsewhere instead
@@ -207,23 +110,7 @@ pub fn list_rulesets() -> anyhow::Result<Vec<RulesetSummary>> {
     names.sort();
     Ok(names
         .into_iter()
-        .map(|name| {
-            // Both built-in rulesets always get their guaranteed hint,
-            // regardless of what their file says -- see
-            // `IMAGE_GENERATION_HINT`'s and `WEB_SEARCH_HINT`'s doc
-            // comments for why this can't be allowed to depend on file
-            // content the way an arbitrary user-created ruleset's hint does.
-            let hint = if name == IMAGE_GENERATION_RULESET_NAME {
-                Some(IMAGE_GENERATION_HINT.to_string())
-            } else if name == WEB_SEARCH_RULESET_NAME {
-                Some(WEB_SEARCH_HINT.to_string())
-            } else {
-                fs::read_to_string(ruleset_path(&name))
-                    .ok()
-                    .and_then(|content| extract_hint(&content))
-            };
-            RulesetSummary { name, hint }
-        })
+        .map(|name| RulesetSummary { name })
         .collect())
 }
 
@@ -240,7 +127,7 @@ pub fn update_ruleset(name: &str, content: &str) -> anyhow::Result<()> {
     if !dest.exists() {
         anyhow::bail!("no ruleset named \"{name}\" to edit");
     }
-    fs::write(&dest, content)?;
+    crate::paths::write_atomic(&dest, content.as_bytes(), None)?;
     Ok(())
 }
 
@@ -273,53 +160,8 @@ mod tests {
                 "web-search".to_string()
             ]
         );
-        // Blank by default -- see `IMAGE_GENERATION_EXAMPLE`'s doc comment
-        // for why this one isn't pre-filled with a template.
+        // Blank by default; the example popup documents what a file could hold.
         assert_eq!(load_ruleset("image-generation-prompt").unwrap(), "");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn list_rulesets_extracts_each_seeds_hint() {
-        let dir = scratch("hints");
-        let summaries = list_rulesets().unwrap();
-        let image_gen = summaries
-            .iter()
-            .find(|r| r.name == "image-generation-prompt")
-            .unwrap();
-        assert!(
-            image_gen.hint.as_deref().unwrap().contains("image"),
-            "{:?}",
-            image_gen.hint
-        );
-        let web_search = summaries.iter().find(|r| r.name == "web-search").unwrap();
-        assert!(
-            web_search.hint.as_deref().unwrap().contains("search"),
-            "{:?}",
-            web_search.hint
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn list_rulesets_keeps_the_image_generation_hint_even_if_the_file_loses_it() {
-        // The exact real-world regression: a user simplifying this ruleset
-        // down to just their own tag preferences (no `> ...` first line at
-        // all) must not lose the hint that makes the model request it in
-        // the first place.
-        let dir = scratch("hint-survives-edit");
-        list_rulesets().unwrap(); // seeds it first
-        update_ruleset(
-            IMAGE_GENERATION_RULESET_NAME,
-            "- always use positive with: some tag\n- always use negative with: some other tag\n",
-        )
-        .unwrap();
-        let summaries = list_rulesets().unwrap();
-        let image_gen = summaries
-            .iter()
-            .find(|r| r.name == IMAGE_GENERATION_RULESET_NAME)
-            .unwrap();
-        assert_eq!(image_gen.hint.as_deref(), Some(IMAGE_GENERATION_HINT));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -334,37 +176,6 @@ mod tests {
             Some(WEB_SEARCH_EXAMPLE)
         );
         assert_eq!(example_for("some-made-up-name"), None);
-    }
-
-    #[test]
-    fn list_rulesets_keeps_the_web_search_hint_even_if_the_file_loses_it() {
-        // The exact real-world regression, a second time: replacing this
-        // one's content with real content-policy guidance (dropping the
-        // `> ...` first line along with it) must not lose the hint that
-        // makes the model request it in the first place.
-        let dir = scratch("web-search-hint-survives-edit");
-        list_rulesets().unwrap(); // seeds it first
-        update_ruleset(WEB_SEARCH_RULESET_NAME, "Never return NSFW results").unwrap();
-        let summaries = list_rulesets().unwrap();
-        let web_search = summaries
-            .iter()
-            .find(|r| r.name == WEB_SEARCH_RULESET_NAME)
-            .unwrap();
-        assert_eq!(web_search.hint.as_deref(), Some(WEB_SEARCH_HINT));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn extract_hint_is_none_without_the_blockquote_prefix() {
-        assert_eq!(extract_hint("# Just a heading\nsome text"), None);
-    }
-
-    #[test]
-    fn extract_hint_reads_the_first_line() {
-        assert_eq!(
-            extract_hint("> use this for X\n# heading"),
-            Some("use this for X".to_string())
-        );
     }
 
     #[test]

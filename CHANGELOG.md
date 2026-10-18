@@ -4,6 +4,59 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [2.0.0] — 2026-10-18
+
+### Added
+- File operations now work through real tools (list, read, search, find, write, edit, move, delete, make folder, run command) instead of shell commands only
+- Edits and overwrites are shown as a diff before you approve them, and every changed file is backed up to the trash
+- An append mode for adding to the end of a file
+- A "Changed files" summary at the end of each file-ops task, recorded by the app itself
+- Native tool calling for models that support it, with automatic fallback to a text format for models that don't
+- Running commands can be stopped, and each one has a time limit (Settings → File Operations)
+- The character now decides on her own when to send a photo, based on the conversation and her persona card (a selfie-loving persona sends them often, a shy one only when asked)
+- `/pic [hint]` and a camera button to ask for a photo directly
+- "Let the character send photos on her own" setting in Settings → Chat
+- Stop button for chat replies
+- Option to unload the chat model while ComfyUI generates an image and free ComfyUI's memory afterwards, for running both on one GPU (only applies when both are on the same machine)
+- `--version`/`-v`
+- `--server`: logout, a login lockout after repeated failures, and an `allowed_hosts` list in `server.json`
+- Long chats recall relevant earlier messages automatically, using keyword search plus an optional embedding model
+- Recall can search every chat with the same persona (Settings → Chat)
+
+### Changed
+- File-ops mode refuses to overwrite a file the model hasn't read first, and questions a rewrite that would drop most of a file before asking you
+- The file-ops loop runs in the app backend, shared by the GUI and the terminal modes
+- `--chat` (file-ops terminal mode) asks before running anything that needs approval
+- Chat history is kept by the app itself, so switching chats or sending while an image generates no longer mixes up messages
+- Chat replies use the common roleplay style: *actions*, "speech" and (thoughts), shown as separate blocks; older chats still display as before
+- Web search is decided the same way as photos, and a search that turns out not to help is dropped quietly
+- The character's state now always tracks her outfit, location, activity and mood
+- The two ruleset files are now plain "Image style rules" and "Search answer policy" texts
+- Unmodified default rule files are upgraded to the new defaults
+- Icons use the Lucide set
+- Unknown command-line options are now an error instead of being sent as a message
+- A config file with only some keys set now loads, with defaults for the rest
+
+### Removed
+- The ruleset-request step that chat used before generating an image or searching
+
+### Fixed
+- Photo, search and state checks work with thinking models (reasoning is turned off for those short checks)
+- Long file-ops tasks no longer lose the current request when the conversation is trimmed
+- Commands inside a reasoning model's hidden thinking are no longer run
+- `tail -f` or a huge file no longer freezes the app; command output is capped
+- Writing a file that contains code blocks no longer truncates it
+- ComfyUI errors are reported right away instead of after a 5-minute timeout
+- Generated images no longer overwrite each other when two finish in the same second
+- Replies with empty content from some servers no longer fail the turn
+- A stalled LLM server no longer hangs the app forever
+
+### Security
+- `--server` no longer lets a client read arbitrary files or delete directories through crafted image paths or session ids
+- `--server` no longer accepts file-ops settings (granted paths, auto-approve) or reveals the API key
+- `--server` refuses to start on a non-local address without a password, and a malformed `server.json` is an error instead of disabling login
+- Sandbox: shims and read-only grants can no longer be made writable by opening a parent folder; opening `/`, your home folder or the app's own folders is refused
+
 ## [1.18.0] — 2026-09-04
 
 ### Changed

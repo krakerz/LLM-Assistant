@@ -1,154 +1,113 @@
 # LLM Assistant
 
-A desktop app for talking to a local LLM two ways: sandboxed file operations
-in a folder you choose, or a persona/roleplay chat mode with no folder at
-all. Chat mode can also run headless as a small web server, so you can leave
-it running and reach it from a browser.
+A Linux desktop app for working with a small local LLM two ways: a sandboxed file assistant confined to one folder, and a persona chat that can send pictures when the moment calls for it.
 
-Point it at any OpenAI-compatible endpoint (LM Studio, Ollama, ...) and go.
-File-ops mode has no fixed tool-call schema -- the model proposes a shell
-command when it wants to do something, and the app decides whether to run it
-automatically or ask you first.
+## Description
 
-## Why sandboxed, not just "trust the model"
+Small local models (1–4B, run through LM Studio, Ollama or any OpenAI-compatible server) are unreliable at following formats and easy to talk into mistakes. This app does the heavy lifting itself so they stay useful:
 
-Letting an LLM run arbitrary shell commands is risky by default. Instead of
-guessing from the command *text* whether it's safe (unreliable -- see
-[`bwrap(1)`](https://github.com/containers/bubblewrap)), this app makes
-"outside the folder" structurally impossible:
-
-- Commands run inside a [`bubblewrap`](https://github.com/containers/bubblewrap)
-  sandbox that can only see the selected folder plus any paths you've
-  explicitly granted -- nothing else -- with a fully cleared environment too.
-- Read-only commands (`ls`, `cat`, `grep`, `find`, `uname`, ...) run
-  immediately; anything else -- writes, deletes, pipes/redirects -- shows you
-  the raw command plus the model's explanation and waits for your approval.
-- Deletions aren't permanent: `rm` inside the sandbox moves targets into
-  a configurable trash location outside the working folder instead of deleting them.
-- `sudo`/`su`/`doas`/`pkexec` are blocked outright -- shown as a command to
-  run yourself, not a prompt that would just fail.
+- **File operations.** The model gets a small set of tools (list, read, search, find, write, edit, move, delete, run a command) instead of a raw shell. The app checks every path against the folder you opened, shows a diff before any change, backs up whatever it overwrites or deletes, and reports which files actually changed. It doesn't rely on the model's word for that. Shell commands still run when needed, inside a [`bubblewrap`](https://github.com/containers/bubblewrap) sandbox that can only see the folder and the paths you granted.
+- **Persona chat.** You write a character as a plain `.md` file and chat with her across as many saved conversations as you like. After each reply, the app decides whether she sends a photo, rendered through your own [ComfyUI](https://github.com/comfyanonymous/ComfyUI) workflow. It also decides whether the question needs a web search through your [SearXNG](https://github.com/searxng/searxng). The decision comes from short checks the model answers about the conversation and her character card. The app then verifies each answer, so a photo-happy persona sends pictures often, a shy one only when asked, and a hallucinated reason never triggers anything.
 
 ## Features
 
-- **Sandboxed execution** -- see above.
-- **Two chat surfaces** -- File Operations (above) and a separate
-  **Chat mode**: no folder, no commands, just a persona (a freeform `.md`
-  character sheet you write or import) and as many independent, permanently
-  kept conversations as you want. A persona can track whatever it wants to
-  persist for the whole conversation -- RPG-style stats are the common case.
-  Deleting a persona moves it into `personas/.trash/` rather than actually
-  removing it, the same "nothing is really gone" guarantee as file-ops
-  mode's sandbox.
-- **Serve chat mode over the web** -- `llm-assistant --server` leaves chat
-  mode running headless behind a small, optionally password-protected HTTP
-  server, sharing the same config and sessions as the desktop app -- see
-  "Serving chat mode over the web" below.
-- **Image & document attachment in chat mode** -- attach an image for a
-  vision-capable model, or a text/code file to fold into the message.
-  Settings' "Test vision support" sends a real test image to confirm the
-  model can actually see, since most servers don't expose that as metadata.
-- **Shows a model's own reasoning** -- a `<think>` block renders collapsed
-  under "Thinking" (off by default; doesn't change whether the model
-  reasons, just whether you see it).
-- **Works with or without a folder open** -- chat as a plain assistant, or
-  select a folder to enable file/command access.
-- **Automatic follow-through** -- after a command runs, the assistant
-  responds to the result instead of leaving raw output as the last message;
-  intermediate steps collapse into "Thinking" so long chains don't clutter
-  the log.
-- **Granted paths** -- give the assistant read (or read-write) access to
-  specific folders outside the working directory, with an optional note on
-  *why*, and a recursive vs. top-level-only toggle.
-- **Configurable safety rails** -- how many automatic steps can chain before
-  it waits for you, which programs auto-approve, and the full "working
-  rules" are all editable in Settings, kept separate from your system prompt
-  so tweaking one can't silently break the other.
-- **CLI modes** -- preload a folder, run one scripted turn headlessly, or
-  chat in the terminal (`ollama run`-styled). Chat mode has its own terminal
-  REPL too (`--persona-chat`) and the headless web server above (`--server`)
-  -- see Command line below.
-- **Debug logging** -- `logs/app.log` plus a plain-text mirror of each GUI
-  chat-mode conversation (`logs/chat-*.log`, one per launch, up to 5 kept,
-  thinking steps included) for troubleshooting without expanding anything
-  in the UI.
+- **Folder-confined tools.** Paths outside the folder, symlinks that escape it, and the app's own config folder are refused. Granted paths can be read-only or read-write.
+- **Changes are previewed and backed up.** Edits and overwrites show a diff in the approval dialog. Anything overwritten, moved over or deleted goes to a trash folder outside the working folder. The model must read a file before it may change it.
+- **Approval only where it matters.** Reading, listing and searching run immediately. Changes and non-read-only commands wait for you. "Always allow" for a program, and a fade-out after repeated approvals, cut down on prompts.
+- **Commands can be stopped and time out.** Output is capped, so `tail -f` or a huge file can't freeze the app.
+- **Works with any model.** It uses native tool calling when the model supports it, and otherwise falls back automatically to a simple text format.
+- **Situational photos in chat.** She can send one when you ask in any wording, when she says she's sending one, or when her card says she loves selfies and something visual happens. `/pic [hint]` or the camera button always asks directly.
+- **One GPU for both.** Optionally unloads the chat model (LM Studio, Ollama) while ComfyUI generates, when both run on the same machine, and frees ComfyUI's memory afterwards.
+- **Web search in chat.** Questions about weather, news, prices and other real-world facts are looked up through SearXNG and answered in character.
+- **Persona state.** Her outfit, location, activity and mood, plus any stats her card defines, are tracked across the conversation and feed the image prompt.
+- **Roleplay formatting.** Replies use the common style, *actions*, "speech" and (thoughts), and each is shown as its own styled block. The narration toggle hides actions.
+- **Chat recall.** In a long chat, older messages that no longer fit the model's context are found again automatically (keyword search, plus an optional embedding model) and shown to it with the next message. Optionally searches every chat with the same persona.
+- **Attachments.** Images for vision models, text and code files folded into the message.
+- **Serve chat over the web.** `--server` runs chat mode headless behind a password-protected HTTP server, sharing the desktop app's sessions.
+- **Terminal modes.** One-shot and interactive file-ops runs, plus a persona chat REPL.
 
-## Requirements
+## Installation
 
-Linux only for now -- the sandbox is built on `bubblewrap`, which relies on
-Linux namespaces with no equivalent on Windows/macOS yet. `--server` mode
-never touches the sandbox (chat mode only), but still needs the same build
-below since it's the same binary.
+Download the `.deb` or AppImage from the [releases page](../../releases).
 
-- `bubblewrap` (`bwrap`)
-- `webkit2gtk-4.1` and `gtk3` (Tauri's runtime dependencies)
-- A local OpenAI-compatible LLM server -- [LM Studio](https://lmstudio.ai/)
-  or [Ollama](https://ollama.com/) both work
+- The `.deb` pulls in `bubblewrap` automatically.
+- For the AppImage, install it yourself: `sudo apt install bubblewrap`, or your distro's equivalent.
 
-## Building
+You also need a local OpenAI-compatible LLM server. [LM Studio](https://lmstudio.ai/) and [Ollama](https://ollama.com/) both work. For photos, add a [ComfyUI](https://github.com/comfyanonymous/ComfyUI) instance; for web search, add a [SearXNG](https://github.com/searxng/searxng) instance with JSON output enabled.
+
+## Building from source
+
+Prerequisites: Rust (stable), `bubblewrap`, and the `webkit2gtk-4.1` and `gtk3` development packages.
 
 ```sh
 cargo install tauri-cli --version "^2"     # once
-cargo tauri build --bundles deb,appimage   # produces the binary + a .deb and an AppImage
+cargo tauri build --bundles deb,appimage   # binary + .deb + AppImage
+cargo tauri dev                            # run with live reload
+cargo test                                 # sandbox tests skip, loudly, where bwrap can't run
 ```
 
-`cargo tauri dev` runs it with live reload. See `CLAUDE.md` for the full
-command reference, including a known `--bundles appimage` caveat (`strip`
-choking on newer binutils' `.relr.dyn` sections; prefix `NO_STRIP=true`) on
-very new/rolling-release distros.
+On very new or rolling-release distros, `--bundles appimage` can fail inside `linuxdeploy`'s `strip`. Prefix the command with `NO_STRIP=true`.
 
 ## Usage
 
-1. Launch the app and click **Select Folder…** (or pass a folder on the
-   command line, see below).
-2. Chat normally. When the assistant wants to run something, it shows a
-   one-line explanation plus the command; read-only commands just run,
-   anything else waits for **Run it** in the approval dialog.
-3. Use the gear icon to configure the endpoint, model, API key, temperature,
-   how many automatic steps it can chain, granted paths, and the working
-   rules/system prompt.
-4. **Unmount** drops the folder and goes back to chat-only mode; **Clear**
-   resets the conversation.
+**File operations**
 
-### Serving chat mode over the web
+1. Click the folder icon, then **Select Folder…**, or pass a folder on the command line.
+2. Ask for something, for example "tidy my notes into folders by topic" or "add eggs to the shopping list".
+3. Reads run on their own. Approve or deny each change in the dialog; it shows the diff or the command.
+4. When the task ends, a card lists every file that was created, changed, moved or deleted.
 
-`llm-assistant --server --bind 0.0.0.0 --port 9333`, then open
-`http://<that machine>:9333` in a browser -- same chat mode, config, and
-sessions as the desktop app, no file-ops. Set `password` in `server.json`
-first unless the network is trusted; empty serves openly with a warning.
+**Chat**
 
-### Command line
+1. Pick or create a persona, then start a new chat.
+2. Talk normally. Use `/pic` (optionally `/pic at the beach`) or the camera button to ask for a photo directly.
+3. Set up ComfyUI and SearXNG under Settings. The puzzle icon edits your image style rules and search answer policy.
+
+**Command line**
 
 ```sh
-llm-assistant                                          # launch the GUI
-llm-assistant /path/to/folder                          # launch the GUI with a folder preloaded
-llm-assistant /path/to/folder "message"                # headless: run one turn, print the result, exit
-llm-assistant /path/to/folder --chat                   # interactive terminal chat, Ctrl+D/Ctrl+C to exit
-llm-assistant --persona-chat [--persona <name>]        # persona chat mode's own REPL, no folder/sandbox
-llm-assistant --persona-chat --session <id>            # resume an existing session
-llm-assistant --list-personas / --list-sessions        # list personas / existing sessions with their IDs
-llm-assistant --server [--bind <addr>] [--port <n>]    # serve chat mode over HTTP, 127.0.0.1:9333 by default
-llm-assistant --help
+llm-assistant                                        # GUI
+llm-assistant /path/to/folder                        # GUI with a folder open
+llm-assistant /path/to/folder "message"              # one file-ops task, printed, then exit
+llm-assistant /path/to/folder --chat                 # interactive file-ops in the terminal
+llm-assistant --persona-chat [--persona <name>] [--session <id>]
+llm-assistant --list-personas | --list-sessions
+llm-assistant --server [--bind <addr>] [--port <n>]  # chat over HTTP, 127.0.0.1:9333 by default
+llm-assistant --help | --version
 ```
 
-## Configuration
+**Configuration** lives in `$XDG_CONFIG_HOME/llm-assistant` (usually `~/.config/llm-assistant/`):
 
-Everything lives under `$XDG_CONFIG_HOME/llm-assistant` (usually
-`~/.config/llm-assistant/`):
+| File | Purpose |
+| --- | --- |
+| `config.toml` | Endpoint, model, API key, temperatures, granted paths, limits. Missing keys take defaults. |
+| `rules.md`, `command-rules.md` | Advisory rules for file operations, editable in Settings |
+| `personas/*.md` | Character cards |
+| `rulesets/*.md` | Image style rules and search answer policy |
+| `comfyui.json`, `searxng.json` | Image generation and web search settings |
+| `server.json` | `--server` bind, port, `password`, `allowed_hosts` |
+| `logs/` | `app.log` plus a mirror of each GUI session |
 
-| File               | Purpose                                                       |
-| ------------------ | -------------------------------------------------------------|
-| `config.toml`      | Endpoint, model, API key, temperature, granted paths, etc.   |
-| `rules.md`         | The working rules read before your system prompt every turn. |
-| `server.json`      | `--server`'s bind/port defaults and password (empty = open). |
-| `logs/app.log`     | Internal debug log.                                           |
-| `logs/chat-*.log`  | Mirror of a GUI chat-mode conversation, one per launch, 5 kept. |
+## FAQ
 
-## License
+**Why Linux only?**
+The sandbox is built on Linux namespaces through `bubblewrap`. Windows and macOS have no equivalent to port it to.
 
-[MIT](LICENSE)
+**The model never uses the tools / never sends a photo.**
+Very small models (about 1B) often ignore formats. Try a 3B+ instruct model, or one with native tool support (Qwen 2.5/3, Llama 3.x).
+
+- File operations show a notice when the app falls back to the text format.
+- In chat, `/pic` and the camera button always work, whatever the model decides.
+- `logs/app.log` records every photo and search decision.
+
+**Can `--server` be reached from other machines?**
+Yes, with `--bind 0.0.0.0`. It then refuses to start without a `password` in `server.json`. For a reverse proxy or a hostname, list the name in `allowed_hosts`. File operations are never exposed over HTTP.
+
+**Where do deleted files go?**
+Into the trash folder set in Settings → File Operations (by default under the app's config folder). There's one folder per task or command.
 
 ---
 
-Built with the help of AI (Claude Code), and tested against a local LM
-Studio setup running `gemma-4-e2b-it-uncensored-max`. Behavior with other
-local models may vary.
+### Notes
+
+Built and maintained with the help of AI.

@@ -12,7 +12,7 @@
        password set -- replaces relying on the browser's own native Basic
        Auth prompt, which some browsers render inconsistently (or not at
        all) for a plain top-level page load. See `ensureAuthenticated` in
-       main.js. -->
+       the ui scripts. -->
   <div id="loginOverlay" class="app-dialog-overlay" hidden>
    <div class="app-dialog-inner">
     <h3>Password required</h3>
@@ -28,14 +28,15 @@
 
   <div class="app-shell">
     <nav id="modeRail" class="mode-rail">
-      <button id="chatModeBtn" class="mode-rail-btn active" title="Chat">💬</button>
-      <button id="fileOpsModeBtn" class="mode-rail-btn" title="File Operations">📁</button>
+      <!-- Lucide icons throughout (https://lucide.dev, ISC; see LUCIDE-LICENSE.txt) -->
+      <button id="chatModeBtn" class="mode-rail-btn active" title="Chat" aria-label="Chat"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/></svg></button>
+      <button id="fileOpsModeBtn" class="mode-rail-btn" title="File Operations" aria-label="File Operations"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg></button>
       <div class="mode-rail-bottom">
-        <button id="settingsBtn" class="mode-rail-btn" title="Settings">⚙</button>
+        <button id="settingsBtn" class="mode-rail-btn" title="Settings" aria-label="Settings"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button>
         <!-- Just the version, never the build hash -- that's what actually
              made this text wide enough to stretch the whole rail. The full
              "vX.Y.Z (hash)" shows in Settings instead, for both the desktop
-             app and the browser. Populated by main.js; starts hidden so
+             app and the browser. Populated by the ui scripts; starts hidden so
              there's nothing to see before that first happens. -->
         <span id="railVersion" class="rail-version" hidden></span>
       </div>
@@ -54,7 +55,7 @@
       <main id="chatLog" class="chat-log"></main>
 
       <form id="chatForm" class="chat-form">
-        <textarea id="chatInput" placeholder="Chat, or select a folder above to let it act on files… (Enter to send, Shift+Enter for newline)" rows="2"></textarea>
+        <textarea id="chatInput" placeholder="Select a folder above, then ask me to look at or change files in it… (Enter to send, Shift+Enter for newline)" rows="2"></textarea>
         <button type="submit" id="sendBtn">Send</button>
       </form>
     </div>
@@ -64,18 +65,18 @@
         <select id="personaSelect" title="Persona">
           <option value="">(no persona)</option>
         </select>
-        <button id="importPersonaBtn" class="icon-btn" title="Import a persona .md file">⬆</button>
+        <button id="importPersonaBtn" class="icon-btn" title="Import a persona .md file" aria-label="Import a persona .md file"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg></button>
         <input type="file" id="importPersonaFileInput" accept=".md" hidden />
-        <button id="newPersonaBtn" class="icon-btn" title="Write a new persona">＋</button>
-        <button id="editPersonaBtn" class="icon-btn" title="Edit the selected persona">✎</button>
-        <button id="deletePersonaBtn" class="icon-btn" title="Delete the selected persona">🗑</button>
-        <button id="editRulesetsBtn" class="icon-btn" title="Edit rulesets (tool/capability reference docs the model can request mid-chat)">🧩</button>
+        <button id="newPersonaBtn" class="icon-btn" title="Write a new persona" aria-label="Write a new persona"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg></button>
+        <button id="editPersonaBtn" class="icon-btn" title="Edit the selected persona" aria-label="Edit the selected persona"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/></svg></button>
+        <button id="deletePersonaBtn" class="icon-btn" title="Delete the selected persona" aria-label="Delete the selected persona"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg></button>
+        <button id="editRulesetsBtn" class="icon-btn" title="Edit image style rules and the search answer policy" aria-label="Edit rulesets"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15.39 4.39a1 1 0 0 0 1.68-.474 2.5 2.5 0 1 1 3.014 3.015 1 1 0 0 0-.474 1.68l1.683 1.682a2.414 2.414 0 0 1 0 3.414L19.61 15.39a1 1 0 0 1-1.68-.474 2.5 2.5 0 1 0-3.014 3.015 1 1 0 0 1 .474 1.68l-1.683 1.682a2.414 2.414 0 0 1-3.414 0L8.61 19.61a1 1 0 0 0-1.68.474 2.5 2.5 0 1 1-3.014-3.015 1 1 0 0 0 .474-1.68l-1.683-1.682a2.414 2.414 0 0 1 0-3.414L4.39 8.61a1 1 0 0 1 1.68.474 2.5 2.5 0 1 0 3.014-3.015 1 1 0 0 1-.474-1.68l1.683-1.682a2.414 2.414 0 0 1 3.414 0z"/></svg></button>
         <span class="root-path" style="flex:1"></span>
         <span id="visionStatusIndicator" class="vision-status" title="Vision support: not yet checked"></span>
-        <button id="viewStateBtn" class="icon-btn" title="View this chat's remembered state">🗒️</button>
+        <button id="viewStateBtn" class="icon-btn" title="View this chat's remembered state" aria-label="View remembered state"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 6h4"/><path d="M2 10h4"/><path d="M2 14h4"/><path d="M2 18h4"/><rect width="16" height="20" x="4" y="2" rx="2"/><path d="M9.5 8h5"/><path d="M9.5 12H16"/><path d="M9.5 16H14"/></svg></button>
         <button id="toggleNarrationBtn" class="icon-btn narration-toggle-btn" title="Hide narration text">
-          <span class="narration-icon">🎭</span>
-          <span class="narration-badge" aria-hidden="true">🚫</span>
+          <span class="narration-icon narration-on"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg></span>
+          <span class="narration-icon narration-off"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49"/><path d="M14.084 14.158a3 3 0 0 1-4.242-4.242"/><path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143"/><path d="m2 2 20 20"/></svg></span>
         </button>
         <button id="chatFontDecBtn" title="Decrease font size" class="icon-btn">A−</button>
         <button id="chatFontIncBtn" title="Increase font size" class="icon-btn">A+</button>
@@ -83,7 +84,7 @@
 
       <div class="chat-mode-body">
         <aside id="chatSessionPane" class="chat-session-pane">
-          <button id="newChatSessionBtn" class="new-session-btn">＋ New chat</button>
+          <button id="newChatSessionBtn" class="new-session-btn"><svg class="lucide-icon" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg> New chat</button>
           <ul id="chatSessionList" class="chat-session-list"></ul>
         </aside>
 
@@ -98,8 +99,12 @@
               multiple
               hidden
             />
-            <button type="button" id="chatAttachBtn" class="icon-btn" title="Attach an image or text file">📎</button>
-            <textarea id="chatModeInput" placeholder="Message… (Enter to send, Shift+Enter for newline; use // action // for narration)" rows="2"></textarea>
+            <button type="button" id="chatAttachBtn" class="icon-btn" title="Attach an image or text file" aria-label="Attach an image or text file"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.234 20.252 21 12.3"/><path d="m16 6-8.414 8.586a2 2 0 0 0 0 2.828 2 2 0 0 0 2.828 0l8.414-8.586a4 4 0 0 0 0-5.656 4 4 0 0 0-5.656 0l-8.415 8.585a6 6 0 1 0 8.486 8.486"/></svg></button>
+            <!-- Lucide "camera" icon (https://lucide.dev, ISC; see LUCIDE-LICENSE.txt) -->
+            <button type="button" id="chatCameraBtn" class="icon-btn" title="Ask for a photo (same as typing /pic)" disabled>
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>
+            </button>
+            <textarea id="chatModeInput" placeholder="Message… (Enter to send, Shift+Enter for newline; /pic [hint] asks for a photo; use *action* for narration)" rows="2"></textarea>
             <button type="submit" id="chatModeSendBtn">Send</button>
           </form>
         </div>
@@ -140,17 +145,13 @@
    <div class="app-dialog-inner">
     <h3>Edit rulesets</h3>
     <p class="explain">
-      Reference docs the model isn't shown by default -- only their names -- and pulls into the
-      conversation itself when a task needs one. Edit them here instead of the files directly.
+      Two preference texts the app passes to the model: <b>Image style rules</b> shape the prompts
+      written for the image generator, and the <b>Search answer policy</b> guides how the
+      character answers from web results. Edit them here instead of the files directly.
     </p>
     <label>Ruleset
       <select id="rulesetSelect"></select>
     </label>
-    <p id="rulesetExampleRow" class="explain" hidden>
-      Blank by default, so nothing extra applies until you type something --
-      <button id="rulesetExampleBtn" type="button" class="link-btn">see an example</button>
-      of what you can put here.
-    </p>
     <label>Content
       <textarea id="rulesetContent" rows="12"></textarea>
     </label>
@@ -161,23 +162,12 @@
    </div>
   </div>
 
-  <div id="rulesetExampleDialog" class="app-dialog-overlay" hidden>
-   <div class="app-dialog-inner">
-    <h3>Example</h3>
-    <p class="explain">Reference only -- this isn't written to your ruleset. Copy whatever's useful into it yourself.</p>
-    <pre id="rulesetExampleContent" class="ruleset-example-pre"></pre>
-    <div class="dialog-actions">
-      <button id="rulesetExampleCloseBtn" type="button">Close</button>
-    </div>
-   </div>
-  </div>
-
   <!-- A plain overlay, not a <dialog>, on purpose -- see the CSS comment on
        `.image-preview-overlay` for why. -->
   <div id="imagePreviewOverlay" class="image-preview-overlay" hidden>
     <div class="image-preview-inner">
       <img id="imagePreviewImg" alt="Generated image preview" />
-      <button id="imagePreviewCloseBtn" type="button" class="image-preview-close" title="Close">✕</button>
+      <button id="imagePreviewCloseBtn" type="button" class="image-preview-close" title="Close" aria-label="Close"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
       <button id="imagePreviewSaveBtn" type="button" class="image-preview-save" title="Save…">
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z" />
@@ -211,22 +201,23 @@
 
   <div id="confirmDialog" class="app-dialog-overlay" hidden>
    <div class="app-dialog-inner">
-    <h3>This command needs your approval</h3>
+    <h3>This needs your approval</h3>
     <p id="confirmContext" class="confirm-context"></p>
     <p class="explain">
-      It writes, deletes, or otherwise changes something — or uses pipes/redirects the sandbox can't
-      pre-check. Deletes inside the folder are soft: they move to an app-managed trash location
-      outside the folder, not gone for good. Review the command(s) below.
+      It changes something, or is a shell command the sandbox can't pre-check. Changes inside the
+      folder are backed up first: overwritten, edited and deleted files go to an app-managed trash
+      location outside the folder, not gone for good. Review it below.
     </p>
     <pre id="confirmCmd" class="cmd"></pre>
-    <ul id="confirmSteps" class="confirm-steps" hidden></ul>
+    <pre id="confirmDiff" class="cmd diff" hidden></pre>
     <label class="checkbox-row" id="alwaysAllowRow">
       <input type="checkbox" id="alwaysAllow" />
-      Always allow this program without asking (only applies while the command has no pipes/redirects)
+      Always allow this without asking (a shell program only while its command has no pipes/redirects;
+      a file change only for this kind of change, for the rest of this session)
     </label>
     <div class="dialog-actions">
       <button id="denyBtn" type="button">Deny</button>
-      <button id="approveBtn" type="button">Run it</button>
+      <button id="approveBtn" type="button">Approve</button>
     </div>
    </div>
   </div>
@@ -298,6 +289,28 @@
         turn it arrived on. Has no effect if the option above is off.
       </label>
       <label class="checkbox-row">
+        <input type="checkbox" id="cfgChatAutoImages" />
+        Let the character send photos on her own (otherwise only on /pic or the camera button)
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="cfgChatRecall" />
+        Recall earlier messages from long chats
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="cfgChatRecallPersona" />
+        Search all chats with the same persona
+      </label>
+      <label>Embedding model (optional)
+        <input id="cfgChatRecallEmbeddingModel" type="text" autocomplete="off" spellcheck="false" />
+      </label>
+      <p class="explain">
+        e.g. text-embedding-nomic-embed-text-v1.5 in LM Studio or nomic-embed-text in Ollama, served
+        by the same server as the chat model. Empty = keyword search only.
+      </p>
+      <label>Max recalled snippets
+        <input id="cfgChatRecallMax" type="number" step="1" min="1" max="10" />
+      </label>
+      <label class="checkbox-row">
         <input type="checkbox" id="cfgChatStreamReplies" />
         Show a reply's own text growing live as it's generated, instead of only once it's complete.
         On by default. Turning this off doesn't stop reasoning from streaming into the "Thinking"
@@ -310,21 +323,31 @@
       <label>Temperature
         <input id="cfgTemperature" type="number" step="0.1" min="0" max="2" />
       </label>
-      <label>Max automatic steps (propose → run → respond cycles before it waits for you; 0 = no limit)
+      <label>Max automatic steps (model turns in one task before it pauses and waits for you; 0 = no limit)
         <input id="cfgMaxAutoSteps" type="number" step="1" min="0" />
+      </label>
+      <label>Tool calling (how the model asks for tools: "auto" tries the model's native tool calls and falls back to plain-text blocks for the session if it doesn't support them; use "text" for small models that fumble native calls)
+        <select id="cfgToolCalling">
+          <option value="auto">auto</option>
+          <option value="native">native only</option>
+          <option value="text">text blocks only</option>
+        </select>
+      </label>
+      <label>Shell command time limit, in seconds (a command still running after this is killed)
+        <input id="cfgCommandTimeoutSecs" type="number" step="10" min="1" />
       </label>
       <label class="checkbox-row">
         <input type="checkbox" id="cfgMemoryEnabled" />
-        Keep a session record (what you asked for, what the folder looked like, every command that
-        actually ran and its exit code) and include it with each turn. Written by the app from what
+        Keep a session record (what you asked for, what the folder looked like, every action
+        that actually happened and its real outcome) and include it with each step. Written by the app from what
         it observed, never by the model, and it survives context trimming — so a long chain can
         still tell what has and hasn't been done. Turn it off for a model with a small context
         window, where the tokens are better spent on the conversation.
       </label>
-      <label>Token budget for that record (recommended: about a tenth of the context budget in General — 800 suits the default 8000; 0 = no cap). It goes in the system block, which is never trimmed, so this is the only thing keeping it in check.
+      <label>Token budget for that record (recommended: about a tenth of the context budget in General — 800 suits the default 8000; 0 = no cap). It is sent with every step and never trimmed, so this is the only thing keeping it in check.
         <input id="cfgMemoryMaxTokens" type="number" step="100" min="0" />
       </label>
-      <label>Stop asking about a program after this many approvals in one session (0 = always ask). Session-only — it resets when the app closes or you open a different folder, and one denial puts that program back to always-asking.
+      <label>Stop asking about a shell program, or a kind of file change, after this many approvals in one session (0 = always ask). Session-only — it resets when the app closes or you open a different folder, and one denial puts it back to always-asking.
         <input id="cfgConfirmFadeAfter" type="number" step="1" min="0" />
       </label>
       <label>System prompt (persona/focus -- behavior and command mechanics live in the Rules/Commands tabs below)
@@ -334,9 +357,9 @@
 
       <label class="checkbox-row">
         <input type="checkbox" id="cfgDisableBuiltinRules" />
-        Disable built-in General/Command rules -- send only my system prompt, plus the minimal
-        command-format protocol the app needs to work (the Rules/Commands tabs below are still saved,
-        just not sent while this is checked)
+        Disable built-in General/Command rules -- send only my system prompt, plus the app's own
+        tool instructions (the Rules/Commands tabs below are still saved, just not sent while this
+        is checked)
       </label>
 
       <fieldset>
@@ -389,7 +412,7 @@
     <div class="tab-panel" data-panel="imagegen" hidden>
       <p class="explain">
         Generates images through ComfyUI when the model requests one (see the
-        "image-generation-prompt" ruleset, the 🧩 button in chat mode). Paste an API-format workflow
+        "image-generation-prompt" ruleset, the puzzle-piece button in chat mode). Paste an API-format workflow
         exported from ComfyUI's own UI, then map the fields below to wherever they live in it --
         everything else in the workflow stays exactly as you set it up there.
       </p>
@@ -452,6 +475,15 @@
           <option value="none">Say nothing -- just show the image</option>
         </select>
       </label>
+      <label class="checkbox-row">
+        <input id="cfgComfyUnloadLlm" type="checkbox" />
+        Unload the chat model while generating images
+      </label>
+      <label class="checkbox-row">
+        <input id="cfgComfyFreeAfter" type="checkbox" />
+        Free ComfyUI's memory after each image
+      </label>
+      <p class="explain">For running the chat model and ComfyUI on the same GPU. Only takes effect when both are on the same machine (detected automatically); a chat model on another computer is left loaded. Works with LM Studio and Ollama; the chat model is reloaded with the same settings afterwards.</p>
 
       <div class="path-row">
         <button id="testComfyGenerationBtn" type="button">Test image generation</button>
@@ -463,7 +495,7 @@
     <div class="tab-panel" data-panel="websearch" hidden>
       <p class="explain">
         Runs a real web search through a self-hosted SearXNG instance when the model requests one
-        (see the "web-search" ruleset, the 🧩 button in chat mode -- it holds only content-policy
+        (see the "web-search" ruleset, the puzzle-piece button in chat mode -- it holds only content-policy
         guidance, like what not to search for or return; the search mechanics themselves are
         handled here).
       </p>
@@ -486,6 +518,7 @@
 
     <div class="dialog-actions">
       <span id="appVersion" class="app-version"></span>
+      <span id="settingsSaveResult" class="explain"></span>
       <button id="settingsCloseBtn" type="button">Close</button>
       <button id="settingsSaveBtn" type="button">Save</button>
     </div>
@@ -520,6 +553,11 @@
    </div>
   </div>
 
-  <script src="main.js"></script>
+  <script src="core.js"></script>
+  <script src="fileops.js"></script>
+  <script src="settings.js"></script>
+  <script src="chat-render.js"></script>
+  <script src="chat.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>

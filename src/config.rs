@@ -1,7 +1,7 @@
 use crate::paths::app_config_dir;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantedPath {
@@ -19,7 +19,10 @@ fn default_recursive() -> bool {
     true
 }
 
+// Container-level default: a hand-written config with only some keys still
+// loads, every missing key taking its default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub endpoint: String,
     pub model: String,
@@ -52,7 +55,14 @@ pub struct AppConfig {
     /// limit. Generous by default since the UI collapses intermediate steps.
     #[serde(default = "default_max_auto_steps")]
     pub max_auto_steps: u32,
-    /// Sends only `rules::PROTOCOL_PROMPT` plus the user's system prompt, so
+    /// File-ops tool transport: "auto" (native, falling back to text blocks
+    /// for the session when the model rejects tools), "native" or "text".
+    #[serde(default = "default_tool_calling")]
+    pub tool_calling: String,
+    /// Wall-clock limit for one `run_command`, in seconds.
+    #[serde(default = "default_command_timeout_secs")]
+    pub command_timeout_secs: u32,
+    /// Skips the advisory rules files (the tool contract is still sent), so
     /// someone wanting full control isn't competing with baked-in advice.
     #[serde(default)]
     pub disable_builtin_rules: bool,
@@ -105,7 +115,7 @@ pub struct AppConfig {
     /// multi-step chain to show a "Thinking…" disclosure for the way
     /// operation mode does, so this repurposes the same UI pattern for that
     /// instead: shown collapsed while the request is in flight, filled in
-    /// and relabeled once the reply arrives -- see `rules::extract_thinking_block`.
+    /// and relabeled once the reply arrives -- see `llm::split_thinking`.
     /// On by default; off just means the reasoning (if any) gets stripped
     /// and never shown, not that the model stops producing it.
     #[serde(default = "default_chat_show_thinking")]
@@ -121,17 +131,17 @@ pub struct AppConfig {
     #[serde(default = "default_chat_persist_thinking")]
     pub chat_persist_thinking: bool,
     /// Client-side display only -- the model is still always told to write
-    /// `*narration*` this way (`rules::CHAT_NARRATION_PROMPT` has no
-    /// off-switch of its own), this just controls whether `ui/main.js`'s
-    /// `renderChatText` shows those blocks or drops them from the rendered
+    /// `*action*` text (`chat_prompts::CHAT_NARRATION_PROMPT` has no
+    /// off-switch of its own), this just controls whether the UI's
+    /// `splitChatBlocks` shows those blocks or drops them (thoughts stay) from the rendered
     /// bubble entirely. Off by default (narration shown, styled and
     /// separated from dialogue); on hides it completely, for someone who
     /// only wants the spoken lines.
     #[serde(default = "default_chat_hide_narration")]
     pub chat_hide_narration: bool,
     /// Client-side only, same as `chat_hide_narration` -- the backend call
-    /// is always the streaming one (`send_chat_message_streaming`/
-    /// `h_send_chat_message_streaming`) either way, so a live reasoning
+    /// is always the streaming one (`send_chat_message_streaming`)
+    /// either way, so a live reasoning
     /// delta can still fill in `chat_show_thinking`'s placeholder as it
     /// arrives regardless of this setting. This just controls whether the
     /// reply's own text is also shown growing live in its own bubble (on
@@ -140,6 +150,25 @@ pub struct AppConfig {
     /// live growing text distracting rather than reassuring.
     #[serde(default = "default_chat_stream_replies")]
     pub chat_stream_replies: bool,
+    /// Whether the character may send a photo on her own when the chat
+    /// director judges it fits; off means only `/pic` and the camera button.
+    #[serde(default = "default_chat_auto_images")]
+    pub chat_auto_images: bool,
+    /// Retrieves old messages that no longer fit the prompt and adds them to
+    /// the turn (see `recall.rs`). The model decides nothing.
+    #[serde(default = "default_chat_recall")]
+    pub chat_recall: bool,
+    /// "session" or "persona" (every chat with the same persona card).
+    #[serde(default = "default_chat_recall_scope")]
+    pub chat_recall_scope: String,
+    /// Empty = keyword search only.
+    #[serde(default)]
+    pub chat_recall_embedding_model: String,
+    #[serde(default = "default_chat_recall_max")]
+    pub chat_recall_max: u32,
+    /// Cosine floor for an embedding hit.
+    #[serde(default = "default_chat_recall_min_similarity")]
+    pub chat_recall_min_similarity: f32,
 }
 
 fn default_confirm_fade_after() -> u32 {
@@ -159,7 +188,7 @@ fn default_memory_max_tokens() -> u32 {
 }
 
 /// 500 (2000 chars) turned out too small for a real richly-tracked
-/// character state -- once a state block exceeded it, `rules::append_state_block`
+/// character state -- once a state block exceeded it, `chat_prompts::build_chat_system_content`
 /// silently cut off the tail before it ever reached the model, so the next
 /// reply could only "restate everything" from what it could still see,
 /// permanently losing whatever got cut. 2000 (8000 chars) gives generous
@@ -186,18 +215,47 @@ fn default_chat_stream_replies() -> bool {
     true
 }
 
-/// 8000 turned out tight once accounted for: `CHAT_PROTOCOL_PROMPT` +
-/// `CHAT_NARRATION_PROMPT` alone are already ~1350 tokens, `chat_state_max_tokens`
-/// allows up to 2000 more, and persona content on top of that -- all fixed,
-/// system-level, never trimmed by `context.rs` -- easily leaves under half
-/// the old budget for actual conversation history before dropping/condensing
-/// kicks in. That history is what turn 3/4's reaction/answer now also read
-/// (see `chat_turn::run_image_reaction_turn`'s doc comment), so a tight
-/// budget pinches more than just turn 1. 16000 is still a context size most
+fn default_chat_auto_images() -> bool {
+    true
+}
+
+fn default_chat_recall() -> bool {
+    true
+}
+
+fn default_chat_recall_scope() -> String {
+    "session".into()
+}
+
+fn default_chat_recall_max() -> u32 {
+    4
+}
+
+// Calibrated on nomic-embed-text: related pairs 0.56-0.76, unrelated
+// mostly below 0.53 (NOTES 2026-10-18).
+fn default_chat_recall_min_similarity() -> f32 {
+    0.58
+}
+
+/// 8000 turned out tight once accounted for: `CHAT_NARRATION_PROMPT` alone is
+/// already ~1000 tokens, `chat_state_max_tokens` allows up to 2000 more, and
+/// persona content on top of that -- all fixed, system-level, never trimmed
+/// by `context.rs` -- easily leaves under half the old budget for actual
+/// conversation history before dropping/condensing kicks in. The image
+/// reaction and search answer read that history too, so a tight budget
+/// pinches more than just turn 1. 16000 is still a context size most
 /// modern small local models handle natively, and this is a plain default
 /// -- freely raised or lowered per model in Settings, never forced.
 fn default_max_context_tokens() -> u32 {
     16000
+}
+
+fn default_tool_calling() -> String {
+    "auto".into()
+}
+
+fn default_command_timeout_secs() -> u32 {
+    120
 }
 
 fn default_max_auto_steps() -> u32 {
@@ -227,6 +285,8 @@ impl Default for AppConfig {
             auto_approve: vec![],
             sandbox_trash_dir: String::new(),
             max_auto_steps: default_max_auto_steps(),
+            tool_calling: default_tool_calling(),
+            command_timeout_secs: default_command_timeout_secs(),
             disable_builtin_rules: false,
             max_context_tokens: default_max_context_tokens(),
             summarize_before_dropping: false,
@@ -239,6 +299,12 @@ impl Default for AppConfig {
             chat_persist_thinking: default_chat_persist_thinking(),
             chat_hide_narration: default_chat_hide_narration(),
             chat_stream_replies: default_chat_stream_replies(),
+            chat_auto_images: default_chat_auto_images(),
+            chat_recall: default_chat_recall(),
+            chat_recall_scope: default_chat_recall_scope(),
+            chat_recall_embedding_model: String::new(),
+            chat_recall_max: default_chat_recall_max(),
+            chat_recall_min_similarity: default_chat_recall_min_similarity(),
         }
     }
 }
@@ -248,67 +314,44 @@ fn config_path() -> PathBuf {
 }
 
 /// Global, not per-folder: it must exist before any folder is picked.
+/// Defaults are written only when the file is absent; an unreadable or
+/// malformed file is an error, never silently replaced.
 pub fn load_or_init() -> anyhow::Result<AppConfig> {
     let path = config_path();
     match fs::read_to_string(&path) {
-        Ok(text) => Ok(toml::from_str(&text)?),
-        Err(_) => {
+        Ok(text) => toml::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let cfg = AppConfig::default();
             save(&cfg)?;
             Ok(cfg)
         }
+        Err(e) => Err(anyhow::anyhow!("{}: {e}", path.display())),
     }
 }
 
+/// 0600: `api_key` lives in here.
 pub fn save(cfg: &AppConfig) -> anyhow::Result<()> {
     let path = config_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, toml::to_string_pretty(cfg)?)?;
+    crate::paths::write_atomic(&path, toml::to_string_pretty(cfg)?.as_bytes(), Some(0o600))?;
     Ok(())
 }
 
-/// What's open and what's granted, with each grant's "why" so the model can
-/// use it proactively rather than only when given an absolute path.
-pub fn build_root_note(root: Option<&Path>, granted_paths: &[GrantedPath]) -> String {
-    let Some(root) = root else {
-        return "No folder is open right now, so don't propose shell commands -- just chat \
-                normally, and if the user wants file operations, tell them to select a folder \
-                first."
-            .to_string();
-    };
-
-    let mut note = format!(
-        "You currently have this folder open and can propose shell commands confined to it: {}. \
-         This folder is the \"root\"/home context for this session -- if the user says \"root\", \
-         \"root folder\", or similar without naming one of the granted paths below, they mean the \
-         top level of THIS folder, not a granted path.",
-        root.display()
-    );
-    if !granted_paths.is_empty() {
-        note.push_str(
-            "\n\nYou also have access to these additional paths outside the working folder \
-             (these are not the \"root\" unless the user names one specifically):",
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn partial_config_fills_missing_keys_with_defaults() {
+        let cfg: super::AppConfig =
+            toml::from_str("endpoint = \"http://x/v1/chat/completions\"\nmodel = \"m\"\n").unwrap();
+        assert_eq!(cfg.model, "m");
+        assert_eq!(cfg.system_prompt, super::AppConfig::default().system_prompt);
+        assert!(cfg.chat_auto_images);
+        assert!(cfg.chat_recall && cfg.chat_recall_embedding_model.is_empty());
+        assert_eq!(
+            (cfg.chat_recall_scope.as_str(), cfg.chat_recall_max),
+            ("session", 4)
         );
-        for g in granted_paths {
-            let access = if g.read_write {
-                "read-write"
-            } else {
-                "read-only"
-            };
-            let scope = if g.recursive {
-                "includes subfolders"
-            } else {
-                "top-level files only, no subfolders"
-            };
-            let why = if g.note.trim().is_empty() {
-                String::new()
-            } else {
-                format!(" -- {}", g.note.trim())
-            };
-            note.push_str(&format!("\n- {} ({access}, {scope}){why}", g.path));
-        }
     }
-    note
 }
