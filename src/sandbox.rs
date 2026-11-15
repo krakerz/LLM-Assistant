@@ -399,12 +399,18 @@ exit $status
 /// mv/cp/truncate: copy what's about to be overwritten into `TRASH_ROOT`,
 /// then `exec` the real tool with `"$@"` untouched.
 ///
-/// Operand scan: skip `-*` until a bare `--`, treat the last operand as the
-/// destination (a directory means victims are `dest/basename(src)`). `@ALL@`
-/// instead treats every operand as a victim, which `truncate` needs.
+/// Operand scan (`walk`, run twice): options are skipped together with their
+/// separate argument (`-t dir`, `-S suf`, `-s 0`, `--target-directory dir`,
+/// abbreviations and clusters like `-at dir` included) until a bare `--`.
+/// `-t`/`--target-directory` makes every operand a source, so the victims are
+/// `target/basename(src)`. Otherwise the last operand is the destination (a
+/// directory means victims are `dest/basename(src)`). `@ALL@` instead treats
+/// every operand as a victim, which `truncate` needs.
 ///
-/// It mis-reads option *arguments* (`cp -t dir a b`) -- accepted, because the
-/// cost is a needless trash copy, never a lost file or a changed command.
+/// Placeholders: `@TARGET@` (tool has `-t`), `@SHORTARGS@` (short options
+/// taking an argument, as a bracket class), `@LONGARGS@` (long ones, besides
+/// `--target-directory`). An option unknown to the scan only ever costs a
+/// needless trash copy, never a lost file or a changed command.
 const PRESERVE_SHIM_SCRIPT: &str = r#"tool="@TOOL@"
 real="$(command -v "$tool" 2>/dev/null)"
 if [ -z "$real" ]; then
@@ -427,42 +433,98 @@ keep() {
   cp -a -- "$1" "$dest" 2>/dev/null || :
 }
 
+# Which kind of argument a long option takes: "t" = the target directory,
+# "o" = some other value, empty = none (or only an `=value` form).
+long_kind() {
+  n="$1"
+  [ -n "$n" ] || return 0
+  if [ "@TARGET@" = "yes" ]; then
+    case "target-directory" in "$n"*) echo t; return ;; esac
+  fi
+  for full in @LONGARGS@; do
+    case "$full" in "$n"*) echo o; return ;; esac
+  done
+}
+
+operand() {
+  if [ "$MODE" -eq 1 ]; then
+    last="$1"
+    count=$((count + 1))
+    if [ "@ALL@" = "yes" ]; then
+      keep "$1"
+    fi
+  else
+    seen=$((seen + 1))
+    if [ -n "$target" ]; then
+      keep "$target/$(basename -- "$1")"
+    elif [ "$seen" -lt "$count" ]; then
+      # Destination is a directory, so each source lands inside it under its
+      # own basename -- those are what get overwritten, not the directory.
+      keep "$last/$(basename -- "$1")"
+    fi
+  fi
+}
+
+walk() {
+  opts_done=0
+  pend=""
+  seen=0
+  for arg in "$@"; do
+    if [ -n "$pend" ]; then
+      [ "$pend" = "t" ] && target="$arg"
+      pend=""
+      continue
+    fi
+    if [ "$opts_done" -eq 0 ]; then
+      case "$arg" in
+        --) opts_done=1; continue ;;
+        --*=*)
+          name="${arg#--}"
+          name="${name%%=*}"
+          [ "$(long_kind "$name")" = "t" ] && target="${arg#*=}"
+          continue ;;
+        --*)
+          pend="$(long_kind "${arg#--}")"
+          continue ;;
+        -?*)
+          rest="${arg#-}"
+          while [ -n "$rest" ]; do
+            c="${rest%"${rest#?}"}"
+            rest="${rest#?}"
+            case "$c" in
+              [@SHORTARGS@])
+                if [ -n "$rest" ]; then
+                  [ "$c" = "t" ] && target="$rest"
+                else
+                  pend="$c"
+                fi
+                break ;;
+            esac
+          done
+          continue ;;
+      esac
+    fi
+    operand "$arg"
+  done
+}
+
 last=""
 count=0
-opts_done=0
-for arg in "$@"; do
-  if [ "$opts_done" -eq 0 ]; then
-    case "$arg" in
-      --) opts_done=1; continue ;;
-      -?*) continue ;;
-    esac
-  fi
-  last="$arg"
-  count=$((count + 1))
-  if [ "@ALL@" = "yes" ]; then
-    keep "$arg"
-  fi
-done
+target=""
+MODE=1
+walk "$@"
 
-if [ "@ALL@" != "yes" ] && [ "$count" -ge 2 ]; then
-  if [ -d "$last" ]; then
-    # Destination is a directory, so each source lands inside it under its
-    # own basename -- those are what get overwritten, not the directory.
-    seen=0
-    opts_done=0
-    for arg in "$@"; do
-      if [ "$opts_done" -eq 0 ]; then
-        case "$arg" in
-          --) opts_done=1; continue ;;
-          -?*) continue ;;
-        esac
-      fi
-      seen=$((seen + 1))
-      [ "$seen" -eq "$count" ] && break
-      keep "$last/$(basename -- "$arg")"
-    done
-  else
-    keep "$last"
+if [ "@ALL@" != "yes" ]; then
+  if [ -n "$target" ]; then
+    MODE=2
+    walk "$@"
+  elif [ "$count" -ge 2 ]; then
+    if [ -d "$last" ]; then
+      MODE=2
+      walk "$@"
+    else
+      keep "$last"
+    fi
   fi
 fi
 
@@ -489,12 +551,19 @@ pub fn ensure_shims(shim_dir: &Path) -> anyhow::Result<()> {
     }
     // `all` = every operand is a victim (truncate rewrites its arguments in
     // place); otherwise only the destination is.
-    for (name, all) in [("mv", "no"), ("cp", "no"), ("truncate", "yes")] {
+    for (name, all, target, short_args, long_args) in [
+        ("mv", "no", "yes", "tS", "suffix"),
+        ("cp", "no", "yes", "tS", "suffix sparse no-preserve"),
+        ("truncate", "yes", "no", "sr", "size reference"),
+    ] {
         write_shim(
             name,
             PRESERVE_SHIM_SCRIPT
                 .replace("@TOOL@", name)
-                .replace("@ALL@", all),
+                .replace("@ALL@", all)
+                .replace("@TARGET@", target)
+                .replace("@SHORTARGS@", short_args)
+                .replace("@LONGARGS@", long_args),
         )?;
     }
     Ok(())
@@ -526,6 +595,84 @@ pub(crate) fn generate_trash_run_id() -> String {
 /// dir: an empty directory inside it is a legitimately trashed item.
 fn prune_empty_run_dir(dir: &Path) {
     let _ = fs::remove_dir(dir);
+}
+
+/// Deletes per-task run dirs (direct children of `trash_root`) older than
+/// `max_age` by mtime, then the oldest ones until the total is at most
+/// `max_bytes`. `None` disables a limit. Never touches `keep` (the live run
+/// dir), symlinks, or anything outside `trash_root`. Failures are logged only.
+const PRUNE_GRACE: Duration = Duration::from_secs(3600);
+
+pub fn prune_trash(
+    trash_root: &Path,
+    max_age: Option<Duration>,
+    max_bytes: Option<u64>,
+    keep: &Path,
+) {
+    let Ok(entries) = fs::read_dir(trash_root) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    // (path, mtime), real directories only; `symlink_metadata` never follows.
+    let mut runs: Vec<(PathBuf, std::time::SystemTime)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let md = fs::symlink_metadata(&path).ok()?;
+            let mtime = md.modified().unwrap_or(now);
+            // A run touched in the last hour may belong to another live task.
+            let recent = now
+                .duration_since(mtime)
+                .map_or(true, |age| age < PRUNE_GRACE);
+            (md.is_dir() && path != keep && !recent).then_some((path, mtime))
+        })
+        .collect();
+    runs.sort_by_key(|(_, mtime)| *mtime);
+
+    let remove = |path: &Path| match fs::remove_dir_all(path) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("trash prune: cannot remove {}: {e}", path.display());
+            false
+        }
+    };
+
+    if let Some(max_age) = max_age {
+        runs.retain(|(path, mtime)| {
+            let expired = now.duration_since(*mtime).is_ok_and(|age| age > max_age);
+            !(expired && remove(path))
+        });
+    }
+    if let Some(max_bytes) = max_bytes {
+        let mut sizes: Vec<u64> = runs.iter().map(|(p, _)| dir_size(p)).collect();
+        // `keep` still counts toward the total, but is never deleted.
+        let mut total: u64 = sizes.iter().sum::<u64>() + dir_size(keep);
+        for ((path, _), size) in runs.iter().zip(sizes.drain(..)) {
+            if total <= max_bytes {
+                break;
+            }
+            if remove(path) {
+                total = total.saturating_sub(size);
+            }
+        }
+    }
+}
+
+/// Total bytes under `path`, without following symlinks. Unreadable parts
+/// count as 0.
+fn dir_size(path: &Path) -> u64 {
+    let Ok(md) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !md.is_dir() {
+        return md.len();
+    }
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| dir_size(&e.path()))
+        .sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,6 +1239,125 @@ mod tests {
             "{trashed:?}"
         );
         cleanup(&root, &trash_base);
+    }
+
+    // Option arguments are not operands: only what lands in the target dir is
+    // overwritten, so the sources themselves must not be trashed.
+    fn target_dir_case(name: &str, cmd: &str) {
+        if !sandbox_available() {
+            return;
+        }
+        let (root, shim_dir, trash_base) = scratch(name);
+        fs::create_dir_all(root.join("dest")).unwrap();
+        fs::write(root.join("a.txt"), "src a").unwrap();
+        fs::write(root.join("b.txt"), "src b").unwrap();
+        fs::write(root.join("dest/a.txt"), "old a").unwrap();
+
+        let outcome = run(&root, &shim_dir, &trash_base, cmd);
+        assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+        assert_eq!(
+            fs::read_to_string(root.join("dest/a.txt")).unwrap(),
+            "src a"
+        );
+        let trashed = trashed_files(&trash_base);
+        assert_eq!(trashed.len(), 1, "{trashed:?}");
+        assert_eq!(trashed[0].1, "old a", "{trashed:?}");
+        cleanup(&root, &trash_base);
+    }
+
+    #[test]
+    fn cp_short_target_directory_preserves_only_the_overwritten_file() {
+        target_dir_case("cp-t", "cp -t dest a.txt b.txt");
+    }
+
+    #[test]
+    fn cp_long_target_directory_forms_preserve_only_the_overwritten_file() {
+        target_dir_case("cp-long-eq", "cp --target-directory=dest a.txt b.txt");
+        target_dir_case("cp-long-sep", "cp --target-directory dest a.txt b.txt");
+        target_dir_case("cp-cluster", "cp -at dest a.txt b.txt");
+        target_dir_case("mv-t-last", "mv a.txt b.txt -t dest");
+    }
+
+    #[test]
+    fn truncate_option_arguments_are_not_victims() {
+        if !sandbox_available() {
+            return;
+        }
+        let (root, shim_dir, trash_base) = scratch("truncate-optarg");
+        fs::write(root.join("f.txt"), "keep me").unwrap();
+        fs::write(root.join("0"), "decoy").unwrap();
+        fs::write(root.join("ref.txt"), "ref").unwrap();
+
+        let outcome = run(&root, &shim_dir, &trash_base, "truncate -s 0 f.txt");
+        assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+        let outcome = run(&root, &shim_dir, &trash_base, "truncate -r ref.txt f.txt");
+        assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+        let trashed = trashed_files(&trash_base);
+        let texts: Vec<&str> = trashed.iter().map(|(_, t)| t.as_str()).collect();
+        assert!(texts.contains(&"keep me"), "{trashed:?}");
+        assert!(
+            !texts.contains(&"decoy") && !texts.contains(&"ref"),
+            "{trashed:?}"
+        );
+        cleanup(&root, &trash_base);
+    }
+
+    fn make_run(root: &Path, name: &str, bytes: usize, age_days: u64) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("f"), vec![b'x'; bytes]).unwrap();
+        let when = std::time::SystemTime::now() - Duration::from_secs(age_days * 86_400);
+        fs::File::open(&dir).unwrap().set_modified(when).unwrap();
+        dir
+    }
+
+    fn prune_root(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("llm-assistant-prune-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn prune_trash_drops_runs_older_than_max_age() {
+        let root = prune_root("age");
+        let old = make_run(&root, "old", 10, 40);
+        let fresh = make_run(&root, "fresh", 10, 1);
+        prune_trash(
+            &root,
+            Some(Duration::from_secs(30 * 86_400)),
+            None,
+            Path::new(""),
+        );
+        assert!(!old.exists() && fresh.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_trash_size_cut_removes_oldest_first() {
+        let root = prune_root("size");
+        let a = make_run(&root, "a", 1000, 3);
+        let b = make_run(&root, "b", 1000, 2);
+        let c = make_run(&root, "c", 1000, 1);
+        prune_trash(&root, None, Some(1500), Path::new(""));
+        assert!(!a.exists() && !b.exists() && c.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_trash_keeps_the_live_dir_and_outsiders() {
+        let root = prune_root("keep");
+        let live = make_run(&root, "live", 1000, 90);
+        let old = make_run(&root, "old", 1000, 80);
+        let outside = prune_root("keep-outside");
+        fs::write(outside.join("precious"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        prune_trash(&root, Some(Duration::from_secs(86_400)), Some(1), &live);
+        assert!(live.exists() && !old.exists());
+        assert!(outside.join("precious").exists());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     // Shims call mv/cp/mkdir internally. Fails by hanging, not by a wrong

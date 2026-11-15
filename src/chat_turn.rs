@@ -18,11 +18,13 @@ use crate::chat_prompts as prompts;
 use crate::comfyui::{self, ImagePromptFields};
 use crate::config::AppConfig;
 use crate::llm::{self, ChatMessage};
+use crate::sandbox::CancelToken;
 use crate::{chat_session, context, gpu, recall, ruleset, searxng};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Fixed, low temperature for the mechanical calls (state, summary).
@@ -94,27 +96,89 @@ fn auto_title_from(message: &str) -> String {
 }
 
 /// Attachments arrive inlined as `[attached: name]` + body; the body must not
-/// become the title, so only that first line is used.
+/// become the title, so only that first line is used (or the typed text after
+/// the closing `[/attached]` line, when there is some).
 fn title_from_user_text(text: &str) -> String {
     let text = text.trim();
     if text.starts_with("[attached:") {
-        auto_title_from(text.lines().next().unwrap_or(""))
+        match crate::recall::typed_after_attachments(text).filter(|t| !t.is_empty()) {
+            Some(typed) => auto_title_from(typed),
+            None => auto_title_from(text.lines().next().unwrap_or("")),
+        }
     } else {
         auto_title_from(text)
     }
 }
 
-fn running() -> &'static Mutex<HashMap<String, tokio::task::AbortHandle>> {
-    static RUNNING: OnceLock<Mutex<HashMap<String, tokio::task::AbortHandle>>> = OnceLock::new();
+/// A turn 1 in flight. `seq` keeps a finishing turn from unregistering a newer
+/// one; `stream` is set once the reply starts streaming.
+struct Running {
+    seq: u64,
+    cancel: CancelToken,
+    stream: Option<tokio::task::AbortHandle>,
+}
+
+fn running() -> &'static Mutex<HashMap<String, Running>> {
+    static RUNNING: OnceLock<Mutex<HashMap<String, Running>>> = OnceLock::new();
     RUNNING.get_or_init(Default::default)
 }
 
-/// Aborts a running turn-1 stream; `false` if none is running. The turn then
-/// returns with what streamed so far.
+/// Registers a turn 1 for `stop_generation`; unregisters it on drop.
+struct RunningGuard {
+    session_id: String,
+    seq: u64,
+    cancel: CancelToken,
+}
+
+impl RunningGuard {
+    fn register(session_id: &str) -> Self {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let cancel = CancelToken::new();
+        lock_map(running()).insert(
+            session_id.to_string(),
+            Running {
+                seq,
+                cancel: cancel.clone(),
+                stream: None,
+            },
+        );
+        Self {
+            session_id: session_id.to_string(),
+            seq,
+            cancel,
+        }
+    }
+
+    /// Checked under the map lock, so a Stop can't slip in between.
+    fn set_stream(&self, handle: tokio::task::AbortHandle) {
+        let mut map = lock_map(running());
+        if self.cancel.is_cancelled() {
+            handle.abort();
+        } else if let Some(r) = map.get_mut(&self.session_id).filter(|r| r.seq == self.seq) {
+            r.stream = Some(handle);
+        }
+    }
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        let mut map = lock_map(running());
+        if map.get(&self.session_id).is_some_and(|r| r.seq == self.seq) {
+            map.remove(&self.session_id);
+        }
+    }
+}
+
+/// Stops a running turn 1 (summarizing or streaming); `false` if none is
+/// running. The turn then returns with what streamed so far.
 pub fn stop_generation(session_id: &str) -> bool {
     match lock_map(running()).get(session_id) {
-        Some(handle) => {
-            handle.abort();
+        Some(r) => {
+            r.cancel.cancel();
+            if let Some(stream) = &r.stream {
+                stream.abort();
+            }
             true
         }
         None => false,
@@ -134,7 +198,7 @@ fn assistant_message(cfg: &AppConfig, text: String, thinking: Option<String>) ->
 /// `<think>` prefix) and whether it was stopped.
 async fn stream_reply(
     cfg: &AppConfig,
-    session_id: &str,
+    guard: &RunningGuard,
     messages: Vec<ChatMessage>,
     on_delta: &mut impl FnMut(llm::ChatDelta<'_>),
 ) -> anyhow::Result<(String, bool)> {
@@ -149,6 +213,7 @@ async fn stream_reply(
         cfg.api_key.clone(),
         cfg.chat_temperature,
     );
+    let effort = (!cfg.chat_thinking).then_some("none");
     let task = tokio::spawn(async move {
         llm::send_chat_streaming(
             &endpoint,
@@ -156,6 +221,7 @@ async fn stream_reply(
             &api_key,
             temperature,
             &messages,
+            effort,
             move |delta: llm::ChatDelta<'_>| {
                 let piece = match delta {
                     llm::ChatDelta::Content(t) => Piece::Content(t.to_string()),
@@ -166,7 +232,7 @@ async fn stream_reply(
         )
         .await
     });
-    lock_map(running()).insert(session_id.to_string(), task.abort_handle());
+    guard.set_stream(task.abort_handle());
 
     let (mut content, mut reasoning) = (String::new(), String::new());
     while let Some(piece) = rx.recv().await {
@@ -181,7 +247,6 @@ async fn stream_reply(
             }
         }
     }
-    lock_map(running()).remove(session_id);
 
     match task.await {
         Ok(result) => result.map(|raw| (raw, false)),
@@ -315,16 +380,24 @@ async fn run_turn_one(
     } = turn;
     let persona = chat_session::persona_content(session_id);
     let state = chat_session::read_state(session_id);
-    let system_content = prompts::build_chat_system_content(
+    let (prev_raw, raw) = (
+        chat_session::read_prev_raw_state(session_id),
+        chat_session::read_raw_state(session_id),
+    );
+    let system_content = prompts::build_chat_system_content_for(
         persona.as_deref(),
         &state,
         cfg.chat_state_max_tokens,
         photo_forced,
+        &snapshot,
+        (&prev_raw, &raw),
     );
+    let running = RunningGuard::register(session_id);
     let summarizer = cfg.summarize_before_dropping.then(|| context::Summarizer {
         endpoint: &cfg.endpoint,
         model: &cfg.model,
         api_key: &cfg.api_key,
+        cancel: Some(&running.cancel),
     });
     let fit = context::fit_to_budget(
         context::estimate_tokens(&system_content),
@@ -336,10 +409,46 @@ async fn run_turn_one(
     .await;
     let mut messages = vec![ChatMessage::text("system", system_content)];
     messages.extend(fit.messages);
-    add_recall(cfg, session_id, &snapshot, &mut messages).await;
+    add_recall(cfg, session_id, &snapshot, &mut messages, &running.cancel).await;
+    // The model has no clock; on the request copy only, so the system prompt
+    // (and the server's prefix cache) stays static.
+    if let Some(last) = messages.last_mut().filter(|m| m.role == "user") {
+        last.content
+            .push_str(&format!("\n\n{}", prompts::now_note()));
+    }
 
-    let (raw, stopped) = stream_reply(cfg, session_id, messages, on_delta).await?;
-    let (reply, thinking) = prompts::clean_reply(&raw);
+    // A Stop while summarizing ends the turn like a Stop before the first token.
+    let (raw, stopped) = if running.cancel.is_cancelled() {
+        (String::new(), true)
+    } else {
+        stream_reply(cfg, &running, messages.clone(), on_delta).await?
+    };
+    let (mut reply, mut thinking) = prompts::clean_reply(&raw);
+    // Small models stall with "are you sure?": one silent regeneration with
+    // the stall nudge; the UI shows the final reply when the turn ends.
+    if !stopped && prompts::needs_stall_retry(&snapshot, &reply) {
+        log::info!("chat: reply asks for confirmation, regenerating once");
+        let mut retry = messages;
+        if let Some(system) = retry
+            .first_mut()
+            .filter(|m| !m.content.contains(prompts::CHAT_STALL_NUDGE_LINE))
+        {
+            system.content = format!("{}\n\n{}", system.content, prompts::CHAT_STALL_NUDGE_LINE);
+        }
+        match stream_reply(cfg, &running, retry, &mut |_| {}).await {
+            Ok((raw2, false)) => {
+                let (r2, t2) = prompts::clean_reply(&raw2);
+                if !r2.trim().is_empty() && !prompts::needs_stall_retry(&snapshot, &r2) {
+                    (reply, thinking) = (r2, t2);
+                } else {
+                    log::info!("chat: regenerated reply still stalls, keeping the first");
+                }
+            }
+            Ok((_, true)) => {}
+            Err(e) => log::warn!("chat: stall regeneration failed: {e}"),
+        }
+    }
+    drop(running);
 
     let mut result = TurnOneResult {
         user_message_id,
@@ -400,6 +509,7 @@ async fn add_recall(
     session_id: &str,
     snapshot: &[ChatMessage],
     messages: &mut [ChatMessage],
+    cancel: &CancelToken,
 ) {
     if !cfg.chat_recall {
         return;
@@ -433,7 +543,15 @@ async fn add_recall(
         query.chars().take(120).collect::<String>()
     );
     let persona = chat_session::persona_name(session_id);
-    let recalled = recall::recall(cfg, session_id, persona.as_deref(), &query, &in_prompt).await;
+    let recalled = recall::recall(
+        cfg,
+        session_id,
+        persona.as_deref(),
+        &query,
+        &in_prompt,
+        Some(cancel),
+    )
+    .await;
     if recalled.is_empty() {
         return;
     }
@@ -510,9 +628,14 @@ pub async fn run_followup(
     }
 
     let search_available = searxng_configured();
-    let auto_images = cfg.chat_auto_images && comfyui_configured();
+    let flow = director::photo_flow(
+        director::PhotoMode::from_config(cfg),
+        comfyui_configured(),
+        photo_forced,
+    );
+    let auto_images = flow.auto_images;
     let raw_state = chat_session::read_raw_state(session_id);
-    let want_photo_signals = auto_images && !photo_forced;
+    let want_photo_signals = flow.director_signals;
     let decision = if want_photo_signals || search_available {
         director::decide(
             cfg,
@@ -521,23 +644,28 @@ pub async fn run_followup(
             &upto[idx].content,
             want_photo_signals,
             search_available,
+            director::photo_in_previous_message(upto),
         )
         .await
     } else {
         director::Decision::default()
     };
-    let plan = director::resolve(
+    let mut plan = director::resolve(
         &decision,
-        photo_forced,
+        flow.force,
         auto_images,
         search_available,
         director::photo_in_previous_message(upto),
         &user_text,
     );
+    if plan.image && !photo_forced && plan.photo_reason.is_empty() && flow.force {
+        plan.photo_reason = director::EVERY_REPLY_PHOTO_REASON.to_string();
+    }
 
     let image = if plan.image {
         let style_rules =
             ruleset::load_ruleset(ruleset::IMAGE_GENERATION_RULESET_NAME).unwrap_or_default();
+        let previous_prompt = chat_session::read_last_image_prompt(session_id);
         let fields = director::build_image_prompt(
             cfg,
             &director::BuilderInput {
@@ -548,6 +676,7 @@ pub async fn run_followup(
                 photo_reason: &plan.photo_reason,
                 hint: photo_hint.as_deref(),
                 style_rules: &style_rules,
+                previous_prompt: previous_prompt.as_deref(),
             },
         )
         .await;
@@ -644,7 +773,9 @@ async fn update_state_json(
     let Value::Object(map) = value else {
         return None;
     };
-    let fields = prompts::flat_fields(map);
+    let fields = prompts::drop_template_fields(prompts::flat_fields(map), &previous);
+    let fields =
+        prompts::drop_unmentioned_garments(fields, &previous, reply, user_text.unwrap_or(""));
     if fields.is_empty() {
         log::warn!("state update produced no usable fields");
         return None;
@@ -803,12 +934,13 @@ async fn in_character_reply(
     messages.extend(trimmed.messages);
     messages.push(trigger);
 
-    let raw = llm::send_chat(
+    let raw = llm::send_chat_with_effort(
         &cfg.endpoint,
         &cfg.model,
         &cfg.api_key,
         cfg.chat_temperature,
         &messages,
+        (!cfg.chat_thinking).then_some("none"),
     )
     .await?;
     let (reply, thinking) = prompts::clean_reply(&raw);
@@ -836,28 +968,36 @@ fn is_none_reply(text: &str) -> bool {
     letters.eq_ignore_ascii_case("none")
 }
 
-const REACTION_ALWAYS: &str = "The picture is now part of the scene, exactly like anything else \
-your character just said or did -- don't step outside the moment to review or caption it. \
-Continue the conversation forward in character, using what's actually in the picture together \
-with how things have actually been going and your current state to decide what your character \
-would naturally say or do next. For example, if the user asked to see you relaxing with your cat, \
-your next line is something like \"See? Isn't he cute?\" -- a real next beat of dialogue that \
-happens to reference the picture, not a description or review of an image file.";
-
-const REACTION_OPTIONAL: &str = "The picture is now part of the scene, exactly like anything else \
-your character just said or did. Given it, how the conversation has actually been going, and \
-your current state, decide for yourself whether continuing forward right now fits, or whether \
-you were already mid-scene and this isn't a natural moment to. If it fits, continue in character \
--- using what's actually in the picture the way you'd naturally reference something you just \
-showed someone, not describing or reviewing an image file. If it doesn't fit, reply with \
-exactly the single word: none";
+/// What the user last typed (attachment bodies left out), for the photo note.
+fn last_user_text(session_id: &str) -> Option<String> {
+    let history = chat_session::load_history(session_id).ok()?;
+    let msg = history.iter().rev().find(|m| m.role == "user")?;
+    match crate::recall::typed_after_attachments(&msg.content) {
+        Some(typed) => Some(typed.to_string()),
+        None if msg.content.trim_start().starts_with("[attached:") => None,
+        None => Some(msg.content.clone()),
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeneratedImageResult {
     pub image_path: String,
     pub image_data_url: String,
+    pub seed: Option<i64>,
     pub reaction: Option<ReplyMsg>,
+}
+
+/// `None`: no reaction turn; `Some(optional)`: run it, with the "none" veto
+/// when `optional`. In every-reply mode the photo illustrates her reply, so
+/// only "always continue" adds a line.
+fn reaction_plan(mode: director::PhotoMode, reaction: comfyui::ReactionMode) -> Option<bool> {
+    match (mode, reaction) {
+        (_, comfyui::ReactionMode::Never) => None,
+        (director::PhotoMode::EveryReply, comfyui::ReactionMode::Optional) => None,
+        (_, comfyui::ReactionMode::Optional) => Some(true),
+        (_, comfyui::ReactionMode::Always) => Some(false),
+    }
 }
 
 /// Renders the image, attaches it to `message_id`, then lets the character
@@ -872,6 +1012,26 @@ pub async fn generate_image(
     vision: Option<bool>,
 ) -> anyhow::Result<GeneratedImageResult> {
     let comfy_cfg = comfyui::load_or_init()?;
+    let resolved = comfyui::resolve_fields(
+        fields,
+        &comfy_cfg,
+        chat_session::read_last_image_seed(session_id),
+        comfyui::random_seed()?,
+    );
+    let fields = &resolved;
+    log::info!(
+        "image: size {} ({}), seed {} ({})",
+        match (fields.width, fields.height) {
+            (Some(w), Some(h)) => format!("{w}x{h}"),
+            _ => "from workflow".to_string(),
+        },
+        comfyui::size_label(fields, &comfy_cfg),
+        fields.seed.map_or("unmapped".into(), |s| s.to_string()),
+        match fields.seed_mode {
+            Some(comfyui::SeedMode::Same) => "same",
+            _ => "new",
+        },
+    );
     // The slot (and its gate) is released before the reaction turn below.
     let image = gpu::with_image_slot(cfg, &comfy_cfg, || {
         comfyui::generate_image(&comfy_cfg, fields)
@@ -880,36 +1040,68 @@ pub async fn generate_image(
     let path = comfyui::save_generated_image(&comfy_cfg, session_id, &image)?;
     let image_path = path.display().to_string();
     chat_session::attach_generated_image(session_id, message_id, &image_path).await?;
+    if let Some(seed) = fields.seed {
+        if let Err(e) = chat_session::write_last_image_seed(session_id, seed).await {
+            log::warn!("failed to remember the image seed: {e}");
+        }
+    }
+    if let Some(prompt) = fields.positive.as_deref() {
+        if let Err(e) = chat_session::write_last_image_prompt(session_id, prompt).await {
+            log::warn!("failed to remember the image prompt: {e}");
+        }
+    }
     let image_data_url = comfyui::read_as_data_url(&path)?;
 
-    let optional = match comfy_cfg.reaction_mode {
-        comfyui::ReactionMode::Never => {
-            return Ok(GeneratedImageResult {
-                image_path,
-                image_data_url,
-                reaction: None,
-            })
-        }
-        comfyui::ReactionMode::Optional => true,
-        comfyui::ReactionMode::Always => false,
+    let Some(optional) = reaction_plan(
+        director::PhotoMode::from_config(cfg),
+        comfy_cfg.reaction_mode,
+    ) else {
+        return Ok(GeneratedImageResult {
+            image_path,
+            image_data_url,
+            seed: fields.seed,
+            reaction: None,
+        });
     };
     let positive = fields.positive.as_deref().unwrap_or("an image");
+    let sees_photo = vision == Some(true);
     let mut trigger = ChatMessage::text(
         "user",
-        format!(
-            "[Here's the picture you just shared, generated from: {positive}] {}",
-            if optional {
-                REACTION_OPTIONAL
-            } else {
-                REACTION_ALWAYS
-            }
+        prompts::photo_followup_note(
+            positive,
+            last_user_text(session_id).as_deref(),
+            sees_photo,
+            optional,
         ),
     );
-    if vision == Some(true) {
+    if sees_photo {
         trigger.images = vec![image_data_url.clone()];
     }
-    let reaction = match in_character_reply(cfg, session_id, None, trigger).await {
+    let previous_reply = chat_session::load_history(session_id)
+        .ok()
+        .and_then(|h| h.into_iter().rev().find(|m| m.role == "assistant"))
+        .map(|m| m.content);
+    let mut reply = in_character_reply(cfg, session_id, None, trigger.clone()).await;
+    if matches!(&reply, Ok(Some((text, _))) if prompts::reads_as_photo_review(text)) {
+        log::debug!("image reaction read as a review of the photo; retrying once");
+        trigger.content.push_str(prompts::PHOTO_NOTE_RETRY);
+        reply = in_character_reply(cfg, session_id, None, trigger).await;
+    }
+    let redundant = match &reply {
+        Ok(Some((text, _))) => prompts::redundant_reaction(text, previous_reply.as_deref()),
+        _ => None,
+    };
+    let reaction = match reply {
         Ok(Some((text, _))) if optional && is_none_reply(&text) => None,
+        // Twice in a row: the photo goes out without a line.
+        Ok(Some((text, _))) if prompts::reads_as_photo_review(&text) => {
+            log::warn!("image reaction still read as a review of the photo; dropped");
+            None
+        }
+        Ok(Some(_)) if redundant.is_some() => {
+            log::info!("image reaction dropped: {}", redundant.unwrap_or_default());
+            None
+        }
         Ok(Some((text, thinking))) => save_reply(cfg, session_id, text, thinking)
             .await
             .map_err(|e| log::warn!("failed to save the image reaction: {e}"))
@@ -923,6 +1115,7 @@ pub async fn generate_image(
     Ok(GeneratedImageResult {
         image_path,
         image_data_url,
+        seed: fields.seed,
         reaction,
     })
 }
@@ -1024,6 +1217,18 @@ pub async fn web_search(
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn every_reply_mode_only_reacts_on_always() {
+        use comfyui::ReactionMode::*;
+        use director::PhotoMode::*;
+        assert_eq!(reaction_plan(EveryReply, Always), Some(false));
+        assert_eq!(reaction_plan(EveryReply, Optional), None);
+        assert_eq!(reaction_plan(EveryReply, Never), None);
+        assert_eq!(reaction_plan(Auto, Optional), Some(true));
+        assert_eq!(reaction_plan(Auto, Always), Some(false));
+        assert_eq!(reaction_plan(Auto, Never), None);
+    }
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex as StdMutex};
 
@@ -1058,6 +1263,14 @@ mod tests {
         assert_eq!(
             title_from_user_text("[attached: notes.txt]\nsecret body\n\nwhat is this"),
             "[attached: notes.txt]"
+        );
+        assert_eq!(
+            title_from_user_text("[attached: n.txt]\nsecret body\n[/attached]\n\nwhat is this"),
+            "what is this"
+        );
+        assert_eq!(
+            title_from_user_text("[attached: n.txt]\nsecret body\n[/attached]\n\n"),
+            "[attached: n.txt]"
         );
         assert!(title_from_user_text(&"x".repeat(100)).chars().count() <= 41);
     }
@@ -1127,6 +1340,21 @@ mod tests {
     #[test]
     fn stopping_with_nothing_running_is_false() {
         assert!(!stop_generation("session-20260101-000000"));
+    }
+
+    #[test]
+    fn a_finished_turn_does_not_unregister_a_newer_one() {
+        let sid = "session-running-guard-test";
+        let old = RunningGuard::register(sid);
+        let new = RunningGuard::register(sid);
+        drop(old);
+        assert!(
+            stop_generation(sid),
+            "the newer turn must still be registered"
+        );
+        assert!(new.cancel.is_cancelled());
+        drop(new);
+        assert!(!stop_generation(sid), "nothing running afterwards");
     }
 
     // --- send_user_message against a local fake OpenAI-compatible server ---

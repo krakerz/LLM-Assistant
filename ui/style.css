@@ -494,6 +494,213 @@ details.bubble.thinking > .bubble.assistant {
   width: min(760px, 92vw);
 }
 
+/* Persona builder: brief on the left, one card per section on the right.
+   One column below ~900px. */
+#personaBuilderDialog .app-dialog-inner {
+  width: min(1100px, 96vw);
+}
+.pb-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 18px;
+}
+@media (min-width: 900px) {
+  .pb-columns {
+    grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+  }
+}
+.pb-brief,
+.pb-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.pb-brief label,
+.pb-section label,
+.pb-footer label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.pb-brief label.checkbox-row {
+  flex-direction: row;
+}
+.pb-section {
+  background: #191c24;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.pb-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pb-section-head h4 {
+  margin: 0;
+  flex: 1;
+}
+.pb-note {
+  color: var(--muted);
+  font-size: 12.5px;
+}
+.pb-note.warn {
+  color: #e0b35c;
+}
+.pb-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: pb-spin 0.8s linear infinite;
+}
+.pb-spinner[hidden] {
+  display: none;
+}
+@keyframes pb-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.pb-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.pb-chips:empty {
+  display: none;
+}
+.pb-chip {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 12.5px;
+  background: transparent;
+  color: var(--text);
+}
+button.pb-chip {
+  cursor: pointer;
+}
+button.pb-chip:hover,
+button.pb-chip.selected {
+  border-color: var(--accent);
+}
+.pb-chip.verified {
+  border-color: var(--ok);
+}
+.pb-chip.alias {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.pb-chip.online {
+  border-color: #a78bfa;
+  color: #a78bfa;
+}
+.pb-chip.unknown {
+  border-color: #e0b35c;
+  color: #e0b35c;
+}
+.pb-chip.unverified {
+  border-color: var(--border);
+  color: var(--muted);
+}
+.pb-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 14px;
+}
+.pb-footer-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+#pbPreview {
+  width: 100%;
+  background: #0f1116;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font: inherit;
+}
+#pbPreview[hidden],
+#pbTestPhotoImg[hidden],
+#pbError[hidden],
+#pbPreviewNote[hidden],
+#pbTestPhotoResult[hidden],
+#pbResearch[hidden] {
+  display: none;
+}
+#pbTestPhotoImg {
+  max-width: 320px;
+  max-height: 420px;
+  border-radius: 6px;
+  align-self: flex-start;
+}
+#pbResearch a {
+  color: var(--accent);
+}
+.pb-locked .pb-section {
+  opacity: 0.55;
+}
+
+/* Image Gen: workflow JSON on the left, mapping + size presets on the right,
+   so the long tab doesn't scroll forever. Stacks again on narrow windows. */
+#settingsDialog .app-dialog-inner:has(.tab-panel[data-panel="imagegen"]:not([hidden])) {
+  width: min(1180px, 96vw);
+}
+.imagegen-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 20px;
+  align-items: stretch;
+}
+.imagegen-left {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+#settingsDialog .imagegen-workflow {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+#settingsDialog .imagegen-workflow textarea {
+  flex: 1;
+  min-height: 240px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+.imagegen-right {
+  min-width: 0;
+}
+.imagegen-right fieldset {
+  min-width: 0;
+}
+.imagegen-right fieldset:first-child {
+  margin-top: 12px;
+}
+/* Mapping rows: label left, dropdown right. */
+#settingsDialog .imagegen-mapping > label {
+  display: grid;
+  grid-template-columns: 9em minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0;
+}
+@media (max-width: 900px) {
+  .imagegen-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 /* Active tab is a full filled chip (accent-tinted background + accent
    text) rather than just an underline -- easier to spot at a glance,
    especially at the smaller sizes these run at, and reads the same in both
@@ -987,7 +1194,14 @@ select {
   align-items: flex-end;
   gap: 6px;
   align-self: flex-start;
-  max-width: 100%;
+  /* The bubble's own 78% would resolve against this shrink-to-fit wrapper
+     and wrap short text early; cap the row instead. */
+  max-width: 78%;
+}
+
+.bubble-with-indicator > .bubble {
+  max-width: none;
+  min-width: 0;
 }
 
 /* Triggering a memory update is routine, not something worth its own line.

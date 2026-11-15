@@ -26,6 +26,29 @@ toggleNarrationBtn.addEventListener("click", async () => {
   }
 });
 
+// Same quick toggle for `chat_hide_thoughts` (the `(thought)` blocks).
+const toggleThoughtsBtn = document.getElementById("toggleThoughtsBtn");
+
+function updateThoughtsToggleBtn() {
+  const hidden = !!currentConfig?.chat_hide_thoughts;
+  toggleThoughtsBtn.classList.toggle("active", hidden);
+  toggleThoughtsBtn.title = hidden
+    ? "Inner thoughts are hidden — click to show them"
+    : "Inner thoughts are shown — click to hide them";
+}
+
+toggleThoughtsBtn.addEventListener("click", async () => {
+  if (!currentConfig) return;
+  currentConfig.chat_hide_thoughts = !currentConfig.chat_hide_thoughts;
+  updateThoughtsToggleBtn();
+  renderChatHistoryLog();
+  try {
+    await invoke("save_config", { cfg: currentConfig });
+  } catch (err) {
+    console.error("save_config (thoughts toggle) failed:", err);
+  }
+});
+
 
 // ============================================================
 // Chat mode: a second, persona-driven UI. Purely conversational -- no
@@ -179,6 +202,7 @@ document.getElementById("newPersonaBtn").addEventListener("click", () => {
   newPersonaNameInput.value = "";
   newPersonaNameInput.disabled = false;
   newPersonaContentInput.value = "";
+  document.getElementById("newPersonaOpenBuilderBtn").hidden = true;
   focusMainWindow();
   newPersonaDialog.hidden = false;
 });
@@ -196,6 +220,7 @@ document.getElementById("editPersonaBtn").addEventListener("click", async () => 
     newPersonaNameInput.value = name;
     newPersonaNameInput.disabled = true;
     newPersonaContentInput.value = content;
+    refreshOpenInBuilderButton(name);
     focusMainWindow();
     newPersonaDialog.hidden = false;
   } catch (err) {
@@ -302,11 +327,29 @@ document.getElementById("rulesetSaveBtn").addEventListener("click", async () => 
 // by the backend every turn) -- there's no "change persona mid-chat"
 // command, so the dropdown is disabled while a session is open to avoid
 // implying a choice made there would do anything.
-function setPersonaSelectorForOpenSession(persona) {
+// An empty chat can still switch persona (saved at once); the first sent
+// message fixes it.
+function setPersonaSelectorForOpenSession(persona, editable = false) {
   personaSelect.value = persona ?? "";
-  personaSelect.disabled = true;
-  personaSelect.title = "This chat's persona is fixed. Start a new chat to use a different one.";
+  personaSelect.disabled = !editable;
+  personaSelect.title = editable
+    ? "Persona for this chat; fixed once you send the first message"
+    : "This chat's persona is fixed. Start a new chat to use a different one.";
 }
+
+personaSelect.addEventListener("change", async () => {
+  const sid = currentSessionId;
+  if (!sid || chatHistory.length > 0) return;
+  try {
+    await invoke("set_chat_session_persona", {
+      sessionId: sid,
+      persona: personaSelect.value || null,
+    });
+    await loadSessionList();
+  } catch (err) {
+    alert(`Could not change this chat's persona: ${err}`);
+  }
+});
 
 function setPersonaSelectorForNewSession() {
   personaSelect.disabled = false;
@@ -505,6 +548,9 @@ document.getElementById("chatStateCloseBtn").addEventListener("click", () => {
 });
 
 document.getElementById("newChatSessionBtn").addEventListener("click", async () => {
+  if (creatingSession) return; // a quick double click would create two chats
+  creatingSession = true;
+  updateSendButton();
   try {
     const persona = personaSelect.value || null;
     const summary = await invoke("create_chat_session", { persona });
@@ -512,6 +558,9 @@ document.getElementById("newChatSessionBtn").addEventListener("click", async () 
     await openChatSession(summary.id);
   } catch (err) {
     alert(`Could not create a new chat: ${err}`);
+  } finally {
+    creatingSession = false;
+    updateSendButton();
   }
 });
 
@@ -538,6 +587,11 @@ function attachGeneratedImages(bubble, paths) {
       .then((dataUrl) => {
         const img = document.createElement("img");
         img.className = "chat-generated-image";
+        // Images arrive after the history render; keep a log that sits at the
+        // bottom there once each one has its real height.
+        const log = chatModeLog;
+        const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+        if (atBottom) img.addEventListener("load", () => (log.scrollTop = log.scrollHeight));
         img.src = dataUrl;
         wireImagePreview(img, path);
         bubble.appendChild(img);
@@ -578,8 +632,9 @@ async function openChatSession(id) {
     if (token !== openSessionToken) return;
     currentSessionId = id;
     chatHistory = history;
-    setPersonaSelectorForOpenSession(meta.persona);
+    setPersonaSelectorForOpenSession(meta.persona, history.length === 0);
     renderChatHistoryLog();
+    chatModeLog.scrollTop = chatModeLog.scrollHeight;
     updateSendButton();
     await loadSessionList();
   } catch (err) {
@@ -878,6 +933,7 @@ async function sendChatMessage(typed) {
     creatingSession = false;
     updateSendButton();
   }
+  setPersonaSelectorForOpenSession(personaSelect.value || null); // first message fixes it
   streamingSessions.add(sid);
   updateSendButton();
   const isCurrent = () => currentSessionId === sid;
@@ -900,7 +956,7 @@ async function sendChatMessage(typed) {
     // Documents need no backend support -- their content becomes message text.
     sentText = attachments
       .filter((a) => a.kind === "text")
-      .reduce((acc, a) => `[attached: ${a.name}]\n${a.data}\n\n${acc}`, typed);
+      .reduce((acc, a) => `[attached: ${a.name}]\n${a.data}\n[/attached]\n\n${acc}`, typed);
     if (!sentText.trim() && images.length > 0) sentText = "What's in this image?";
     shownText = typed || "(sent with attachment)"; // not the folded document text
     cachedText = sentText;

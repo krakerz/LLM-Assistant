@@ -9,6 +9,10 @@
 //! (RRF). Any failure degrades to keyword only, then to nothing; recall never
 //! fails a turn.
 //!
+//! Besides chat messages it holds the text of files attached in chat (`kind`
+//! doc) and one entry per finished file-ops task (`kind` task, scoped to the
+//! working folder; see `recall_tasks`).
+//!
 //! Everything SQLite runs in `spawn_blocking`, with the DB path resolved on the
 //! calling thread (tests redirect it per thread through `chat_session`'s test
 //! root, which a blocking-pool thread can't see).
@@ -16,10 +20,12 @@
 use crate::chat_session;
 use crate::config::AppConfig;
 use crate::llm::{self, ChatMessage};
+use crate::sandbox::CancelToken;
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 const CHUNK_CHARS: usize = 600;
 const MAX_QUERY_TERMS: usize = 12;
@@ -37,6 +43,39 @@ const MAX_BLOCK_CHARS: usize = 1200;
 /// Un-embedded chunks embedded per recall, so legacy history is covered gradually.
 const EMBED_BACKFILL: usize = 64;
 const EMBED_BATCH: usize = 32;
+
+const KIND_CHAT: &str = "chat";
+const KIND_DOC: &str = "doc";
+const KIND_TASK: &str = "task";
+/// Attachment text indexed per file; the rest of a huge paste is dropped.
+const DOC_MAX_CHARS: usize = 100_000;
+/// A file excerpt needs more room than a chat line to be useful.
+const DOC_SNIPPET_MAX_CHARS: usize = 600;
+
+/// Extra queries the optional rewrite may add.
+const MAX_EXPANSIONS: usize = 3;
+const EXPANSION_MAX_CHARS: usize = 200;
+/// The rewrite runs before the reply starts; a slower one is skipped.
+const EXPANSION_TIMEOUT: Duration = Duration::from_secs(8);
+/// Rewritten queries count for half the user's own words in the fusion, so a
+/// bad rewrite can't push out what the user actually asked about.
+const EXPANSION_WEIGHT: f32 = 0.5;
+const EXPANSION_PROMPT: &str = "You write search queries for finding earlier parts of a \
+conversation. Given the user's latest message, reply with JSON {\"queries\": [...]} holding 1 to \
+3 short queries: one with only the key words (names, things, facts; no filler words), and one or \
+two plain statements of what the answer would say (\"what's my job again?\" -> \"the user's job \
+is\", \"the user works as\"). Do not answer the message.";
+
+const TASK_REQUEST_MAX_CHARS: usize = 400;
+const TASK_OUTCOME_MAX_CHARS: usize = 600;
+const TASK_MAX_FILES: usize = 20;
+/// Relevance hits among past file-ops tasks.
+const TASK_RECALL_MAX: usize = 3;
+/// Newest tasks always shown: "what was I doing" has no words to match.
+const TASK_RECENT: usize = 2;
+/// Tasks kept per folder; older ones are pruned so the index doesn't grow forever.
+const TASK_KEEP_PER_FOLDER: usize = 200;
+const TASK_SNIPPET_MAX_CHARS: usize = 500;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS chunks(
@@ -64,14 +103,20 @@ END;
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 ";
 
-/// A snippet of old chat to show the model.
-#[derive(Debug, Clone, PartialEq)]
+/// A snippet of old chat, an attached file or a past file-ops task.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Recalled {
     /// "user" or "assistant".
     pub role: String,
     pub text: String,
     /// Unix seconds the message was indexed; `None` for backfilled history.
     pub ts: Option<i64>,
+    /// "chat", "doc" or "task".
+    pub kind: String,
+    /// The attached file's name, for "doc".
+    pub source: Option<String>,
+    /// JSON list of `TaskFileState`, for "task".
+    pub meta: Option<String>,
 }
 
 /// Chunks newly inserted by `index_messages`, waiting for their embedding.
@@ -110,7 +155,31 @@ fn open_new(path: &Path) -> anyhow::Result<Connection> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
     conn.execute_batch(SCHEMA)?;
+    migrate(&conn)?;
     Ok(conn)
+}
+
+/// Columns added in recall v2. Existing rows are chat messages, which the
+/// `kind` default says.
+fn migrate(conn: &Connection) -> anyhow::Result<()> {
+    let columns: HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(chunks)")?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        names.collect::<Result<_, _>>()?
+    };
+    for (name, ddl) in [
+        (
+            "kind",
+            "ALTER TABLE chunks ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat'",
+        ),
+        ("source", "ALTER TABLE chunks ADD COLUMN source TEXT"),
+        ("meta", "ALTER TABLE chunks ADD COLUMN meta TEXT"),
+    ] {
+        if !columns.contains(name) {
+            conn.execute_batch(ddl)?;
+        }
+    }
+    Ok(())
 }
 
 fn open_db(path: &Path) -> anyhow::Result<Db> {
@@ -160,11 +229,21 @@ fn now_secs() -> i64 {
 
 /// What gets indexed: roleplay markers (`*`, `(`/`)`, and the legacy `//`,
 /// `||`) become spaces, an attachment message keeps only its
-/// `[attached: name]` line, whitespace is collapsed per line.
+/// `[attached: name]` line plus the typed text after the last `[/attached]`
+/// line (legacy messages without it: the first line only), whitespace is
+/// collapsed per line.
 fn clean_text(raw: &str) -> String {
     let raw = raw.trim();
+    let joined;
     let raw = if raw.starts_with("[attached:") {
-        raw.lines().next().unwrap_or("")
+        let first = raw.lines().next().unwrap_or("");
+        match typed_after_attachments(raw) {
+            Some(typed) => {
+                joined = format!("{first}\n{typed}");
+                joined.as_str()
+            }
+            None => first,
+        }
     } else {
         raw
     };
@@ -176,6 +255,67 @@ fn clean_text(raw: &str) -> String {
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Attachment and task text: whitespace collapsed per line, blank lines
+/// dropped. Code punctuation stays (unlike `clean_text`'s roleplay markers).
+fn clean_doc(raw: &str) -> String {
+    raw.lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Line closing an attachment body (written by `ui/chat.js`).
+pub const ATTACHED_END: &str = "[/attached]";
+
+/// The text typed after the last `[/attached]` line, if the message has one.
+pub fn typed_after_attachments(content: &str) -> Option<&str> {
+    let mut rest = None;
+    let mut offset = 0;
+    for line in content.split_inclusive('\n') {
+        offset += line.len();
+        if line.trim() == ATTACHED_END {
+            rest = Some(&content[offset..]);
+        }
+    }
+    rest.map(str::trim)
+}
+
+/// The `[attached: name]` blocks of a user message (built in `ui/chat.js`).
+/// A body runs to its `[/attached]` line; legacy messages without it run to
+/// the next marker or the end (so the last one also carries the typed text).
+/// Data URLs (binary files) are skipped and bodies are capped.
+fn attachment_docs(content: &str) -> Vec<(String, String)> {
+    let mut docs: Vec<(String, String)> = Vec::new();
+    let mut open = false;
+    for line in content.lines() {
+        if line.trim() == ATTACHED_END {
+            open = false;
+            continue;
+        }
+        let marker = line
+            .strip_prefix("[attached: ")
+            .and_then(|rest| rest.strip_suffix(']'));
+        match (marker, docs.last_mut()) {
+            (Some(name), _) => {
+                docs.push((name.trim().to_string(), String::new()));
+                open = true;
+            }
+            (None, Some((_, body))) if open => {
+                body.push_str(line);
+                body.push('\n');
+            }
+            _ => {}
+        }
+    }
+    docs.into_iter()
+        .map(|(name, body)| (name, body.trim().chars().take(DOC_MAX_CHARS).collect()))
+        .filter(|(name, body): &(String, String)| {
+            !name.is_empty() && !body.is_empty() && !body.starts_with("data:")
+        })
+        .collect()
 }
 
 fn sentences(text: &str) -> Vec<String> {
@@ -411,11 +551,30 @@ fn insert_message(
         return Ok(fresh);
     }
     let mut stmt = conn.prepare_cached(
-        "INSERT OR IGNORE INTO chunks(session_id, persona, message_id, role, ts, text)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR IGNORE INTO chunks(session_id, persona, message_id, role, ts, text, kind, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
-    for chunk in chunk_text(&clean_text(&msg.content)) {
-        let inserted = stmt.execute(params![session_id, persona, msg.id, msg.role, ts, chunk])?;
+    let mut docs: Vec<(Option<String>, String)> = chunk_text(&clean_text(&msg.content))
+        .into_iter()
+        .map(|chunk| (None, chunk))
+        .collect();
+    // An attachment's body: recallable once its message leaves the prompt.
+    if msg.role == "user" {
+        for (name, body) in attachment_docs(&msg.content) {
+            for chunk in chunk_text(&clean_doc(&body)) {
+                docs.push((Some(name.clone()), chunk));
+            }
+        }
+    }
+    for (source, chunk) in docs {
+        let kind = if source.is_some() {
+            KIND_DOC
+        } else {
+            KIND_CHAT
+        };
+        let inserted = stmt.execute(params![
+            session_id, persona, msg.id, msg.role, ts, chunk, kind, source
+        ])?;
         if inserted > 0 {
             fresh.push((conn.last_insert_rowid(), chunk));
         }
@@ -496,8 +655,8 @@ pub async fn delete_session(session_id: &str) {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM chunks WHERE session_id = ?1", params![sid])?;
         tx.execute(
-            "DELETE FROM meta WHERE key = ?1",
-            params![backfill_key(&sid)],
+            "DELETE FROM meta WHERE key IN (?1, ?2)",
+            params![backfill_key(&sid), format!("backfilled:{sid}")],
         )?;
         tx.commit()?;
         Ok(())
@@ -508,8 +667,10 @@ pub async fn delete_session(session_id: &str) {
     }
 }
 
+/// v2: attachments became recallable, so every chat is backfilled once more
+/// (chat rows already present are skipped by the unique index).
 fn backfill_key(session_id: &str) -> String {
-    format!("backfilled:{session_id}")
+    format!("backfilled:v2:{session_id}")
 }
 
 /// Indexes the existing history of every not-yet-backfilled session in scope
@@ -645,15 +806,17 @@ struct EmbeddingHits {
     scored: HashMap<i64, f32>,
 }
 
+/// A chunk's similarity is its best over `queries` (the first is the user's own).
 fn embedding_search(
     conn: &Connection,
     scope: &Scope,
     model: &str,
-    query: &[f32],
+    queries: &[Vec<f32>],
     exclude: &HashSet<String>,
     min_similarity: f32,
     keyword_ids: &HashSet<i64>,
 ) -> anyhow::Result<EmbeddingHits> {
+    let dims = queries.first().map_or(0, Vec::len);
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT id, message_id, embedding FROM chunks
          WHERE {SCOPE_SQL} AND embed_model = ?3 AND embedding IS NOT NULL"
@@ -667,10 +830,14 @@ fn embedding_search(
             continue;
         }
         let blob: Vec<u8> = row.get(2)?;
-        let Some(vector) = from_blob(&blob).filter(|v| v.len() == query.len()) else {
+        let Some(vector) = from_blob(&blob).filter(|v| v.len() == dims) else {
             continue;
         };
-        let sim = cosine(query, &vector);
+        // The best of the user's query and its rewrites.
+        let sim = queries
+            .iter()
+            .map(|q| cosine(q, &vector))
+            .fold(f32::MIN, f32::max);
         if keyword_ids.contains(&id) {
             scored.insert(id, sim);
         }
@@ -686,23 +853,28 @@ fn embedding_search(
     Ok(EmbeddingHits { top: all, scored })
 }
 
-/// Reciprocal rank fusion of two best-first lists; ties keep the keyword
-/// side's order.
-fn fuse(keyword: &[i64], embedding: &[i64], max: usize, weight: impl Fn(i64) -> f32) -> Vec<i64> {
+/// Reciprocal rank fusion of best-first lists, each with its own weight; ties
+/// keep the earlier lists' order.
+fn fuse_many(lists: &[(&[i64], f32)], max: usize, weight: impl Fn(i64) -> f32) -> Vec<i64> {
     let mut score: HashMap<i64, f32> = HashMap::new();
     let mut order: Vec<i64> = Vec::new();
-    for list in [keyword, embedding] {
+    for (list, list_weight) in lists {
         for (rank, id) in list.iter().enumerate() {
             let entry = score.entry(*id).or_insert_with(|| {
                 order.push(*id);
                 0.0
             });
-            *entry += weight(*id) / (RRF_K + rank as f32 + 1.0);
+            *entry += list_weight * weight(*id) / (RRF_K + rank as f32 + 1.0);
         }
     }
     order.sort_by(|a, b| score[b].total_cmp(&score[a]));
     order.truncate(max);
     order
+}
+
+#[cfg(test)]
+fn fuse(keyword: &[i64], embedding: &[i64], max: usize, weight: impl Fn(i64) -> f32) -> Vec<i64> {
+    fuse_many(&[(keyword, 1.0), (embedding, 1.0)], max, weight)
 }
 
 struct ChunkRow {
@@ -712,11 +884,14 @@ struct ChunkRow {
     role: String,
     ts: Option<i64>,
     text: String,
+    kind: String,
+    source: Option<String>,
+    meta: Option<String>,
 }
 
 fn load_chunks(conn: &Connection, ids: &[i64]) -> anyhow::Result<Vec<ChunkRow>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, session_id, message_id, role, ts, text FROM chunks WHERE id = ?1",
+        "SELECT id, session_id, message_id, role, ts, text, kind, source, meta FROM chunks WHERE id = ?1",
     )?;
     let mut out = Vec::new();
     for id in ids {
@@ -729,6 +904,9 @@ fn load_chunks(conn: &Connection, ids: &[i64]) -> anyhow::Result<Vec<ChunkRow>> 
                 role: row.get(3)?,
                 ts: row.get(4)?,
                 text: row.get(5)?,
+                kind: row.get(6)?,
+                source: row.get(7)?,
+                meta: row.get(8)?,
             });
         }
     }
@@ -738,10 +916,16 @@ fn load_chunks(conn: &Connection, ids: &[i64]) -> anyhow::Result<Vec<ChunkRow>> 
 /// Rank-ordered chunks -> snippets: chunks of one message merge (a gap in the
 /// chunk run shows as an ellipsis) and sit at the message's best rank.
 fn assemble(rows: Vec<ChunkRow>) -> Vec<Recalled> {
-    let mut order: Vec<(String, String)> = Vec::new();
-    let mut groups: HashMap<(String, String), Vec<ChunkRow>> = HashMap::new();
+    // An attachment's chunks stay apart from the message's own chat chunks.
+    type Key = (String, String, String);
+    let mut order: Vec<Key> = Vec::new();
+    let mut groups: HashMap<Key, Vec<ChunkRow>> = HashMap::new();
     for row in rows {
-        let key = (row.session_id.clone(), row.message_id.clone());
+        let key = (
+            row.session_id.clone(),
+            row.message_id.clone(),
+            row.source.clone().unwrap_or_default(),
+        );
         if !groups.contains_key(&key) {
             order.push(key.clone());
         }
@@ -765,6 +949,9 @@ fn assemble(rows: Vec<ChunkRow>) -> Vec<Recalled> {
                 role: chunks[0].role.clone(),
                 text,
                 ts: chunks[0].ts,
+                kind: chunks[0].kind.clone(),
+                source: chunks[0].source.clone(),
+                meta: chunks[0].meta.clone(),
             })
         })
         .collect()
@@ -821,19 +1008,31 @@ fn scope_sessions(
 }
 
 /// The few most relevant old messages that aren't already in the prompt
-/// (`exclude_message_ids`; this includes the current user message). Any
-/// failure degrades to keyword only, then to nothing.
+/// (`exclude_message_ids`; this includes the current user message). With
+/// `chat_recall_query_expansion` on, one short model call adds search queries
+/// first; `cancel` aborts it. Any failure degrades to keyword only, then to
+/// nothing.
 pub async fn recall(
     cfg: &AppConfig,
     session_id: &str,
     persona: Option<&str>,
     query_text: &str,
     exclude_message_ids: &HashSet<String>,
+    cancel: Option<&CancelToken>,
 ) -> Vec<Recalled> {
     if !cfg.chat_recall || cfg.chat_recall_max == 0 {
         return Vec::new();
     }
-    match recall_inner(cfg, session_id, persona, query_text, exclude_message_ids).await {
+    match recall_inner(
+        cfg,
+        session_id,
+        persona,
+        query_text,
+        exclude_message_ids,
+        cancel,
+    )
+    .await
+    {
         Ok(items) => items,
         Err(e) => {
             log::warn!("recall failed, continuing without it: {e}");
@@ -848,40 +1047,82 @@ async fn recall_inner(
     persona: Option<&str>,
     query_text: &str,
     exclude: &HashSet<String>,
+    cancel: Option<&CancelToken>,
 ) -> anyhow::Result<Vec<Recalled>> {
     let path = db_path();
     let (scope, sessions) = scope_sessions(cfg, session_id, persona);
     ensure_backfilled(&path, sessions).await?;
-
-    let candidates = {
-        let (scope, exclude) = (scope.clone(), exclude.clone());
-        blocking(&path, move |conn| has_candidates(conn, &scope, &exclude)).await?
-    };
-    if !candidates {
+    if !any_candidates(&path, &scope, exclude).await? {
         log::debug!("recall: nothing outside the prompt to search");
         return Ok(Vec::new());
     }
-
-    let query = clean_text(query_text);
-    let match_query = fts_query(&query_terms(&query));
-    let keyword: Vec<i64> = match match_query {
-        Some(q) => {
-            let (scope, exclude) = (scope.clone(), exclude.clone());
-            blocking(&path, move |conn| {
-                keyword_search(conn, &scope, &q, &exclude)
-            })
-            .await
-            .unwrap_or_else(|e| {
-                log::warn!("recall: keyword search failed: {e}");
-                Vec::new()
-            })
-        }
-        None => Vec::new(),
+    let mut queries = vec![clean_text(query_text)];
+    if cfg.chat_recall_query_expansion {
+        let extra = expand_query(cfg, &queries[0], cancel).await;
+        queries.extend(extra);
+    }
+    let search = Search {
+        scope,
+        queries,
+        exclude: exclude.clone(),
+        max: cfg.chat_recall_max as usize,
     };
+    let rows = search_chunks(cfg, &path, &search).await?;
+    Ok(fit_chars(assemble(rows), MAX_BLOCK_CHARS))
+}
+
+/// One retrieval over a scope. `queries[0]` is the user's own text; the rest
+/// come from the optional rewrite.
+struct Search {
+    scope: Scope,
+    queries: Vec<String>,
+    exclude: HashSet<String>,
+    max: usize,
+}
+
+async fn any_candidates(
+    path: &Path,
+    scope: &Scope,
+    exclude: &HashSet<String>,
+) -> anyhow::Result<bool> {
+    let (scope, exclude) = (scope.clone(), exclude.clone());
+    blocking(path, move |conn| has_candidates(conn, &scope, &exclude)).await
+}
+
+/// One keyword list per query plus the embedding list, filtered and fused;
+/// returns the chosen chunks, best first.
+async fn search_chunks(cfg: &AppConfig, path: &Path, s: &Search) -> anyhow::Result<Vec<ChunkRow>> {
+    let mut keyword_lists: Vec<Vec<i64>> = Vec::with_capacity(s.queries.len());
+    for query in &s.queries {
+        let ids = match fts_query(&query_terms(query)) {
+            Some(q) => {
+                let (scope, exclude) = (s.scope.clone(), s.exclude.clone());
+                blocking(path, move |conn| keyword_search(conn, &scope, &q, &exclude))
+                    .await
+                    .unwrap_or_else(|e| {
+                        log::warn!("recall: keyword search failed: {e}");
+                        Vec::new()
+                    })
+            }
+            None => Vec::new(),
+        };
+        keyword_lists.push(ids);
+    }
+    let keyword_all: Vec<i64> = keyword_lists.iter().flatten().copied().collect();
 
     let mut embedded: Option<EmbeddingHits> = None;
     if let Some(model) = embedding_model(cfg) {
-        match embedding_phase(cfg, &path, &scope, model, &query, exclude, &keyword).await {
+        match embedding_phase(
+            cfg,
+            path,
+            &s.scope,
+            model,
+            &s.queries,
+            &s.exclude,
+            &keyword_all,
+        )
+        .await
+        {
             Ok(hits) => embedded = Some(hits),
             Err(e) => log::warn!("recall: embeddings unavailable, using keywords only: {e}"),
         }
@@ -891,24 +1132,23 @@ async fn recall_inner(
     // no score and stays) the threshold: the
     // embedding is the stronger relevance signal, a weak hit on a common word
     // is noise.
-    let keyword: Vec<i64> = match &embedded {
-        Some(hits) => keyword
-            .into_iter()
-            .filter(|id| {
+    if let Some(hits) = &embedded {
+        for list in &mut keyword_lists {
+            list.retain(|id| {
                 hits.scored
                     .get(id)
-                    .map_or(true, |s| *s >= cfg.chat_recall_min_similarity)
-            })
-            .collect(),
-        None => keyword,
-    };
+                    .map_or(true, |sim| *sim >= cfg.chat_recall_min_similarity)
+            });
+        }
+    }
     let embedding_ids: Vec<i64> = embedded
         .as_ref()
         .map(|h| h.top.iter().map(|(id, _)| *id).collect())
         .unwrap_or_default();
 
-    let candidates: Vec<i64> = keyword
+    let candidates: Vec<i64> = keyword_lists
         .iter()
+        .flatten()
         .chain(embedding_ids.iter())
         .copied()
         .collect::<HashSet<i64>>()
@@ -917,34 +1157,35 @@ async fn recall_inner(
     let assistant_ids: HashSet<i64> = if candidates.is_empty() {
         HashSet::new()
     } else {
-        blocking(&path, move |conn| load_chunks(conn, &candidates))
+        blocking(path, move |conn| load_chunks(conn, &candidates))
             .await?
             .into_iter()
             .filter(|r| r.role == "assistant")
             .map(|r| r.id)
             .collect()
     };
-    let selected = fuse(
-        &keyword,
-        &embedding_ids,
-        cfg.chat_recall_max as usize,
-        |id| {
-            if assistant_ids.contains(&id) {
-                ASSISTANT_WEIGHT
-            } else {
-                1.0
-            }
-        },
-    );
+    let mut lists: Vec<(&[i64], f32)> = keyword_lists
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (l.as_slice(), if i == 0 { 1.0 } else { EXPANSION_WEIGHT }))
+        .collect();
+    lists.push((embedding_ids.as_slice(), 1.0));
+    let selected = fuse_many(&lists, s.max, |id| {
+        if assistant_ids.contains(&id) {
+            ASSISTANT_WEIGHT
+        } else {
+            1.0
+        }
+    });
     if selected.is_empty() {
-        log::debug!("recall: no relevant earlier messages");
+        log::debug!("recall: no relevant earlier entries");
         return Ok(Vec::new());
     }
     let rows = {
         let selected = selected.clone();
-        blocking(&path, move |conn| load_chunks(conn, &selected)).await?
+        blocking(path, move |conn| load_chunks(conn, &selected)).await?
     };
-    let kw: HashSet<i64> = keyword.iter().copied().collect();
+    let kw: HashSet<i64> = keyword_lists.iter().flatten().copied().collect();
     let emb: HashSet<i64> = embedding_ids.iter().copied().collect();
     let used_keyword = selected.iter().any(|id| kw.contains(id));
     let used_embedding = selected.iter().any(|id| emb.contains(id));
@@ -960,23 +1201,24 @@ async fn recall_inner(
             .map(|(_, s)| *s)
             .reduce(f32::max)
     });
-    let items = fit_chars(assemble(rows), MAX_BLOCK_CHARS);
     log::info!(
-        "recall: {} earlier snippet(s) ({mode}{})",
-        items.len(),
+        "recall: {} chunk(s) from {} quer{} ({mode}{})",
+        rows.len(),
+        s.queries.len(),
+        if s.queries.len() == 1 { "y" } else { "ies" },
         top_similarity.map_or(String::new(), |s| format!(", top similarity {s:.2}"))
     );
-    Ok(items)
+    Ok(rows)
 }
 
-/// Embeds a slice of un-embedded history, then the query, then scores. An
+/// Embeds a slice of un-embedded history, then the queries, then scores. An
 /// error anywhere means "no embedding signal this turn".
 async fn embedding_phase(
     cfg: &AppConfig,
     path: &Path,
     scope: &Scope,
     model: &str,
-    query: &str,
+    queries: &[String],
     exclude: &HashSet<String>,
     keyword: &[i64],
 ) -> anyhow::Result<EmbeddingHits> {
@@ -991,11 +1233,14 @@ async fn embedding_phase(
         let model = model.to_string();
         blocking(path, move |conn| store_embeddings(conn, &model, items)).await?;
     }
-    let query_vec = embed_texts(cfg, model, Kind::Query, &[query.to_string()])
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no query embedding returned"))?;
+    let query_vecs = embed_texts(cfg, model, Kind::Query, queries).await?;
+    if query_vecs.is_empty() || query_vecs.len() != queries.len() {
+        anyhow::bail!(
+            "expected {} query embedding(s), got {}",
+            queries.len(),
+            query_vecs.len()
+        );
+    }
     let (scope, exclude, model) = (scope.clone(), exclude.clone(), model.to_string());
     let keyword_ids: HashSet<i64> = keyword.iter().copied().collect();
     let min_similarity = cfg.chat_recall_min_similarity;
@@ -1004,13 +1249,348 @@ async fn embedding_phase(
             conn,
             &scope,
             &model,
-            &query_vec,
+            &query_vecs,
             &exclude,
             min_similarity,
             &keyword_ids,
         )
     })
     .await
+}
+
+// --- Query rewrite (optional) ---
+
+/// Up to `MAX_EXPANSIONS` extra search queries for `query`, from one short
+/// JSON call (reasoning off). Empty on any failure, a timeout or a Stop: the
+/// user's own words are always searched anyway.
+async fn expand_query(cfg: &AppConfig, query: &str, cancel: Option<&CancelToken>) -> Vec<String> {
+    if query.trim().is_empty() || cancel.is_some_and(CancelToken::is_cancelled) {
+        return Vec::new();
+    }
+    let model = match cfg.chat_recall_expansion_model.trim() {
+        "" => cfg.model.as_str(),
+        m => m,
+    };
+    let messages = [
+        ChatMessage::text("system", EXPANSION_PROMPT),
+        ChatMessage::text("user", query.chars().take(500).collect::<String>()),
+    ];
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "queries": { "type": "array", "items": { "type": "string" }, "maxItems": MAX_EXPANSIONS }
+        },
+        "required": ["queries"],
+        "additionalProperties": false
+    });
+    let call = llm::send_chat_json(
+        &cfg.endpoint,
+        model,
+        &cfg.api_key,
+        &messages,
+        0.0,
+        Some(150),
+        "search_queries",
+        &schema,
+    );
+    let stopped = async {
+        match cancel {
+            Some(c) => c.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    let reply = tokio::select! {
+        _ = stopped => {
+            log::debug!("recall: query rewrite stopped");
+            return Vec::new();
+        }
+        r = tokio::time::timeout(EXPANSION_TIMEOUT, call) => r,
+    };
+    match reply {
+        Ok(Ok(value)) => {
+            let queries = parse_expansion(&value, query);
+            log::debug!("recall: rewritten queries {queries:?}");
+            queries
+        }
+        Ok(Err(e)) => {
+            log::warn!("recall: query rewrite failed, searching the message as is: {e}");
+            Vec::new()
+        }
+        Err(_) => {
+            log::warn!("recall: query rewrite timed out, searching the message as is");
+            Vec::new()
+        }
+    }
+}
+
+/// `{"queries": [...]}` -> trimmed, non-empty, capped strings that differ
+/// from the original and from each other.
+fn parse_expansion(reply: &serde_json::Value, original: &str) -> Vec<String> {
+    let items = reply
+        .get("queries")
+        .and_then(|q| q.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    for item in items {
+        let Some(q) = item.as_str() else { continue };
+        let q: String = q
+            .trim()
+            .trim_matches('"')
+            .trim()
+            .chars()
+            .take(EXPANSION_MAX_CHARS)
+            .collect();
+        if q.is_empty()
+            || q.eq_ignore_ascii_case(original.trim())
+            || out.iter().any(|o| o.eq_ignore_ascii_case(&q))
+        {
+            continue;
+        }
+        out.push(q);
+        if out.len() == MAX_EXPANSIONS {
+            break;
+        }
+    }
+    out
+}
+
+// --- File-ops tasks ---
+
+/// One changed file of a finished file-ops task, as the agent reports it.
+pub struct TaskFile {
+    /// Display path (relative to the folder, or absolute).
+    pub path: String,
+    /// "created", "modified", "moved", "deleted", "folder created".
+    pub change: String,
+}
+
+/// What a finished file-ops task leaves for later tasks in the same folder.
+pub struct TaskRecord<'a> {
+    pub root: &'a Path,
+    pub request: &'a str,
+    pub outcome: &'a str,
+    pub files: Vec<TaskFile>,
+}
+
+/// A touched file's mtime right after the task, to tell later whether it
+/// changed. `mtime: None` = it didn't exist then (deleted by the task).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TaskFileState {
+    path: String,
+    abs: PathBuf,
+    mtime: Option<i64>,
+}
+
+fn mtime_secs(path: &Path) -> Option<i64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(since.as_secs()).ok()
+}
+
+/// Tasks are scoped per working folder, in the `session_id` column.
+fn task_scope_key(root: &Path) -> String {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    format!("fileops:{}", root.display())
+}
+
+fn task_text(request: &str, outcome: &str, files: &[TaskFile]) -> String {
+    let one_line = |s: &str, max: usize| -> String {
+        clean_doc(s).replace('\n', " ").chars().take(max).collect()
+    };
+    let mut text = format!(
+        "Asked: {}\nOutcome: {}",
+        one_line(request, TASK_REQUEST_MAX_CHARS),
+        one_line(outcome, TASK_OUTCOME_MAX_CHARS)
+    );
+    if !files.is_empty() {
+        let list: Vec<String> = files
+            .iter()
+            .take(TASK_MAX_FILES)
+            .map(|f| format!("{} ({})", f.path, f.change))
+            .collect();
+        text.push_str("\nChanged: ");
+        text.push_str(&list.join(", "));
+        if files.len() > TASK_MAX_FILES {
+            text.push_str(&format!(" and {} more", files.len() - TASK_MAX_FILES));
+        }
+    }
+    text
+}
+
+/// Deletes a folder's task rows except those of the newest `keep` tasks
+/// (by latest `ts`, ties by latest row id). FTS follows via the delete trigger.
+fn prune_tasks(conn: &Connection, key: &str, keep: usize) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM chunks WHERE session_id = ?1 AND kind = ?2 AND message_id NOT IN (
+             SELECT message_id FROM chunks WHERE session_id = ?1 AND kind = ?2
+             GROUP BY message_id ORDER BY MAX(ts) DESC, MAX(id) DESC LIMIT ?3)",
+        params![key, KIND_TASK, keep as i64],
+    )
+}
+
+/// Indexes a finished task under its folder. Returns the task's id (for
+/// `recall_tasks`' exclude set) and the chunks to embed. Never fails outward.
+pub async fn index_task(record: TaskRecord<'_>) -> (Option<String>, Fresh) {
+    let path = db_path();
+    let key = task_scope_key(record.root);
+    let states: Vec<TaskFileState> = record
+        .files
+        .iter()
+        .take(TASK_MAX_FILES)
+        .map(|f| {
+            let given = Path::new(&f.path);
+            let abs = if given.is_absolute() {
+                given.to_path_buf()
+            } else {
+                record.root.join(given)
+            };
+            TaskFileState {
+                path: f.path.clone(),
+                mtime: mtime_secs(&abs),
+                abs,
+            }
+        })
+        .collect();
+    let text = task_text(record.request, record.outcome, &record.files);
+    let meta = serde_json::to_string(&states).ok();
+    let id = llm::new_message_id();
+    let ts = now_secs();
+    let result = {
+        let id = id.clone();
+        blocking(&path, move |conn| {
+            let tx = conn.transaction()?;
+            let mut inserted: Vec<(i64, String)> = Vec::new();
+            {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT OR IGNORE INTO chunks(session_id, persona, message_id, role, ts, text, kind, meta)
+                     VALUES (?1, NULL, ?2, 'user', ?3, ?4, ?5, ?6)",
+                )?;
+                for chunk in chunk_text(&text) {
+                    let n = stmt.execute(params![key, id, ts, chunk, KIND_TASK, meta])?;
+                    if n > 0 {
+                        inserted.push((tx.last_insert_rowid(), chunk));
+                    }
+                }
+            }
+            prune_tasks(&tx, &key, TASK_KEEP_PER_FOLDER)?;
+            tx.commit()?;
+            Ok(inserted)
+        })
+        .await
+    };
+    match result {
+        Ok(chunks) if !chunks.is_empty() => (Some(id), Fresh { path, chunks }),
+        Ok(_) => (
+            None,
+            Fresh {
+                path,
+                chunks: Vec::new(),
+            },
+        ),
+        Err(e) => {
+            log::warn!("recall: indexing a file-ops task failed: {e}");
+            (
+                None,
+                Fresh {
+                    path,
+                    chunks: Vec::new(),
+                },
+            )
+        }
+    }
+}
+
+/// Past tasks in this folder for a new task's prompt: the relevant ones plus
+/// the newest few, newest first, as a ready block. `exclude_task_ids` are the
+/// tasks the running session already carries in its history.
+pub async fn recall_tasks(
+    cfg: &AppConfig,
+    root: &Path,
+    request: &str,
+    exclude_task_ids: &HashSet<String>,
+) -> Option<String> {
+    if !cfg.fileops_recall {
+        return None;
+    }
+    match recall_tasks_inner(cfg, root, request, exclude_task_ids).await {
+        Ok(block) => block,
+        Err(e) => {
+            log::warn!("recall: past file-ops tasks unavailable: {e}");
+            None
+        }
+    }
+}
+
+async fn recall_tasks_inner(
+    cfg: &AppConfig,
+    root: &Path,
+    request: &str,
+    exclude: &HashSet<String>,
+) -> anyhow::Result<Option<String>> {
+    let path = db_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let key = task_scope_key(root);
+    let scope = Scope {
+        session_id: key.clone(),
+        persona: None,
+    };
+    if !any_candidates(&path, &scope, exclude).await? {
+        return Ok(None);
+    }
+    let search = Search {
+        scope,
+        queries: vec![clean_doc(request)],
+        exclude: exclude.clone(),
+        max: TASK_RECALL_MAX,
+    };
+    let mut rows = search_chunks(cfg, &path, &search).await?;
+    let recent = {
+        let exclude = exclude.clone();
+        blocking(&path, move |conn| {
+            recent_task_chunks(conn, &key, &exclude, TASK_RECENT)
+        })
+        .await?
+    };
+    let have: HashSet<i64> = rows.iter().map(|r| r.id).collect();
+    rows.extend(recent.into_iter().filter(|r| !have.contains(&r.id)));
+    let mut items = assemble(rows);
+    items.sort_by_key(|r| std::cmp::Reverse(r.ts));
+    let items = fit_chars(items, MAX_BLOCK_CHARS);
+    Ok((!items.is_empty()).then(|| format_task_block(&items, now_secs())))
+}
+
+/// The newest `n` tasks of a folder that aren't excluded, as chunk rows.
+fn recent_task_chunks(
+    conn: &Connection,
+    key: &str,
+    exclude: &HashSet<String>,
+    n: usize,
+) -> anyhow::Result<Vec<ChunkRow>> {
+    let mut newest = conn.prepare_cached(
+        "SELECT message_id, MAX(id) AS last FROM chunks WHERE session_id = ?1
+         GROUP BY message_id ORDER BY last DESC LIMIT ?2",
+    )?;
+    let limit = (n + exclude.len().min(500)) as i64;
+    let tasks: Vec<String> = newest
+        .query_map(params![key, limit], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|m| !exclude.contains(m))
+        .take(n)
+        .collect();
+    let mut by_task = conn.prepare_cached(
+        "SELECT id FROM chunks WHERE session_id = ?1 AND message_id = ?2 ORDER BY id",
+    )?;
+    let mut ids = Vec::new();
+    for task in &tasks {
+        for id in by_task.query_map(params![key, task], |r| r.get::<_, i64>(0))? {
+            ids.push(id?);
+        }
+    }
+    load_chunks(conn, &ids)
 }
 
 // --- Prompt block ---
@@ -1040,16 +1620,16 @@ pub fn format_block(items: &[Recalled]) -> String {
     let lines: Vec<String> = items
         .iter()
         .map(|r| {
-            let who = if r.role == "user" {
-                "the user said"
-            } else {
-                "you said"
+            let (who, max) = match (r.kind.as_str(), r.source.as_deref()) {
+                (KIND_DOC, Some(name)) => (
+                    format!("from the file {name} the user attached"),
+                    DOC_SNIPPET_MAX_CHARS,
+                ),
+                _ if r.role == "user" => ("the user said".to_string(), SNIPPET_MAX_CHARS),
+                _ => ("you said".to_string(), SNIPPET_MAX_CHARS),
             };
-            let text = if r.text.chars().count() > SNIPPET_MAX_CHARS {
-                format!(
-                    "{}…",
-                    r.text.chars().take(SNIPPET_MAX_CHARS).collect::<String>()
-                )
+            let text = if r.text.chars().count() > max {
+                format!("{}…", r.text.chars().take(max).collect::<String>())
             } else {
                 r.text.clone()
             };
@@ -1059,6 +1639,70 @@ pub fn format_block(items: &[Recalled]) -> String {
     format!(
         "[From earlier in this chat. These are past moments and may be outdated; your current \
          state is what's true now:\n{}]",
+        lines.join("\n")
+    )
+}
+
+/// " Since then: a.txt changed, b.txt deleted." from the stored file states,
+/// or " Its files are unchanged since." when every one still matches.
+fn staleness(meta: Option<&str>) -> String {
+    let Some(states) = meta.and_then(|m| serde_json::from_str::<Vec<TaskFileState>>(m).ok()) else {
+        return String::new();
+    };
+    if states.is_empty() {
+        return String::new();
+    }
+    let notes: Vec<String> = states
+        .iter()
+        .filter_map(|s| match (s.mtime, mtime_secs(&s.abs)) {
+            (Some(_), None) => Some(format!("{} deleted", s.path)),
+            (Some(then), Some(now)) if then != now => Some(format!("{} changed", s.path)),
+            (None, Some(_)) => Some(format!("{} re-created", s.path)),
+            _ => None,
+        })
+        .collect();
+    if notes.is_empty() {
+        " Its files are unchanged since.".to_string()
+    } else {
+        format!(" Since then: {}.", notes.join(", "))
+    }
+}
+
+/// Past file-ops tasks for the step tail: dated, newest first, each with the
+/// current state of the files it touched. Stale entries are marked, not dropped.
+fn format_task_block(items: &[Recalled], now: i64) -> String {
+    let lines: Vec<String> = items
+        .iter()
+        .map(|r| {
+            let date =
+                r.ts.and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                    .map(|d| {
+                        d.with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M ")
+                            .to_string()
+                    })
+                    .unwrap_or_default();
+            let text = r.text.replace('\n', "; ");
+            let text = if text.chars().count() > TASK_SNIPPET_MAX_CHARS {
+                format!(
+                    "{}…",
+                    text.chars()
+                        .take(TASK_SNIPPET_MAX_CHARS)
+                        .collect::<String>()
+                )
+            } else {
+                text
+            };
+            format!(
+                "- {date}({}): {text}{}",
+                relative_age(r.ts, now),
+                staleness(r.meta.as_deref())
+            )
+        })
+        .collect();
+    format!(
+        "[Earlier tasks in this folder, from past sessions. Files may have changed since; check \
+         them before relying on this:\n{}]",
         lines.join("\n")
     )
 }
@@ -1246,6 +1890,7 @@ mod tests {
             None,
             "what was my cat called?",
             &in_prompt,
+            None,
         )
         .await;
         assert_eq!(found.len(), 2, "{found:?}");
@@ -1255,11 +1900,11 @@ mod tests {
         assert!(found.iter().all(|r| r.ts.is_none()), "backfilled: no time");
 
         let in_prompt = ids(&[&history[0], &history[1], &history[2], &history[3]]);
-        assert!(recall(&cfg, &session.id, None, "my cat", &in_prompt)
+        assert!(recall(&cfg, &session.id, None, "my cat", &in_prompt, None)
             .await
             .is_empty());
         let excluded = ids(&[&history[0], &history[1]]);
-        assert!(recall(&cfg, &session.id, None, "my cat", &excluded)
+        assert!(recall(&cfg, &session.id, None, "my cat", &excluded, None)
             .await
             .is_empty());
 
@@ -1267,9 +1912,11 @@ mod tests {
             chat_recall: false,
             ..keyword_cfg()
         };
-        assert!(recall(&off, &session.id, None, "my cat", &HashSet::new())
-            .await
-            .is_empty());
+        assert!(
+            recall(&off, &session.id, None, "my cat", &HashSet::new(), None)
+                .await
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1292,6 +1939,7 @@ mod tests {
             Some("Aria"),
             "my cat",
             &HashSet::new(),
+            None,
         )
         .await;
         assert!(found.is_empty(), "{found:?}");
@@ -1306,6 +1954,7 @@ mod tests {
             Some("Aria"),
             "my cat",
             &HashSet::new(),
+            None,
         )
         .await;
         assert_eq!(found.len(), 1, "{found:?}");
@@ -1327,7 +1976,7 @@ mod tests {
         .await;
         let cfg = keyword_cfg();
         chat_session::save_history(&a.id, &[m("user", "remember the lighthouse")], None).unwrap();
-        recall(&cfg, &a.id, None, "lighthouse", &HashSet::new()).await;
+        recall(&cfg, &a.id, None, "lighthouse", &HashSet::new(), None).await;
         chat_session::delete_session(&a.id).await.unwrap();
         assert_eq!(
             row_count(&path),
@@ -1374,6 +2023,9 @@ mod tests {
             role: "user".into(),
             ts: Some(1),
             text: text.into(),
+            kind: KIND_CHAT.into(),
+            source: None,
+            meta: None,
         };
         let items = assemble(vec![
             row(11, "b", "second"),
@@ -1389,6 +2041,7 @@ mod tests {
             role: "user".into(),
             text: t.repeat(700),
             ts: None,
+            ..Default::default()
         };
         let kept = fit_chars(vec![big("a"), big("b")], 1200);
         assert_eq!(kept.len(), 1, "lowest-ranked trimmed first");
@@ -1438,7 +2091,7 @@ mod tests {
                 c,
                 &scope,
                 "mod",
-                &[1.0, 0.0],
+                &[vec![1.0, 0.0]],
                 &HashSet::new(),
                 0.6,
                 &HashSet::from([2]),
@@ -1458,7 +2111,7 @@ mod tests {
                 c,
                 &scope,
                 "other",
-                &[1.0, 0.0],
+                &[vec![1.0, 0.0]],
                 &HashSet::new(),
                 0.0,
                 &HashSet::new(),
@@ -1632,6 +2285,7 @@ mod tests {
             None,
             "what pet do I have",
             &HashSet::new(),
+            None,
         )
         .await;
         assert_eq!(found.len(), 1, "{found:?}");
@@ -1663,6 +2317,7 @@ mod tests {
             None,
             "what pet do I have",
             &HashSet::new(),
+            None,
         )
         .await;
         assert_eq!(again.len(), 1);
@@ -1687,12 +2342,13 @@ mod tests {
             None,
             "alpha beta",
             &HashSet::new(),
+            None,
         )
         .await;
         assert_eq!(keyword_only.len(), 2);
 
         let cfg = embedding_cfg(&host, "plain-model");
-        let hybrid = recall(&cfg, &session.id, None, "alpha beta", &HashSet::new()).await;
+        let hybrid = recall(&cfg, &session.id, None, "alpha beta", &HashSet::new(), None).await;
         assert_eq!(hybrid.len(), 1, "{hybrid:?}");
         assert!(hybrid[0].text.starts_with("beta"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1705,7 +2361,7 @@ mod tests {
         let session = chat_session::create_session(None).unwrap();
         let history = vec![m("user", "My cat Biscuit loves tuna")];
         chat_session::save_history(&session.id, &history, None).unwrap();
-        let found = recall(&cfg, &session.id, None, "which cat", &HashSet::new()).await;
+        let found = recall(&cfg, &session.id, None, "which cat", &HashSet::new(), None).await;
         assert_eq!(found.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1725,15 +2381,331 @@ mod tests {
                 role: "user".into(),
                 text: "a".into(),
                 ts: None,
+                ..Default::default()
             },
             Recalled {
                 role: "assistant".into(),
                 text: "b".into(),
                 ts: Some(now_secs() - 2 * 86400),
+                ..Default::default()
             },
         ]);
         assert!(block.starts_with("[From earlier in this chat."));
         assert!(block.contains("- (earlier) the user said: a"));
         assert!(block.contains("- (2 days ago) you said: b]"));
+    }
+
+    #[test]
+    fn migration_adds_the_v2_columns_and_old_rows_read_as_chat() {
+        let dir = test_dir("migrate");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute(
+                "INSERT INTO chunks(session_id, message_id, role, text) VALUES ('s', 'm', 'user', 'hi')",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = open_new(&path).unwrap();
+        migrate(&conn).unwrap();
+        let columns: HashSet<String> = conn
+            .prepare("PRAGMA table_info(chunks)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(["kind", "source", "meta"]
+            .iter()
+            .all(|c| columns.contains(*c)));
+        let kind: String = conn
+            .query_row("SELECT kind FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kind, "chat");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attachment_docs_split_files_and_skip_binary() {
+        let content = "[attached: a.txt]\nalpha\n\n[attached: b.png]\ndata:image/png;base64,xx\n\n[attached: c.rs]\nfn main() {}\n\nwhat is this";
+        assert_eq!(
+            attachment_docs(content),
+            vec![
+                ("a.txt".to_string(), "alpha".to_string()),
+                (
+                    "c.rs".to_string(),
+                    "fn main() {}\n\nwhat is this".to_string()
+                ),
+            ]
+        );
+        assert!(attachment_docs("just a message").is_empty());
+    }
+
+    #[test]
+    fn attachment_docs_end_marker_splits_off_the_typed_text() {
+        let content = "[attached: a.txt]\nalpha\n[/attached]\n\n[attached: c.rs]\nfn main() {}\n[/attached]\n\nwhat is this";
+        assert_eq!(
+            attachment_docs(content),
+            vec![
+                ("a.txt".to_string(), "alpha".to_string()),
+                ("c.rs".to_string(), "fn main() {}".to_string()),
+            ]
+        );
+        assert_eq!(typed_after_attachments(content), Some("what is this"));
+        assert_eq!(typed_after_attachments("[attached: a]\nx"), None);
+    }
+
+    #[test]
+    fn clean_text_keeps_typed_words_but_not_the_file_body() {
+        let cleaned = clean_text("[attached: n.txt]\nsecret body\n[/attached]\n\nwhat is *this*");
+        assert_eq!(cleaned, "[attached: n.txt]\nwhat is this");
+    }
+
+    #[test]
+    fn prune_tasks_keeps_the_newest_per_folder_only() {
+        let dir = test_dir("prune");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = open_new(&dir.join("p.sqlite")).unwrap();
+        migrate(&conn).unwrap();
+        let n = std::cell::Cell::new(0);
+        let put = |session: &str, msg: &str, ts: i64, kind: &str| {
+            conn.execute(
+                "INSERT INTO chunks(session_id, message_id, role, ts, text, kind) VALUES (?1, ?2, 'user', ?3, ?2 || ?3 || ?5, ?4)",
+                params![session, msg, ts, kind, n.get()],
+            )
+            .unwrap();
+            n.set(n.get() + 1);
+        };
+        put("fileops:a", "t1", 1, KIND_TASK);
+        put("fileops:a", "t2", 2, KIND_TASK);
+        put("fileops:a", "t2", 2, KIND_TASK);
+        put("fileops:a", "t3", 3, KIND_TASK);
+        put("fileops:b", "b1", 1, KIND_TASK);
+        put("fileops:a", "c1", 0, KIND_CHAT);
+        assert_eq!(prune_tasks(&conn, "fileops:a", 2).unwrap(), 1);
+        let left: Vec<String> = conn
+            .prepare("SELECT DISTINCT message_id FROM chunks ORDER BY message_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(left, ["b1", "c1", "t2", "t3"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_attachment_is_recalled_by_its_content_once_out_of_the_prompt() {
+        let dir = test_dir("attach");
+        let session = chat_session::create_session(None).unwrap();
+        let history = vec![
+            m_with(
+                "user",
+                "[attached: notes.txt]\nThe launch code is pelican seven.\n\nkeep this",
+                "m1",
+            ),
+            m("assistant", "Noted, I will keep it."),
+            m("user", "unrelated talk about gardening"),
+        ];
+        chat_session::save_history(&session.id, &history, None).unwrap();
+        let cfg = keyword_cfg();
+        let found = recall(
+            &cfg,
+            &session.id,
+            None,
+            "what was the launch code",
+            &HashSet::new(),
+            None,
+        )
+        .await;
+        let doc = found
+            .iter()
+            .find(|r| r.kind == "doc")
+            .unwrap_or_else(|| panic!("no doc item in {found:?}"));
+        assert_eq!(doc.source.as_deref(), Some("notes.txt"));
+        assert!(doc.text.contains("pelican"));
+        assert!(format_block(&found).contains("from the file notes.txt"));
+
+        let hidden = HashSet::from(["m1".to_string()]);
+        let found = recall(
+            &cfg,
+            &session.id,
+            None,
+            "what was the launch code",
+            &hidden,
+            None,
+        )
+        .await;
+        assert!(found.iter().all(|r| r.kind != "doc"), "{found:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expansion_replies_are_trimmed_capped_and_deduped() {
+        let long = "x".repeat(300);
+        let reply = json!({"queries": [
+            "  Nurse job ", "nurse JOB", "what's my job", "", 5, "\"quoted\"", long, "fifth"
+        ]});
+        let out = parse_expansion(&reply, "What's my job");
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert_eq!(out[0], "Nurse job");
+        assert_eq!(out[1], "quoted");
+        assert_eq!(out[2].chars().count(), EXPANSION_MAX_CHARS);
+        assert!(parse_expansion(&json!({"other": []}), "q").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_or_stopped_rewrite_falls_back_to_the_message() {
+        let cfg = AppConfig {
+            endpoint: "http://127.0.0.1:9".into(),
+            ..keyword_cfg()
+        };
+        assert!(expand_query(&cfg, "what is my job", None).await.is_empty());
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let out = tokio::time::timeout(
+            Duration::from_secs(1),
+            expand_query(&cfg, "what is my job", Some(&cancel)),
+        )
+        .await
+        .expect("a stopped rewrite returns at once");
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rewritten_queries_widen_keyword_recall() {
+        let dir = test_dir("rewrite");
+        let session = chat_session::create_session(None).unwrap();
+        chat_session::save_history(
+            &session.id,
+            &[
+                m("user", "I work as a nurse at the city hospital"),
+                m("user", "the weather is nice today"),
+            ],
+            None,
+        )
+        .unwrap();
+        let path = db_path();
+        ensure_backfilled(&path, vec![(session.id.clone(), None)])
+            .await
+            .unwrap();
+        let search = |queries: Vec<String>| Search {
+            scope: Scope {
+                session_id: session.id.clone(),
+                persona: None,
+            },
+            queries,
+            exclude: HashSet::new(),
+            max: 4,
+        };
+        let cfg = keyword_cfg();
+        let plain = search_chunks(&cfg, &path, &search(vec!["what's my job again".into()]))
+            .await
+            .unwrap();
+        assert!(plain.is_empty());
+        let widened = search_chunks(
+            &cfg,
+            &path,
+            &search(vec![
+                "what's my job again".into(),
+                "user works as nurse".into(),
+            ]),
+        )
+        .await
+        .unwrap();
+        assert!(widened.iter().any(|r| r.text.contains("nurse")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fuse_many_weights_lists() {
+        let heavy = [1_i64];
+        let light = [2_i64];
+        let out = fuse_many(&[(&light, 0.5), (&heavy, 1.0)], 2, |_| 1.0);
+        assert_eq!(out, vec![1, 2]);
+    }
+
+    fn task(root: &Path, request: &str, outcome: &str, file: &str) -> TaskRecord<'static> {
+        // Leaked so the record can outlive the borrowed strings in the test.
+        let root: &'static Path = Box::leak(root.to_path_buf().into_boxed_path());
+        TaskRecord {
+            root,
+            request: Box::leak(request.to_string().into_boxed_str()),
+            outcome: Box::leak(outcome.to_string().into_boxed_str()),
+            files: vec![TaskFile {
+                path: file.into(),
+                change: "modified".into(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn tasks_are_recalled_per_folder_dated_and_marked_stale() {
+        let dir = test_dir("tasks");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("a.txt"), "x").unwrap();
+        let (id, _fresh) = index_task(task(
+            &a,
+            "rename the invoices by date",
+            "Renamed 3 invoices",
+            "a.txt",
+        ))
+        .await;
+        let id = id.expect("task indexed");
+        let cfg = AppConfig {
+            fileops_recall: true,
+            ..keyword_cfg()
+        };
+        let none = HashSet::new();
+        let block = recall_tasks(&cfg, &a, "invoices", &none).await.unwrap();
+        assert!(block.contains("rename the invoices"), "{block}");
+        assert!(block.contains("Its files are unchanged since"), "{block}");
+        assert!(block.contains(&chrono::Local::now().format("%Y-%m-%d").to_string()));
+
+        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(a.join("a.txt"))
+            .unwrap()
+            .set_modified(hour_ago)
+            .unwrap();
+        let block = recall_tasks(&cfg, &a, "invoices", &none).await.unwrap();
+        assert!(block.contains("a.txt changed"), "{block}");
+        std::fs::remove_file(a.join("a.txt")).unwrap();
+        let block = recall_tasks(&cfg, &a, "invoices", &none).await.unwrap();
+        assert!(block.contains("a.txt deleted"), "{block}");
+
+        assert!(recall_tasks(&cfg, &b, "invoices", &none).await.is_none());
+        let seen = HashSet::from([id]);
+        assert!(recall_tasks(&cfg, &a, "invoices", &seen).await.is_none());
+        let off = AppConfig {
+            fileops_recall: false,
+            ..cfg
+        };
+        assert!(recall_tasks(&off, &a, "invoices", &none).await.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_newest_task_shows_up_without_matching_words() {
+        let dir = test_dir("tasks-recent");
+        let a = dir.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        index_task(task(&a, "sort the photos", "Sorted photos", "p.jpg")).await;
+        index_task(task(&a, "zip the reports", "Zipped reports", "r.zip")).await;
+        let cfg = keyword_cfg();
+        let block = recall_tasks(&cfg, &a, "what was I doing yesterday", &HashSet::new())
+            .await
+            .unwrap();
+        let (photos, reports) = (block.find("sort the photos"), block.find("zip the reports"));
+        assert!(photos.is_some() && reports.is_some(), "{block}");
+        // Same-second tasks keep their insertion order in the sort, so only
+        // require both to appear; ordering is by timestamp, newest first.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

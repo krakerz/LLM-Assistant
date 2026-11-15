@@ -24,6 +24,8 @@ const META_FILE: &str = "meta.json";
 const HISTORY_FILE: &str = "history.json";
 const STATE_FILE: &str = "state.md";
 const RAW_STATE_FILE: &str = "state.json";
+/// The `state.json` that the latest update replaced.
+const PREV_RAW_STATE_FILE: &str = "state.prev.json";
 const STATE_STAMP_FILE: &str = "state.stamp";
 
 /// Title a fresh session starts with; `save_history` only auto-titles while
@@ -190,7 +192,12 @@ fn new_session_id() -> String {
 
 #[cfg(not(test))]
 fn free_session_id(base: String) -> String {
-    let taken = |id: &str| sessions_root().join(id).exists();
+    let root = sessions_root();
+    let _ = fs::create_dir_all(&root);
+    // `create_dir` claims the name atomically, so two concurrent creates
+    // (`--server`, or a quick double click) can't get the same id. Any other
+    // error is left for `create_session` to report.
+    let taken = |id: &str| matches!(fs::create_dir(root.join(id)), Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists);
     if !taken(&base) {
         return base;
     }
@@ -246,7 +253,15 @@ fn read_history(id: &str) -> anyhow::Result<Vec<ChatMessage>> {
             m.id = format!("legacy-{i}");
         }
     }
+    strip_old_echoes(&mut history);
     Ok(history)
+}
+
+/// Old saved replies still carry echoed stat lines; cut them on load.
+fn strip_old_echoes(history: &mut [ChatMessage]) {
+    for m in history.iter_mut().filter(|m| m.role == "assistant") {
+        m.content = crate::chat_prompts::strip_reply_echoes(&m.content);
+    }
 }
 
 pub fn load_session(id: &str) -> anyhow::Result<(SessionMeta, Vec<ChatMessage>)> {
@@ -300,6 +315,37 @@ pub async fn append_message(id: &str, msg: ChatMessage) -> anyhow::Result<()> {
     Ok(())
 }
 
+const LAST_IMAGE_SEED_FILE: &str = "last-image-seed";
+
+/// The seed of the session's last generated image; `None` if missing or garbage.
+pub fn read_last_image_seed(id: &str) -> Option<i64> {
+    read_session_file(id, LAST_IMAGE_SEED_FILE)?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Remembers the seed of the image just generated. Locks internally.
+pub async fn write_last_image_seed(id: &str, seed: i64) -> anyhow::Result<()> {
+    let _guard = lock(id).await;
+    write_session_file(id, LAST_IMAGE_SEED_FILE, seed.to_string().as_bytes())
+}
+
+const LAST_IMAGE_PROMPT_FILE: &str = "last-image-prompt";
+
+/// The positive prompt of the session's last generated image.
+pub fn read_last_image_prompt(id: &str) -> Option<String> {
+    read_session_file(id, LAST_IMAGE_PROMPT_FILE)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Remembers the positive prompt of the image just generated. Locks internally.
+pub async fn write_last_image_prompt(id: &str, prompt: &str) -> anyhow::Result<()> {
+    let _guard = lock(id).await;
+    write_session_file(id, LAST_IMAGE_PROMPT_FILE, prompt.as_bytes())
+}
+
 /// Attaches a generated image to that exact message; errors if it is gone
 /// (e.g. the session was deleted meanwhile). Locks internally.
 pub async fn attach_generated_image(
@@ -328,6 +374,11 @@ pub fn read_raw_state(id: &str) -> String {
     read_session_file(id, RAW_STATE_FILE).unwrap_or_default()
 }
 
+/// The raw state before the latest update; empty if there was none.
+pub fn read_prev_raw_state(id: &str) -> String {
+    read_session_file(id, PREV_RAW_STATE_FILE).unwrap_or_default()
+}
+
 fn position_of(history: &[ChatMessage], message_id: &str) -> Option<usize> {
     history.iter().position(|m| m.id == message_id)
 }
@@ -349,6 +400,9 @@ pub async fn write_raw_state_stamped(
         .and_then(|stamp| position_of(&history, stamp.trim()));
     if stamped_pos.is_some_and(|p| p > pos) {
         return Ok(false);
+    }
+    if let Some(old) = read_session_file(id, RAW_STATE_FILE) {
+        write_session_file(id, PREV_RAW_STATE_FILE, old.as_bytes())?;
     }
     write_session_file(id, RAW_STATE_FILE, json.as_bytes())?;
     write_session_file(id, STATE_STAMP_FILE, source_message_id.as_bytes())?;
@@ -379,6 +433,21 @@ pub async fn rename_session(id: &str, title: &str) -> anyhow::Result<()> {
     write_meta(id, &meta)
 }
 
+/// Locks internally. Only while the chat is still empty: the persona shapes
+/// every reply, so it is fixed once the first message exists.
+pub async fn set_session_persona(id: &str, persona: Option<&str>) -> anyhow::Result<()> {
+    let _guard = lock(id).await;
+    if !read_history(id)?.is_empty() {
+        anyhow::bail!("this chat already has messages; its persona is fixed");
+    }
+    let mut meta = read_meta(id)?;
+    meta.persona = persona
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(String::from);
+    write_meta(id, &meta)
+}
+
 /// Locks internally.
 pub async fn delete_session(id: &str) -> anyhow::Result<()> {
     let dir = session_dir(id)?;
@@ -394,6 +463,21 @@ pub async fn delete_session(id: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::{thread::sleep, time::Duration};
+
+    #[test]
+    fn old_assistant_echoes_are_stripped_on_load() {
+        let mut h = vec![
+            ChatMessage::text(
+                "assistant",
+                "Hi.\n\nOutfit: dress\nMood: calm\nLocation: home",
+            ),
+            ChatMessage::text("user", "Outfit: dress\nMood: calm\nLocation: home"),
+        ];
+        let user = h[1].content.clone();
+        strip_old_echoes(&mut h);
+        assert_eq!(h[0].content, "Hi.");
+        assert_eq!(h[1].content, user);
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

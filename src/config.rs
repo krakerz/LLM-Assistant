@@ -51,6 +51,13 @@ pub struct AppConfig {
     /// sandbox anywhere a plain `ls` from the working folder could find it.
     #[serde(default)]
     pub sandbox_trash_dir: String,
+    /// Per-task trash run dirs older than this many days are deleted when a
+    /// new one is created. 0 = no age limit.
+    #[serde(default = "default_trash_max_age_days")]
+    pub trash_max_age_days: u32,
+    /// Total trash size cap in MB; the oldest run dirs go first. 0 = no cap.
+    #[serde(default = "default_trash_max_mb")]
+    pub trash_max_mb: u64,
     /// Propose -> run -> respond cycles chained without the user. 0 = no
     /// limit. Generous by default since the UI collapses intermediate steps.
     #[serde(default = "default_max_auto_steps")]
@@ -120,6 +127,17 @@ pub struct AppConfig {
     /// and never shown, not that the model stops producing it.
     #[serde(default = "default_chat_show_thinking")]
     pub chat_show_thinking: bool,
+    /// Whether the model may think before a chat reply. Off sends
+    /// `reasoning_effort: "none"` on the streamed reply so it starts sooner;
+    /// servers or models that don't support it ignore or reject it (the
+    /// request is then retried without it). On by default.
+    #[serde(default = "default_chat_thinking")]
+    pub chat_thinking: bool,
+    /// How the user appears in photos that show them with the character
+    /// ("man" or "woman"). A persona card line such as `User: woman`
+    /// overrides it. "man" by default.
+    #[serde(default = "default_chat_user_gender")]
+    pub chat_user_gender: String,
     /// Whether a shown thinking block is written into `history.json` (on the
     /// assistant `ChatMessage`, alongside `content`) rather than only ever
     /// existing for the one live turn. Off by default -- reasoning text can
@@ -139,6 +157,12 @@ pub struct AppConfig {
     /// only wants the spoken lines.
     #[serde(default = "default_chat_hide_narration")]
     pub chat_hide_narration: bool,
+    /// Client-side display only, the twin of `chat_hide_narration` for
+    /// `(thought)` blocks: the model is still told to write them, the chat
+    /// header's thought toggle just drops them from the rendered bubble, so
+    /// turning it back on shows them again on old messages too.
+    #[serde(default = "default_chat_hide_thoughts")]
+    pub chat_hide_thoughts: bool,
     /// Client-side only, same as `chat_hide_narration` -- the backend call
     /// is always the streaming one (`send_chat_message_streaming`)
     /// either way, so a live reasoning
@@ -154,6 +178,10 @@ pub struct AppConfig {
     /// director judges it fits; off means only `/pic` and the camera button.
     #[serde(default = "default_chat_auto_images")]
     pub chat_auto_images: bool,
+    /// With auto images on: every reply gets a photo of what she is doing
+    /// now, skipping the director's photo decision. Ignored when off.
+    #[serde(default)]
+    pub chat_photo_every_reply: bool,
     /// Retrieves old messages that no longer fit the prompt and adds them to
     /// the turn (see `recall.rs`). The model decides nothing.
     #[serde(default = "default_chat_recall")]
@@ -169,10 +197,38 @@ pub struct AppConfig {
     /// Cosine floor for an embedding hit.
     #[serde(default = "default_chat_recall_min_similarity")]
     pub chat_recall_min_similarity: f32,
+    /// Before chat recall searches, one short model call rewrites the user's
+    /// message into extra search queries. Off: it costs a call per turn.
+    #[serde(default)]
+    pub chat_recall_query_expansion: bool,
+    /// Model for that rewrite; empty = `model`.
+    #[serde(default)]
+    pub chat_recall_expansion_model: String,
+    /// File ops: index each finished task per working folder and show the
+    /// relevant and newest past ones to a new task (see `recall::recall_tasks`).
+    #[serde(default = "default_fileops_recall")]
+    pub fileops_recall: bool,
+    /// Persona builder: optional folder with `danbooru_tags.csv` and
+    /// `danbooru_tags_cooccurrence.csv` (comfyui-autocomplete-plus format).
+    /// Overrides the tag list shipped with the app. Empty = shipped list.
+    #[serde(default)]
+    pub danbooru_tags_dir: String,
+    /// Persona builder: look tags the local list doesn't know up on
+    /// danbooru.donmai.us. Off: it sends tag names to a third party.
+    #[serde(default)]
+    pub danbooru_online_lookup: bool,
 }
 
 fn default_confirm_fade_after() -> u32 {
     3
+}
+
+fn default_trash_max_age_days() -> u32 {
+    30
+}
+
+fn default_trash_max_mb() -> u64 {
+    2048
 }
 
 fn default_server_session_expiry_days() -> u32 {
@@ -203,11 +259,23 @@ fn default_chat_show_thinking() -> bool {
     true
 }
 
+fn default_chat_thinking() -> bool {
+    true
+}
+
+fn default_chat_user_gender() -> String {
+    "man".to_string()
+}
+
 fn default_chat_persist_thinking() -> bool {
     false
 }
 
 fn default_chat_hide_narration() -> bool {
+    false
+}
+
+fn default_chat_hide_thoughts() -> bool {
     false
 }
 
@@ -235,6 +303,10 @@ fn default_chat_recall_max() -> u32 {
 // mostly below 0.53 (NOTES 2026-10-18).
 fn default_chat_recall_min_similarity() -> f32 {
     0.58
+}
+
+fn default_fileops_recall() -> bool {
+    true
 }
 
 /// 8000 turned out tight once accounted for: `CHAT_NARRATION_PROMPT` alone is
@@ -284,6 +356,8 @@ impl Default for AppConfig {
             granted_paths: vec![],
             auto_approve: vec![],
             sandbox_trash_dir: String::new(),
+            trash_max_age_days: default_trash_max_age_days(),
+            trash_max_mb: default_trash_max_mb(),
             max_auto_steps: default_max_auto_steps(),
             tool_calling: default_tool_calling(),
             command_timeout_secs: default_command_timeout_secs(),
@@ -296,15 +370,24 @@ impl Default for AppConfig {
             memory_max_tokens: default_memory_max_tokens(),
             chat_state_max_tokens: default_chat_state_max_tokens(),
             chat_show_thinking: default_chat_show_thinking(),
+            chat_thinking: default_chat_thinking(),
+            chat_user_gender: default_chat_user_gender(),
             chat_persist_thinking: default_chat_persist_thinking(),
             chat_hide_narration: default_chat_hide_narration(),
+            chat_hide_thoughts: default_chat_hide_thoughts(),
             chat_stream_replies: default_chat_stream_replies(),
             chat_auto_images: default_chat_auto_images(),
+            chat_photo_every_reply: false,
             chat_recall: default_chat_recall(),
             chat_recall_scope: default_chat_recall_scope(),
             chat_recall_embedding_model: String::new(),
             chat_recall_max: default_chat_recall_max(),
             chat_recall_min_similarity: default_chat_recall_min_similarity(),
+            chat_recall_query_expansion: false,
+            chat_recall_expansion_model: String::new(),
+            fileops_recall: default_fileops_recall(),
+            danbooru_tags_dir: String::new(),
+            danbooru_online_lookup: false,
         }
     }
 }
@@ -347,11 +430,17 @@ mod tests {
             toml::from_str("endpoint = \"http://x/v1/chat/completions\"\nmodel = \"m\"\n").unwrap();
         assert_eq!(cfg.model, "m");
         assert_eq!(cfg.system_prompt, super::AppConfig::default().system_prompt);
-        assert!(cfg.chat_auto_images);
+        assert!(cfg.chat_auto_images && !cfg.chat_photo_every_reply);
+        let old: super::AppConfig = toml::from_str("chat_auto_images = false\n").unwrap();
+        assert!(!old.chat_auto_images && !old.chat_photo_every_reply);
         assert!(cfg.chat_recall && cfg.chat_recall_embedding_model.is_empty());
+        assert!(cfg.fileops_recall && !cfg.chat_recall_query_expansion);
+        assert!(cfg.danbooru_tags_dir.is_empty() && !cfg.danbooru_online_lookup);
+        assert!(cfg.chat_recall_expansion_model.is_empty());
         assert_eq!(
             (cfg.chat_recall_scope.as_str(), cfg.chat_recall_max),
             ("session", 4)
         );
+        assert_eq!((cfg.trash_max_age_days, cfg.trash_max_mb), (30, 2048));
     }
 }

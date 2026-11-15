@@ -43,6 +43,8 @@ pub struct ComfyUiMapping {
     pub cfg: String,
     #[serde(default)]
     pub steps: String,
+    #[serde(default)]
+    pub seed: String,
 }
 
 /// What the character does once a generated image lands: always continue the
@@ -81,6 +83,141 @@ pub struct ComfyUiConfig {
     /// Ask ComfyUI to drop its models and cached memory after each image.
     #[serde(default)]
     pub free_after_generation: bool,
+    /// Pixel sizes behind the model's `portrait`/`landscape`/`square` choice.
+    #[serde(default)]
+    pub size_presets: SizePresets,
+    /// Preset used when the model picks none.
+    #[serde(default)]
+    pub default_size: DefaultSize,
+}
+
+const MIN_SIDE: i64 = 256;
+const MAX_SIDE: i64 = 4096;
+/// Largest seed the app generates (2^50): exactly representable in the JS
+/// numbers the UI round-trips, and accepted by ComfyUI's seed inputs.
+const MAX_SEED: i64 = 1_125_899_906_842_624;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Size {
+    pub width: i64,
+    pub height: i64,
+}
+
+impl Size {
+    /// Clamps each side to 256..=4096 and rounds it to the nearest multiple of 8.
+    #[must_use]
+    pub fn sanitized(self) -> Self {
+        let side = |v: i64| ((v.clamp(MIN_SIDE, MAX_SIDE) + 4) / 8 * 8).clamp(MIN_SIDE, MAX_SIDE);
+        Self {
+            width: side(self.width),
+            height: side(self.height),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizePresets {
+    pub portrait: Size,
+    pub landscape: Size,
+    pub square: Size,
+}
+
+impl Default for SizePresets {
+    fn default() -> Self {
+        Self {
+            portrait: Size {
+                width: 832,
+                height: 1216,
+            },
+            landscape: Size {
+                width: 1216,
+                height: 832,
+            },
+            square: Size {
+                width: 1024,
+                height: 1024,
+            },
+        }
+    }
+}
+
+impl SizePresets {
+    #[must_use]
+    pub fn sanitized(self) -> Self {
+        Self {
+            portrait: self.portrait.sanitized(),
+            landscape: self.landscape.sanitized(),
+            square: self.square.sanitized(),
+        }
+    }
+
+    fn get(&self, preset: SizePreset) -> Size {
+        match preset {
+            SizePreset::Portrait => self.portrait,
+            SizePreset::Landscape => self.landscape,
+            SizePreset::Square => self.square,
+        }
+    }
+}
+
+/// The model's size choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SizePreset {
+    Portrait,
+    Landscape,
+    Square,
+}
+
+impl SizePreset {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Portrait => "portrait",
+            Self::Landscape => "landscape",
+            Self::Square => "square",
+        }
+    }
+}
+
+/// What to do when the model picks no size: keep the workflow's own, or a preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultSize {
+    #[default]
+    Workflow,
+    Portrait,
+    Landscape,
+    Square,
+}
+
+impl DefaultSize {
+    fn preset(self) -> Option<SizePreset> {
+        match self {
+            Self::Workflow => None,
+            Self::Portrait => Some(SizePreset::Portrait),
+            Self::Landscape => Some(SizePreset::Landscape),
+            Self::Square => Some(SizePreset::Square),
+        }
+    }
+}
+
+/// The model's seed choice; the number itself is always the app's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedMode {
+    New,
+    Same,
+}
+
+/// Unknown strings (or any other shape) become `None` instead of failing the
+/// whole struct.
+fn lenient<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let v = Option::<serde_json::Value>::deserialize(de)?;
+    Ok(v.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 fn default_output_dir() -> String {
@@ -106,6 +243,8 @@ impl Default for ComfyUiConfig {
             reaction_mode: ReactionMode::default(),
             unload_llm_during_generation: false,
             free_after_generation: false,
+            size_presets: SizePresets::default(),
+            default_size: DefaultSize::default(),
         }
     }
 }
@@ -161,6 +300,56 @@ pub struct ImagePromptFields {
     pub cfg: Option<f64>,
     #[serde(default)]
     pub steps: Option<i64>,
+    /// The model's size choice; `resolve_fields` turns it into `width`/`height`.
+    #[serde(default, deserialize_with = "lenient")]
+    pub size: Option<SizePreset>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub seed_mode: Option<SeedMode>,
+    /// Filled by `resolve_fields`, never by the model.
+    #[serde(default)]
+    pub seed: Option<i64>,
+}
+
+/// Resolves the model's `size`/`seed_mode` choices into the numbers sent to
+/// ComfyUI. A raw `width`/`height`/`seed` already in `fields` is discarded.
+/// `fresh_seed` is any random number; it is folded into 0..=2^50.
+#[must_use]
+pub fn resolve_fields(
+    fields: &ImagePromptFields,
+    cfg: &ComfyUiConfig,
+    last_seed: Option<i64>,
+    fresh_seed: i64,
+) -> ImagePromptFields {
+    let mut out = fields.clone();
+    let preset = fields.size.or(cfg.default_size.preset());
+    let size = preset.map(|p| cfg.size_presets.get(p).sanitized());
+    out.width = size.map(|s| s.width);
+    out.height = size.map(|s| s.height);
+    out.seed = if cfg.mapping.seed.trim().is_empty() {
+        None
+    } else {
+        match (fields.seed_mode, last_seed) {
+            (Some(SeedMode::Same), Some(seed)) => Some(seed),
+            _ => Some(fresh_seed.rem_euclid(MAX_SEED + 1)),
+        }
+    };
+    out
+}
+
+/// A fresh random seed in 0..=2^50.
+pub fn random_seed() -> anyhow::Result<i64> {
+    let mut buf = [0u8; 8];
+    getrandom::getrandom(&mut buf).map_err(|e| anyhow::anyhow!("OS RNG failed: {e}"))?;
+    Ok(i64::from_le_bytes(buf).rem_euclid(MAX_SEED + 1))
+}
+
+/// Short label for the log line: the chosen preset or "workflow".
+#[must_use]
+pub fn size_label(fields: &ImagePromptFields, cfg: &ComfyUiConfig) -> &'static str {
+    fields
+        .size
+        .or(cfg.default_size.preset())
+        .map_or("workflow", SizePreset::name)
 }
 
 /// Splits a `"node_id.input_key"` mapping string and writes `value` into
@@ -247,6 +436,9 @@ pub fn apply_mapping(
     if let Some(v) = fields.steps {
         set_mapped(workflow, &mapping.steps, serde_json::Value::from(v))?;
     }
+    if let Some(v) = fields.seed {
+        set_mapped(workflow, &mapping.seed, serde_json::Value::from(v))?;
+    }
     Ok(())
 }
 
@@ -308,6 +500,12 @@ pub async fn generate_image(
                 "the saved ComfyUI workflow JSON doesn't parse ({e}) -- re-paste it in Settings"
             )
         })?;
+    if cfg.mapping.positive.trim().is_empty() {
+        anyhow::bail!(
+            "the positive prompt isn't mapped to a workflow field -- pick it under Field mapping \
+             in Settings' Image Gen tab (without it every image ignores the prompt)"
+        );
+    }
     apply_mapping(&mut workflow, &cfg.mapping, fields)?;
 
     let base_url = cfg.base_url.trim().trim_end_matches('/');
@@ -601,7 +799,126 @@ mod tests {
             scheduler: "58.scheduler".to_string(),
             cfg: "58.cfg".to_string(),
             steps: "58.steps_total".to_string(),
+            seed: "58.seed".to_string(),
         }
+    }
+
+    fn cfg_with_seed(seed_mapped: bool) -> ComfyUiConfig {
+        ComfyUiConfig {
+            mapping: ComfyUiMapping {
+                seed: if seed_mapped {
+                    "58.seed".into()
+                } else {
+                    String::new()
+                },
+                ..sample_mapping()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_uses_the_models_preset_and_ignores_raw_sizes() {
+        let cfg = cfg_with_seed(true);
+        let fields = ImagePromptFields {
+            size: Some(SizePreset::Landscape),
+            width: Some(9999),
+            height: Some(1),
+            ..Default::default()
+        };
+        let r = resolve_fields(&fields, &cfg, None, 5);
+        assert_eq!((r.width, r.height), (Some(1216), Some(832)));
+    }
+
+    #[test]
+    fn resolve_default_size_and_workflow_default() {
+        let mut cfg = cfg_with_seed(true);
+        let raw = ImagePromptFields {
+            width: Some(640),
+            height: Some(640),
+            ..Default::default()
+        };
+        let r = resolve_fields(&raw, &cfg, None, 5);
+        assert_eq!((r.width, r.height), (None, None));
+        cfg.default_size = DefaultSize::Square;
+        let r = resolve_fields(&raw, &cfg, None, 5);
+        assert_eq!((r.width, r.height), (Some(1024), Some(1024)));
+    }
+
+    #[test]
+    fn resolve_sanitizes_configured_sizes() {
+        let mut cfg = cfg_with_seed(true);
+        cfg.size_presets.portrait = Size {
+            width: 100,
+            height: 5000,
+        };
+        cfg.size_presets.square = Size {
+            width: 1001,
+            height: 1019,
+        };
+        let p = ImagePromptFields {
+            size: Some(SizePreset::Portrait),
+            ..Default::default()
+        };
+        let r = resolve_fields(&p, &cfg, None, 5);
+        assert_eq!((r.width, r.height), (Some(256), Some(4096)));
+        let q = ImagePromptFields {
+            size: Some(SizePreset::Square),
+            ..Default::default()
+        };
+        let r = resolve_fields(&q, &cfg, None, 5);
+        assert_eq!((r.width, r.height), (Some(1000), Some(1016)));
+    }
+
+    #[test]
+    fn resolve_seed_modes() {
+        let cfg = cfg_with_seed(true);
+        let same = ImagePromptFields {
+            seed_mode: Some(SeedMode::Same),
+            ..Default::default()
+        };
+        assert_eq!(resolve_fields(&same, &cfg, Some(42), 7).seed, Some(42));
+        assert_eq!(resolve_fields(&same, &cfg, None, 7).seed, Some(7));
+        let new = ImagePromptFields {
+            seed_mode: Some(SeedMode::New),
+            ..Default::default()
+        };
+        assert_eq!(resolve_fields(&new, &cfg, Some(42), 7).seed, Some(7));
+        let seeded = ImagePromptFields {
+            seed: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(resolve_fields(&seeded, &cfg, None, 7).seed, Some(7));
+        let unmapped = cfg_with_seed(false);
+        assert_eq!(resolve_fields(&same, &unmapped, Some(42), 7).seed, None);
+        let big = resolve_fields(&new, &cfg, None, i64::MAX).seed.unwrap();
+        assert!((0..=MAX_SEED).contains(&big));
+    }
+
+    #[test]
+    fn apply_mapping_writes_the_seed() {
+        let mut workflow = sample_workflow();
+        workflow["58"]["inputs"]["seed"] = serde_json::json!(1);
+        let fields = ImagePromptFields {
+            seed: Some(123),
+            ..Default::default()
+        };
+        apply_mapping(&mut workflow, &sample_mapping(), &fields).unwrap();
+        assert_eq!(workflow["58"]["inputs"]["seed"], 123);
+    }
+
+    #[test]
+    fn unknown_size_and_seed_strings_become_none() {
+        let f: ImagePromptFields =
+            serde_json::from_str(r#"{"size":"huge","seed_mode":"later","steps":3}"#).unwrap();
+        assert_eq!((f.size, f.seed_mode, f.steps), (None, None, Some(3)));
+        let f: ImagePromptFields =
+            serde_json::from_str(r#"{"size":"square","seed_mode":"same"}"#).unwrap();
+        assert_eq!(f.size, Some(SizePreset::Square));
+        assert_eq!(f.seed_mode, Some(SeedMode::Same));
+        let back: ImagePromptFields =
+            serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(back.size, Some(SizePreset::Square));
     }
 
     #[test]

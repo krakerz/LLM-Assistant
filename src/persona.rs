@@ -25,7 +25,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-fn personas_dir() -> PathBuf {
+pub(crate) fn personas_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = TEST_PERSONAS_DIR.with(|d| d.borrow().clone()) {
         return dir;
@@ -35,6 +35,11 @@ fn personas_dir() -> PathBuf {
 
 fn persona_path(name: &str) -> PathBuf {
     personas_dir().join(format!("{}.md", sanitize_filename(name, "persona")))
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_personas_dir(dir: PathBuf) {
+    TEST_PERSONAS_DIR.with(|d| *d.borrow_mut() = Some(dir));
 }
 
 #[cfg(test)]
@@ -122,12 +127,14 @@ pub fn delete_persona(name: &str) -> anyhow::Result<()> {
     let base = trash_dir.join(format!("{timestamp}-{file_name}"));
     if !base.exists() {
         fs::rename(&path, &base)?;
+        crate::persona_builder::remove_sidecar(&sanitize_filename(name, "persona"));
         return Ok(());
     }
     for n in 2.. {
         let candidate = trash_dir.join(format!("{timestamp}-{n}-{file_name}"));
         if !candidate.exists() {
             fs::rename(&path, &candidate)?;
+            crate::persona_builder::remove_sidecar(&sanitize_filename(name, "persona"));
             return Ok(());
         }
     }

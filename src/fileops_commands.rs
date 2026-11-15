@@ -36,10 +36,19 @@ impl AppState {
 
     /// Cancels any running task and drops the session once it has let go.
     async fn stop_and_drop_session(&self) {
-        if let Some(cancel) = self.running.lock().unwrap().as_ref() {
-            cancel.cancel();
-        }
+        self.cancel_running();
         *self.session.lock().await = None;
+    }
+
+    /// Cancels the running task, if any; `true` if one was running.
+    pub fn cancel_running(&self) -> bool {
+        match self.running.lock().unwrap().as_ref() {
+            Some(cancel) => {
+                cancel.cancel();
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -233,7 +242,9 @@ struct GuiHost<'a> {
 impl AgentHost for GuiHost<'_> {
     fn emit(&self, ev: AgentEvent) {
         if let Err(e) = self.channel.send(ev) {
-            log::debug!("agent event not delivered: {e}");
+            // The page that started the task is gone; nobody can answer it.
+            log::warn!("agent event not delivered, stopping the task: {e}");
+            self.cancel.cancel();
         }
     }
 

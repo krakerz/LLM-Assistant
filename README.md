@@ -111,3 +111,5 @@ Into the trash folder set in Settings → File Operations (by default under the 
 ### Notes
 
 Built and maintained with the help of AI.
+
+The persona builder's built-in tag list comes from public Danbooru tag data, as distributed by the ComfyUI node [comfyui-autocomplete-plus](https://github.com/newtextdoc1111/ComfyUI-Autocomplete-Plus). `scripts/build-danbooru-db.py` regenerates it.
