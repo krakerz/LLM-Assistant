@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-11-15
+
 ### Added
 - A chat setting to let the model skip its reasoning before replying, so replies start sooner (Settings → Chat, "Let the model think before replying"; some servers or models ignore it)
 - A button in the chat header (next to the narration eye) to show or hide the character's inner thoughts
