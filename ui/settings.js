@@ -56,9 +56,18 @@ const COMFY_MAPPING_FIELDS = [
   ["cfgComfyMapScheduler", "scheduler"],
   ["cfgComfyMapCfg", "cfg"],
   ["cfgComfyMapSteps", "steps"],
+  ["cfgComfyMapSeed", "seed"],
 ];
 
-// Parses the pasted ComfyUI workflow JSON and rebuilds each of the 9 mapping
+const COMFY_SIZE_DEFAULTS = {
+  portrait: { width: 832, height: 1216 },
+  landscape: { width: 1216, height: 832 },
+  square: { width: 1024, height: 1024 },
+};
+const comfySizeId = (name, dim) =>
+  `cfgComfySize${name[0].toUpperCase()}${name.slice(1)}${dim === "width" ? "W" : "H"}`;
+
+// Parses the pasted ComfyUI workflow JSON and rebuilds each of the 10 mapping
 // <select>s from its actual nodes -- node ids are specific to one workflow
 // export, so the user picks from what's really in *this* JSON rather than
 // typing one. Only scalar input values (string/number/boolean) are offered;
@@ -68,28 +77,40 @@ const COMFY_MAPPING_FIELDS = [
 // whatever it was already showing, if that path still exists in the
 // reparsed workflow -- lets the workflow textarea reparse live as the user
 // types/pastes without losing selections that are still valid.
+// The user's chosen path per field. Kept apart from the <select>s so a path
+// that drops out of the JSON for a moment (half-typed edit) comes back
+// selected once the JSON is whole again, instead of silently becoming
+// "(not mapped)" and being saved that way.
+const comfyWantedMapping = {};
+
 function rebuildComfyMappingOptions(applyMapping) {
+  if (applyMapping) {
+    for (const [, field] of COMFY_MAPPING_FIELDS) comfyWantedMapping[field] = applyMapping[field] || "";
+  }
   const options = [];
+  let workflow;
   try {
-    const workflow = JSON.parse(document.getElementById("cfgComfyWorkflowJson").value);
-    if (workflow && typeof workflow === "object") {
-      for (const [nodeId, node] of Object.entries(workflow)) {
-        const inputs = node?.inputs;
-        if (!inputs || typeof inputs !== "object") continue;
-        const label = node._meta?.title || node.class_type || nodeId;
-        for (const [key, value] of Object.entries(inputs)) {
-          if (value === null || typeof value === "object") continue; // array wire or object
-          options.push({ path: `${nodeId}.${key}`, text: `${nodeId} · ${label} · ${key}` });
-        }
+    workflow = JSON.parse(document.getElementById("cfgComfyWorkflowJson").value);
+  } catch {
+    // Invalid/incomplete JSON while typing: leave the dropdowns as they are.
+    // (On dialog open there is nothing to keep, so fall through and build blanks.)
+    if (!applyMapping) return;
+  }
+  if (workflow && typeof workflow === "object") {
+    for (const [nodeId, node] of Object.entries(workflow)) {
+      const inputs = node?.inputs;
+      if (!inputs || typeof inputs !== "object") continue;
+      const label = node._meta?.title || node.class_type || nodeId;
+      for (const [key, value] of Object.entries(inputs)) {
+        if (value === null || typeof value === "object") continue; // array wire or object
+        options.push({ path: `${nodeId}.${key}`, text: `${nodeId} · ${label} · ${key}` });
       }
     }
-  } catch {
-    // Invalid/incomplete JSON while typing -- just offer no options yet.
   }
 
   for (const [id, field] of COMFY_MAPPING_FIELDS) {
     const select = document.getElementById(id);
-    const previousValue = applyMapping ? applyMapping[field] || "" : select.value;
+    const previousValue = comfyWantedMapping[field] ?? select.value;
     select.innerHTML = "";
     const blank = document.createElement("option");
     blank.value = "";
@@ -110,6 +131,11 @@ function rebuildComfyMappingOptions(applyMapping) {
 document
   .getElementById("cfgComfyWorkflowJson")
   .addEventListener("input", () => rebuildComfyMappingOptions());
+for (const [id, field] of COMFY_MAPPING_FIELDS) {
+  document.getElementById(id).addEventListener("change", (e) => {
+    comfyWantedMapping[field] = e.target.value;
+  });
+}
 
 document.getElementById("cfgComfyOutputDirBrowseBtn").addEventListener("click", async () => {
   try {
@@ -117,6 +143,15 @@ document.getElementById("cfgComfyOutputDirBrowseBtn").addEventListener("click", 
     if (path) document.getElementById("cfgComfyOutputDir").value = path;
   } catch (err) {
     console.error("pick_comfyui_output_dir failed:", err);
+  }
+});
+
+document.getElementById("cfgDanbooruTagsDirBrowseBtn").addEventListener("click", async () => {
+  try {
+    const path = await invoke("pick_danbooru_tags_dir");
+    if (path) document.getElementById("cfgDanbooruTagsDir").value = path;
+  } catch (err) {
+    console.error("pick_danbooru_tags_dir failed:", err);
   }
 });
 
@@ -180,6 +215,18 @@ function collectComfyConfigFromForm() {
     reaction_mode: document.getElementById("cfgComfyReactionMode").value,
     unload_llm_during_generation: document.getElementById("cfgComfyUnloadLlm").checked,
     free_after_generation: document.getElementById("cfgComfyFreeAfter").checked,
+    size_presets: Object.fromEntries(
+      Object.entries(COMFY_SIZE_DEFAULTS).map(([name, def]) => [
+        name,
+        Object.fromEntries(
+          ["width", "height"].map((dim) => [
+            dim,
+            parseInt(document.getElementById(comfySizeId(name, dim)).value, 10) || def[dim],
+          ]),
+        ),
+      ]),
+    ),
+    default_size: document.getElementById("cfgComfyDefaultSize").value,
   };
 }
 
@@ -208,12 +255,21 @@ function renderSettings() {
   document.getElementById("cfgMaxContextTokens").value = currentConfig.max_context_tokens;
   document.getElementById("cfgConfirmFadeAfter").value = currentConfig.confirm_fade_after;
   document.getElementById("cfgMemoryEnabled").checked = !!currentConfig.memory_enabled;
+  document.getElementById("cfgFileopsRecall").checked = currentConfig.fileops_recall ?? true;
   document.getElementById("cfgMemoryMaxTokens").value = currentConfig.memory_max_tokens;
   document.getElementById("cfgSandboxTrashDir").value = currentConfig.sandbox_trash_dir || "";
   document.getElementById("cfgChatStateMaxTokens").value = currentConfig.chat_state_max_tokens;
+  document.getElementById("cfgChatThinking").checked = currentConfig.chat_thinking ?? true;
   document.getElementById("cfgChatShowThinking").checked = !!currentConfig.chat_show_thinking;
   document.getElementById("cfgChatPersistThinking").checked = !!currentConfig.chat_persist_thinking;
-  document.getElementById("cfgChatAutoImages").checked = currentConfig.chat_auto_images ?? true;
+  document.getElementById("cfgChatPhotoMode").value =
+    currentConfig.chat_auto_images === false
+      ? "off"
+      : currentConfig.chat_photo_every_reply
+        ? "every_reply"
+        : "auto";
+  document.getElementById("cfgChatUserGender").value =
+    currentConfig.chat_user_gender === "woman" ? "woman" : "man";
   document.getElementById("cfgChatStreamReplies").checked = !!currentConfig.chat_stream_replies;
   document.getElementById("cfgChatRecall").checked = currentConfig.chat_recall ?? true;
   document.getElementById("cfgChatRecallPersona").checked =
@@ -221,6 +277,20 @@ function renderSettings() {
   document.getElementById("cfgChatRecallEmbeddingModel").value =
     currentConfig.chat_recall_embedding_model || "";
   document.getElementById("cfgChatRecallMax").value = currentConfig.chat_recall_max ?? 4;
+  document.getElementById("cfgChatRecallQueryExpansion").checked =
+    !!currentConfig.chat_recall_query_expansion;
+  document.getElementById("cfgChatRecallExpansionModel").value =
+    currentConfig.chat_recall_expansion_model || "";
+  document.getElementById("cfgDanbooruTagsDir").value = currentConfig.danbooru_tags_dir || "";
+  document.getElementById("cfgDanbooruOnlineLookup").checked =
+    !!currentConfig.danbooru_online_lookup;
+  // --server: the folder is desktop-only (see ServerSaveConfig).
+  document.getElementById("cfgDanbooruTagsDir").disabled = !window.__TAURI__;
+  document.getElementById("cfgDanbooruTagsDirBrowseBtn").hidden = !window.__TAURI__;
+  document.getElementById("cfgDanbooruTagsDirWebNote").hidden = !!window.__TAURI__;
+  document.getElementById("cfgDanbooruTagsDir").placeholder = window.__TAURI__
+    ? "/absolute/path"
+    : "desktop app only";
   document.getElementById("cfgSystemPrompt").value = currentConfig.system_prompt;
   document.getElementById("cfgDisableBuiltinRules").checked = !!currentConfig.disable_builtin_rules;
   document.getElementById("cfgSummarizeBeforeDropping").checked =
@@ -237,6 +307,13 @@ function renderSettings() {
   document.getElementById("cfgComfyReactionMode").value = currentComfyConfig.reaction_mode || "always";
   document.getElementById("cfgComfyUnloadLlm").checked = !!currentComfyConfig.unload_llm_during_generation;
   document.getElementById("cfgComfyFreeAfter").checked = !!currentComfyConfig.free_after_generation;
+  for (const [name, def] of Object.entries(COMFY_SIZE_DEFAULTS)) {
+    for (const dim of ["width", "height"]) {
+      document.getElementById(comfySizeId(name, dim)).value =
+        currentComfyConfig.size_presets?.[name]?.[dim] ?? def[dim];
+    }
+  }
+  document.getElementById("cfgComfyDefaultSize").value = currentComfyConfig.default_size || "workflow";
   rebuildComfyMappingOptions(currentComfyConfig.mapping);
   document.getElementById("testComfyGenerationResult").textContent = "";
   document.getElementById("testComfyGenerationResult").classList.remove("warn");
@@ -461,6 +538,7 @@ document.getElementById("settingsSaveBtn").addEventListener("click", async () =>
     parseInt(document.getElementById("cfgConfirmFadeAfter").value, 10) || 0,
   );
   currentConfig.memory_enabled = document.getElementById("cfgMemoryEnabled").checked;
+  currentConfig.fileops_recall = document.getElementById("cfgFileopsRecall").checked;
   currentConfig.memory_max_tokens = Math.max(
     0,
     parseInt(document.getElementById("cfgMemoryMaxTokens").value, 10) || 0,
@@ -470,9 +548,13 @@ document.getElementById("settingsSaveBtn").addEventListener("click", async () =>
     0,
     parseInt(document.getElementById("cfgChatStateMaxTokens").value, 10) || 0,
   );
+  currentConfig.chat_thinking = document.getElementById("cfgChatThinking").checked;
   currentConfig.chat_show_thinking = document.getElementById("cfgChatShowThinking").checked;
   currentConfig.chat_persist_thinking = document.getElementById("cfgChatPersistThinking").checked;
-  currentConfig.chat_auto_images = document.getElementById("cfgChatAutoImages").checked;
+  const photoMode = document.getElementById("cfgChatPhotoMode").value;
+  currentConfig.chat_user_gender = document.getElementById("cfgChatUserGender").value;
+  currentConfig.chat_auto_images = photoMode !== "off";
+  currentConfig.chat_photo_every_reply = photoMode === "every_reply";
   currentConfig.chat_stream_replies = document.getElementById("cfgChatStreamReplies").checked;
   currentConfig.chat_recall = document.getElementById("cfgChatRecall").checked;
   currentConfig.chat_recall_scope = document.getElementById("cfgChatRecallPersona").checked
@@ -485,6 +567,15 @@ document.getElementById("settingsSaveBtn").addEventListener("click", async () =>
     10,
     Math.max(1, parseInt(document.getElementById("cfgChatRecallMax").value, 10) || 4),
   );
+  currentConfig.chat_recall_query_expansion = document.getElementById(
+    "cfgChatRecallQueryExpansion",
+  ).checked;
+  currentConfig.chat_recall_expansion_model = document
+    .getElementById("cfgChatRecallExpansionModel")
+    .value.trim();
+  currentConfig.danbooru_tags_dir = document.getElementById("cfgDanbooruTagsDir").value.trim();
+  currentConfig.danbooru_online_lookup =
+    document.getElementById("cfgDanbooruOnlineLookup").checked;
   currentConfig.system_prompt = document.getElementById("cfgSystemPrompt").value;
   currentConfig.disable_builtin_rules = document.getElementById("cfgDisableBuiltinRules").checked;
   currentConfig.summarize_before_dropping = document.getElementById(
@@ -519,6 +610,7 @@ document.getElementById("settingsSaveBtn").addEventListener("click", async () =>
     return;
   }
   updateNarrationToggleBtn();
+  updateThoughtsToggleBtn();
   refreshImageCapability(); // ComfyUI setup may have changed
   if (chatModeView && !chatModeView.hidden) renderChatHistoryLog();
   settingsDialog.hidden = true;

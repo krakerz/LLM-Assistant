@@ -16,12 +16,13 @@
 // `hideNarration` (from `chat_hide_narration`) drops action blocks only
 // (thoughts stay) rather than just styling them differently -- the model is
 // still always told to write them (`CHAT_NARRATION_PROMPT`), this is
-// purely a display choice.
+// purely a display choice. `hideThoughts` (from `chat_hide_thoughts`) does
+// the same for `(thought)` blocks; the legacy grammar has none.
 // Parses `text` into blocks (`{type: "action"|"dialogue"|"thought", html}`),
 // kept separate rather than joined into one string --
 // `groupChatBlocksIntoBubbles` below needs the blocks apart to split them
 // across multiple bubbles.
-function splitChatBlocks(text, hideNarration = false) {
+function splitChatBlocks(text, hideNarration = false, hideThoughts = false) {
   const codeBlocks = [];
   // NUL delimits our placeholders below; a literal one in model text would forge one.
   let working = text.replace(/\u0000/g, "").replace(/```([a-zA-Z]*)\n([\s\S]*?)```/g, (_, _lang, code) => {
@@ -39,7 +40,7 @@ function splitChatBlocks(text, hideNarration = false) {
   if (legacyPair.test(working.replace(/\b[a-z][a-z0-9+.-]*:\/\/\S*/gi, ""))) {
     return splitLegacyBlocks(working, codeBlocks, inlineCode, hideNarration);
   }
-  return splitRoleplayBlocks(working, codeBlocks, inlineCode, hideNarration);
+  return splitRoleplayBlocks(working, codeBlocks, inlineCode, hideNarration, hideThoughts);
 }
 
 // Escapes `raw`, applies `**bold**`/`*italic*`, drops any leftover `*`, then
@@ -67,7 +68,7 @@ function matchingParen(s, open) {
   return -1;
 }
 
-function splitRoleplayBlocks(working, codeBlocks, inlineCode, hideNarration) {
+function splitRoleplayBlocks(working, codeBlocks, inlineCode, hideNarration, hideThoughts) {
   const fmt = (raw) => renderRoleplayInline(raw, codeBlocks, inlineCode);
   const blocks = [];
   // Speech pieces (quoted + plain) accumulate until an action/thought
@@ -91,6 +92,7 @@ function splitRoleplayBlocks(working, codeBlocks, inlineCode, hideNarration) {
     // No fallback to raw text when everything is hidden: an all-action
     // message under `hideNarration` legitimately renders as nothing.
     if (type === "action" && hideNarration) return;
+    if (type === "thought" && hideThoughts) return;
     blocks.push({ type, html: `<div class="chat-${type}">${fmt(raw.trim())}</div>` });
   };
   let plain = "";
@@ -314,7 +316,8 @@ function appendChatModeBubble(role, text, attachments = []) {
   }
 
   const hideNarration = currentConfig?.chat_hide_narration ?? false;
-  const blocks = splitChatBlocks(text, hideNarration);
+  const hideThoughts = currentConfig?.chat_hide_thoughts ?? false;
+  const blocks = splitChatBlocks(text, hideNarration, hideThoughts);
   // `CHAT_NARRATION_PROMPT`'s strict alternation is a rule for the *model*,
   // never the user -- a person typing is free to mix narration-style asides
   // into a message however they like without it getting split apart, so only

@@ -4,6 +4,66 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- A chat setting to let the model skip its reasoning before replying, so replies start sooner (Settings → Chat, "Let the model think before replying"; some servers or models ignore it)
+- A button in the chat header (next to the narration eye) to show or hide the character's inner thoughts
+- File operations remember earlier tasks in the same folder, across sessions: a new task sees the most relevant and the latest past requests with their outcome and date, and a note when a file they changed has changed or disappeared since (Settings → File Operations)
+- Text and code files attached in a chat can be recalled later in that chat, after they have scrolled out of the model's context
+- Optional query rewriting for chat recall: one short extra model call turns your message into search queries, which helps with loosely phrased questions (Settings → Chat, off by default; can use a separate small model)
+- Image size presets: the character picks portrait, landscape or square, and the pixel sizes come from Settings → Image Gen (used when Width and Height are mapped; a fallback preset applies when she picks none)
+- A mappable Seed field for image generation: a new random seed per photo, or the previous photo's seed when you ask for a variation of it
+- The file-ops trash is emptied of backups older than 30 days or beyond 2 GB in total, oldest first (`trash_max_age_days`, `trash_max_mb` in config.toml; 0 turns a limit off)
+- Photo mode "with every reply": the character sends a photo of what she is doing right now with each message (Settings → Chat, replaces the on/off photo checkbox)
+- Persona builder: describe a character in a few fields and the model drafts the card section by section; edit, regenerate single sections, preview and save
+- Photos work for male characters; a setting (Settings → Chat, "You appear in photos as") or a "User:" line in the card says how you appear in photos
+- Personas made with the builder can be reopened in it later ("Edit with builder")
+- Built-in Danbooru tag list for the builder: fixes tag spelling and aliases, finds a character's tag and suggests outfits; a folder with your own tag files can replace it (Settings → Chat)
+- Optional online lookup for tags the local list doesn't know (off by default)
+- The persona builder can look an existing character up through web search and render a test photo before saving
+
+### Changed
+- A new, still empty chat can switch persona; the persona is fixed once the first message is sent
+- Chat replies are steered toward short, natural conversation; a persona card can override this
+- The message a character sends with a photo now reads as her own line about what you asked ("how do I look?"), not as a comment on the picture
+- The desktop window now enforces a Content Security Policy, as `--server` already did
+- The Image Gen settings tab uses two columns on wide windows: workflow JSON on the left, field mapping and size presets on the right
+
+### Fixed
+- Holding a riding crop no longer turns a photo into a sex scene
+- Stat fields copied from the card template no longer end up in her state
+- Replies no longer repeat the app's photo note
+- Stat lines the model echoes into a reply (Outfit:, Mood:, ...) are removed from the chat
+- Stat lines in old saved chats are cleaned up too
+- A garment she took off no longer reappears in her outfit unless it is mentioned
+- A photo "of us" now shows both of you, even without a sex scene
+- An original character's name is no longer used as a photo tag
+- Photos always carry the negative tags listed as "always" in the image rules, even when the model leaves some out
+- Vague prose in photo prompts ("playful glint in eyes", "afternoon sun", a lone "wearing") becomes a real tag or is dropped
+- A selfie no longer comes out "from behind" unless you asked for the back view
+- Close-up chat photos no longer show her shoes or socks in the frame
+- A remark about the last chat photo no longer triggers a new photo, and the character treats glitches in it as a camera mistake
+- A reply that stalls with "are you sure?" after a clear request is regenerated once
+- Photos no longer mix in other outfits from the character card
+- Photos follow her state more closely: clothes she took off stay off, and the picture matches when her reply or activity says she undressed
+- Photo prompts turn descriptive phrases into proper tags and drop names, stray sentences and tags the state doesn't back
+- Photos at school grounds or other outdoor spots no longer default to an indoor classroom
+- Photos follow the framing the user asks for (close-up, full body, from behind)
+- Character tags with parentheses (e.g. `asuna (blue archive)`) reach ComfyUI escaped and intact
+- The message after a photo no longer invents another photo or repeats her previous reply
+- Opening a chat scrolls to the newest message instead of the oldest
+- The character's outfit updates when she agrees to change clothes, so photos show the new outfit
+- Photos show her current outfit and equipment state without duplicated or garbled outfit tags
+- The character always has a place in her state, so photos no longer get a random background
+- Stop now also interrupts the "summarize older messages" step, in chat and in file operations
+- Reloading the window while a file-ops confirmation is open now stops that task instead of leaving it waiting
+- A folder granted without its subfolders no longer lets the file tools into those subfolders, or create new ones there
+- Text typed alongside an attached file is no longer treated as part of that file, so recall finds it and chats are titled from it
+- Copy/move/truncate commands with a target-directory or size option no longer back up files they don't touch
+- "Always allow" choices and granted folders are no longer lost when a Settings dialog that was already open is saved
+- `--server`: changing the endpoint without entering a key no longer sends the saved key to the new endpoint
+- Clicking "New chat" twice quickly no longer creates two chats
+- Generated photos no longer repeat the same scene; prompts follow the current moment and mood
+- Editing the workflow JSON in Settings → Image Gen no longer resets every field mapping to "(not mapped)" while the JSON is half-typed; image generation now refuses to run when the positive prompt isn't mapped, instead of rendering without it
 ## [2.0.0] — 2026-10-18
 
 ### Added

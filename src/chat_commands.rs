@@ -6,7 +6,9 @@
 use crate::app_commands::first_line;
 use crate::fileops_commands::pick_folder_path;
 use crate::llm::ChatMessage;
-use crate::{chat_session, chat_turn, comfyui, gpu, persona, ruleset, searxng};
+use crate::{
+    chat_session, chat_turn, comfyui, danbooru, gpu, persona, persona_builder, ruleset, searxng,
+};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
 
@@ -43,7 +45,8 @@ pub mod api {
         comfyui::load_or_init().map_err(err)
     }
 
-    pub fn save_comfyui_config(cfg: comfyui::ComfyUiConfig) -> Result<(), String> {
+    pub fn save_comfyui_config(mut cfg: comfyui::ComfyUiConfig) -> Result<(), String> {
+        cfg.size_presets = cfg.size_presets.sanitized();
         log::info!("save_comfyui_config: base_url={}", cfg.base_url);
         comfyui::save(&cfg).map_err(err)
     }
@@ -74,8 +77,16 @@ pub mod api {
             positive: Some("a red circle on a white background".to_string()),
             ..Default::default()
         };
+        image_data_url(&cfg, &fields).await
+    }
+
+    /// Generates one image and returns it as a `data:` URL.
+    async fn image_data_url(
+        cfg: &comfyui::ComfyUiConfig,
+        fields: &comfyui::ImagePromptFields,
+    ) -> Result<String, String> {
         let app_cfg = config::load_or_init().map_err(err)?;
-        let image = gpu::with_image_slot(&app_cfg, &cfg, || comfyui::generate_image(&cfg, &fields))
+        let image = gpu::with_image_slot(&app_cfg, cfg, || comfyui::generate_image(cfg, fields))
             .await
             .map_err(err)?;
         let name = image.filename.to_lowercase();
@@ -115,6 +126,121 @@ pub mod api {
 
     pub fn update_persona(name: String, content: String) -> Result<(), String> {
         persona::update_persona(&name, &content).map_err(err)
+    }
+
+    // --- persona builder ---
+
+    #[derive(serde::Serialize)]
+    pub struct CharacterMatches {
+        pub source: danbooru::TagSource,
+        pub candidates: Vec<danbooru::TagInfo>,
+    }
+
+    #[derive(serde::Serialize)]
+    pub struct TagChecks {
+        pub source: danbooru::TagSource,
+        pub checks: Vec<danbooru::TagCheck>,
+    }
+
+    pub fn persona_builder_status() -> Result<persona_builder::Status, String> {
+        Ok(persona_builder::status(
+            &config::load_or_init().map_err(err)?,
+        ))
+    }
+
+    pub async fn persona_builder_research(
+        build_id: String,
+        brief: persona_builder::Brief,
+    ) -> Result<Vec<persona_builder::Snippet>, String> {
+        let cfg = config::load_or_init().map_err(err)?;
+        persona_builder::research(&cfg, &build_id, &brief.sanitized())
+            .await
+            .map_err(err)
+    }
+
+    pub async fn persona_builder_find_character(
+        name: String,
+        source: String,
+    ) -> Result<CharacterMatches, String> {
+        let cfg = config::load_or_init().map_err(err)?;
+        let (source, candidates) = danbooru::find_characters(&cfg, &name, &source).await;
+        Ok(CharacterMatches { source, candidates })
+    }
+
+    pub async fn persona_builder_check_tags(tags: Vec<String>) -> Result<TagChecks, String> {
+        let cfg = config::load_or_init().map_err(err)?;
+        let (source, checks) = danbooru::check_tags(&cfg, &tags).await;
+        Ok(TagChecks { source, checks })
+    }
+
+    pub async fn persona_builder_suggest(
+        character_tag: String,
+    ) -> Result<Option<persona_builder::Suggestion>, String> {
+        let cfg = config::load_or_init().map_err(err)?;
+        persona_builder::suggest(&cfg, &character_tag)
+            .await
+            .map_err(err)
+    }
+
+    pub async fn persona_builder_generate_section(
+        build_id: String,
+        brief: persona_builder::Brief,
+        section: persona_builder::Section,
+        draft: persona_builder::Draft,
+        snippets: Vec<persona_builder::Snippet>,
+    ) -> Result<persona_builder::SectionOutcome, String> {
+        let cfg = config::load_or_init().map_err(err)?;
+        Ok(persona_builder::generate_section(
+            &cfg,
+            &build_id,
+            &brief.sanitized(),
+            section,
+            &draft,
+            &snippets,
+        )
+        .await)
+    }
+
+    pub fn persona_builder_render(
+        brief: persona_builder::Brief,
+        draft: persona_builder::Draft,
+    ) -> Result<String, String> {
+        Ok(persona_builder::render(&brief.sanitized(), &draft))
+    }
+
+    /// Renders a test portrait of the draft and returns it as a `data:` URL.
+    pub async fn persona_builder_test_photo(
+        build_id: String,
+        brief: persona_builder::Brief,
+        draft: persona_builder::Draft,
+    ) -> Result<String, String> {
+        let cfg = config::load_or_init().map_err(err)?;
+        let comfy = comfyui::load_or_init().map_err(err)?;
+        let fields =
+            persona_builder::test_photo_fields(&cfg, &build_id, &brief.sanitized(), &draft)
+                .await
+                .ok_or_else(|| "Stopped.".to_string())?;
+        image_data_url(&comfy, &fields).await
+    }
+
+    pub fn persona_builder_save(
+        mode: persona_builder::SaveMode,
+        persona: String,
+        brief: persona_builder::Brief,
+        draft: persona_builder::Draft,
+        content: String,
+    ) -> Result<persona::PersonaSummary, String> {
+        persona_builder::save(mode, &persona, &brief.sanitized(), &draft, &content).map_err(err)
+    }
+
+    pub fn persona_builder_load(
+        name: String,
+    ) -> Result<Option<persona_builder::SavedBuild>, String> {
+        persona_builder::load(&name).map_err(err)
+    }
+
+    pub fn stop_persona_builder(build_id: String) -> Result<bool, String> {
+        Ok(persona_builder::stop(&build_id))
     }
 
     /// Editing only: the two rulesets are seeded by `list_rulesets` itself.
@@ -161,6 +287,15 @@ pub mod api {
 
     pub async fn delete_chat_session(session_id: String) -> Result<(), String> {
         chat_session::delete_session(&session_id).await.map_err(err)
+    }
+
+    pub async fn set_chat_session_persona(
+        session_id: String,
+        persona: Option<String>,
+    ) -> Result<(), String> {
+        chat_session::set_session_persona(&session_id, persona.as_deref())
+            .await
+            .map_err(err)
     }
 
     /// The derived `state.md` summary.
@@ -336,6 +471,14 @@ pub async fn pick_comfyui_output_dir(app: AppHandle) -> Result<Option<String>, S
         .map(|p| p.display().to_string()))
 }
 
+/// Folder with the Danbooru tag CSVs (Settings -> Chat); same helper, desktop only.
+#[tauri::command]
+pub async fn pick_danbooru_tags_dir(app: AppHandle) -> Result<Option<String>, String> {
+    Ok(pick_folder_path(&app)
+        .await?
+        .map(|p| p.display().to_string()))
+}
+
 #[tauri::command]
 pub fn list_personas() -> Result<Vec<persona::PersonaSummary>, String> {
     api::list_personas()
@@ -381,6 +524,90 @@ pub fn update_persona(name: String, content: String) -> Result<(), String> {
     api::update_persona(name, content)
 }
 
+// --- persona builder ---
+
+#[tauri::command]
+pub fn persona_builder_status() -> Result<persona_builder::Status, String> {
+    api::persona_builder_status()
+}
+
+#[tauri::command]
+pub async fn persona_builder_research(
+    build_id: String,
+    brief: persona_builder::Brief,
+) -> Result<Vec<persona_builder::Snippet>, String> {
+    api::persona_builder_research(build_id, brief).await
+}
+
+#[tauri::command]
+pub async fn persona_builder_find_character(
+    name: String,
+    source: String,
+) -> Result<api::CharacterMatches, String> {
+    api::persona_builder_find_character(name, source).await
+}
+
+#[tauri::command]
+pub async fn persona_builder_check_tags(tags: Vec<String>) -> Result<api::TagChecks, String> {
+    api::persona_builder_check_tags(tags).await
+}
+
+#[tauri::command]
+pub async fn persona_builder_suggest(
+    character_tag: String,
+) -> Result<Option<persona_builder::Suggestion>, String> {
+    api::persona_builder_suggest(character_tag).await
+}
+
+#[tauri::command]
+pub async fn persona_builder_generate_section(
+    build_id: String,
+    brief: persona_builder::Brief,
+    section: persona_builder::Section,
+    draft: persona_builder::Draft,
+    snippets: Vec<persona_builder::Snippet>,
+) -> Result<persona_builder::SectionOutcome, String> {
+    api::persona_builder_generate_section(build_id, brief, section, draft, snippets).await
+}
+
+#[tauri::command]
+pub fn persona_builder_render(
+    brief: persona_builder::Brief,
+    draft: persona_builder::Draft,
+) -> Result<String, String> {
+    api::persona_builder_render(brief, draft)
+}
+
+#[tauri::command]
+pub async fn persona_builder_test_photo(
+    build_id: String,
+    brief: persona_builder::Brief,
+    draft: persona_builder::Draft,
+) -> Result<String, String> {
+    api::persona_builder_test_photo(build_id, brief, draft).await
+}
+
+#[tauri::command]
+pub fn persona_builder_save(
+    mode: persona_builder::SaveMode,
+    persona: String,
+    brief: persona_builder::Brief,
+    draft: persona_builder::Draft,
+    content: String,
+) -> Result<persona::PersonaSummary, String> {
+    api::persona_builder_save(mode, persona, brief, draft, content)
+}
+
+#[tauri::command]
+pub fn persona_builder_load(name: String) -> Result<Option<persona_builder::SavedBuild>, String> {
+    api::persona_builder_load(name)
+}
+
+#[tauri::command]
+pub fn stop_persona_builder(build_id: String) -> Result<bool, String> {
+    api::stop_persona_builder(build_id)
+}
+
 #[tauri::command]
 pub fn list_rulesets() -> Result<Vec<ruleset::RulesetSummary>, String> {
     api::list_rulesets()
@@ -421,6 +648,14 @@ pub fn load_chat_session(session_id: String) -> Result<serde_json::Value, String
 #[tauri::command]
 pub async fn rename_chat_session(session_id: String, title: String) -> Result<(), String> {
     api::rename_chat_session(session_id, title).await
+}
+
+#[tauri::command]
+pub async fn set_chat_session_persona(
+    session_id: String,
+    persona: Option<String>,
+) -> Result<(), String> {
+    api::set_chat_session_persona(session_id, persona).await
 }
 
 #[tauri::command]
@@ -613,6 +848,7 @@ mod tests {
         let g = serde_json::to_value(chat_turn::GeneratedImageResult {
             image_path: "p".into(),
             image_data_url: "d".into(),
+            seed: Some(1),
             reaction: Some(chat_turn::ReplyMsg {
                 id: "i".into(),
                 text: "t".into(),

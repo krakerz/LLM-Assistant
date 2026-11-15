@@ -13,6 +13,7 @@ mod cli;
 mod comfyui;
 mod config;
 mod context;
+mod danbooru;
 mod fileops_commands;
 mod gpu;
 mod headless;
@@ -20,6 +21,7 @@ mod llm;
 mod memory;
 mod paths;
 mod persona;
+mod persona_builder;
 mod recall;
 mod rules;
 mod ruleset;
@@ -303,6 +305,15 @@ fn main() {
             Ok(())
         })
         .manage(AppState::new(cli_root))
+        // A reload drops the page's Channel and any open confirm dialog, so the
+        // old task could only wait forever; stop it as the new page starts.
+        .on_page_load(|webview, payload| {
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
+                && webview.state::<AppState>().cancel_running()
+            {
+                log::info!("page load: stopped the running file-ops task");
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             fileops_commands::pick_and_set_root,
             fileops_commands::pick_granted_path,
@@ -342,6 +353,18 @@ fn main() {
             chat_commands::delete_persona,
             chat_commands::get_persona_content,
             chat_commands::update_persona,
+            chat_commands::persona_builder_status,
+            chat_commands::persona_builder_research,
+            chat_commands::persona_builder_find_character,
+            chat_commands::persona_builder_check_tags,
+            chat_commands::persona_builder_suggest,
+            chat_commands::persona_builder_generate_section,
+            chat_commands::persona_builder_render,
+            chat_commands::persona_builder_test_photo,
+            chat_commands::persona_builder_save,
+            chat_commands::persona_builder_load,
+            chat_commands::stop_persona_builder,
+            chat_commands::pick_danbooru_tags_dir,
             chat_commands::list_rulesets,
             chat_commands::get_ruleset_content,
             chat_commands::update_ruleset,
@@ -350,6 +373,7 @@ fn main() {
             chat_commands::create_chat_session,
             chat_commands::load_chat_session,
             chat_commands::rename_chat_session,
+            chat_commands::set_chat_session_persona,
             chat_commands::delete_chat_session,
             chat_commands::get_chat_state,
             chat_commands::get_chat_raw_state,

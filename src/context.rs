@@ -13,6 +13,7 @@
 //! those two are never separated here, or the native wire format breaks.
 
 use crate::llm::{ChatMessage, ToolCall};
+use crate::sandbox::CancelToken;
 use crate::{tool_protocol, tools};
 
 const TRIM_MARKER: &str = "[...older turns of this conversation were dropped to stay within the \
@@ -236,6 +237,8 @@ pub struct Summarizer<'a> {
     pub endpoint: &'a str,
     pub model: &'a str,
     pub api_key: &'a str,
+    /// The turn's Stop; a stopped summary falls back to plain dropping.
+    pub cancel: Option<&'a CancelToken>,
 }
 
 /// Below this a round-trip isn't worth it -- a gap marker says as much.
@@ -323,7 +326,14 @@ async fn summarize(s: &Summarizer<'_>, victims: &[ChatMessage]) -> anyhow::Resul
         ChatMessage::text("user", transcript),
     ];
     // Temperature 0: a creative record is the failure mode.
-    let text = crate::llm::send_chat(s.endpoint, s.model, s.api_key, 0.0, &messages).await?;
+    let call = crate::llm::send_chat(s.endpoint, s.model, s.api_key, 0.0, &messages);
+    let text = match s.cancel {
+        Some(cancel) => tokio::select! {
+            r = call => r?,
+            () = cancel.cancelled() => anyhow::bail!("stopped by the user"),
+        },
+        None => call.await?,
+    };
     let text = text.trim();
     if text.is_empty() {
         anyhow::bail!("summarizer returned nothing");
@@ -746,6 +756,7 @@ mod tests {
             endpoint: "http://127.0.0.1:1/never",
             model: "none",
             api_key: "",
+            cancel: None,
         };
         let out = fit_to_budget(20, chain(6), 450, Some(s), None).await;
         assert!(out.condensed > 0);
@@ -788,10 +799,36 @@ mod tests {
             endpoint: "http://127.0.0.1:1/refused",
             model: "none",
             api_key: "",
+            cancel: None,
         };
         let out = fit_to_budget(50, history(40), 600, Some(s), None).await;
         assert!(out.summary.is_none());
         assert!(out.dropped > 0);
         assert!(out.messages.iter().any(|m| m.content == TRIM_MARKER));
+    }
+
+    #[tokio::test]
+    async fn a_stopped_summarizer_returns_promptly_without_rewriting() {
+        // Connections queue in the backlog and are never answered.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let cancel = CancelToken::new();
+        let stopper = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            stopper.cancel();
+        });
+        let s = Summarizer {
+            endpoint: &endpoint,
+            model: "none",
+            api_key: "",
+            cancel: Some(&cancel),
+        };
+        let started = std::time::Instant::now();
+        let out = fit_to_budget(50, history(40), 600, Some(s), None).await;
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+        assert!(out.summary.is_none() && out.rewritten_history.is_none());
+        assert!(out.dropped > 0);
     }
 }

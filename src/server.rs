@@ -23,7 +23,7 @@
 use crate::chat_commands::{api, ChatStreamEvent};
 use crate::llm::ChatMessage;
 use crate::paths::{app_config_dir, write_atomic};
-use crate::{chat_turn, comfyui, config, llm, searxng};
+use crate::{chat_turn, comfyui, config, llm, persona_builder, searxng};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
@@ -635,7 +635,8 @@ async fn h_load_config() -> Response {
 /// listed -- `granted_paths`, `auto_approve`, `disable_builtin_rules`,
 /// `sandbox_trash_dir`, `max_auto_steps`, `confirm_fade_after`, `memory_*` --
 /// is file-ops policy that only the desktop app may touch, and is dropped
-/// here no matter what the client sends.
+/// here no matter what the client sends. `danbooru_tags_dir` is not accepted
+/// either: it would let a browser point the server at any folder.
 #[derive(Deserialize, Default)]
 struct ServerSaveConfig {
     endpoint: Option<String>,
@@ -648,20 +649,33 @@ struct ServerSaveConfig {
     summarize_before_dropping: Option<bool>,
     chat_state_max_tokens: Option<u32>,
     chat_show_thinking: Option<bool>,
+    chat_thinking: Option<bool>,
+    chat_user_gender: Option<String>,
     chat_persist_thinking: Option<bool>,
     chat_hide_narration: Option<bool>,
+    chat_hide_thoughts: Option<bool>,
     chat_stream_replies: Option<bool>,
     chat_auto_images: Option<bool>,
+    chat_photo_every_reply: Option<bool>,
     chat_recall: Option<bool>,
     chat_recall_scope: Option<String>,
     chat_recall_embedding_model: Option<String>,
     chat_recall_max: Option<u32>,
     chat_recall_min_similarity: Option<f32>,
+    chat_recall_query_expansion: Option<bool>,
+    chat_recall_expansion_model: Option<String>,
     server_session_expiry_days: Option<u32>,
+    danbooru_online_lookup: Option<bool>,
+}
+
+/// Endpoint without cosmetic differences (whitespace, trailing slashes).
+fn normalized_endpoint(endpoint: &str) -> &str {
+    endpoint.trim().trim_end_matches('/')
 }
 
 impl ServerSaveConfig {
     fn merge_into(self, cfg: &mut config::AppConfig) {
+        let old_endpoint = normalized_endpoint(&cfg.endpoint).to_string();
         macro_rules! set {
             ($($field:ident),*) => {
                 $(if let Some(v) = self.$field { cfg.$field = v; })*
@@ -677,21 +691,32 @@ impl ServerSaveConfig {
             summarize_before_dropping,
             chat_state_max_tokens,
             chat_show_thinking,
+            chat_thinking,
+            chat_user_gender,
             chat_persist_thinking,
             chat_hide_narration,
+            chat_hide_thoughts,
             chat_stream_replies,
             chat_auto_images,
+            chat_photo_every_reply,
             chat_recall,
             chat_recall_scope,
             chat_recall_embedding_model,
             chat_recall_max,
             chat_recall_min_similarity,
-            server_session_expiry_days
+            chat_recall_query_expansion,
+            chat_recall_expansion_model,
+            server_session_expiry_days,
+            danbooru_online_lookup
         );
         // `h_load_config` blanks the key, so the browser echoes "" back on
-        // every save -- that must keep the stored key, not wipe it.
-        if let Some(key) = self.api_key.filter(|k| !k.is_empty()) {
-            cfg.api_key = key;
+        // every save -- that keeps the stored key, but only for the endpoint it
+        // was saved with: otherwise a client could re-point the endpoint and
+        // collect the key (same rule as `effective_api_key`).
+        match self.api_key.filter(|k| !k.is_empty()) {
+            Some(key) => cfg.api_key = key,
+            None if normalized_endpoint(&cfg.endpoint) != old_endpoint => cfg.api_key.clear(),
+            None => {}
         }
     }
 }
@@ -799,6 +824,136 @@ async fn h_update_persona(Json(req): Json<UpdatePersonaRequest>) -> Response {
     ok_or_400(api::update_persona(req.name, req.content))
 }
 
+// --- persona builder ---
+// Wire names are camelCase, the same as the Tauri commands' arguments.
+
+async fn h_persona_builder_status() -> Response {
+    ok_or_400(api::persona_builder_status())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersonaBuilderResearchRequest {
+    build_id: String,
+    brief: persona_builder::Brief,
+}
+
+async fn h_persona_builder_research(Json(req): Json<PersonaBuilderResearchRequest>) -> Response {
+    ok_or_400(api::persona_builder_research(req.build_id, req.brief).await)
+}
+
+#[derive(Deserialize)]
+struct PersonaBuilderFindCharacterRequest {
+    name: String,
+    source: String,
+}
+
+async fn h_persona_builder_find_character(
+    Json(req): Json<PersonaBuilderFindCharacterRequest>,
+) -> Response {
+    ok_or_400(api::persona_builder_find_character(req.name, req.source).await)
+}
+
+#[derive(Deserialize)]
+struct PersonaBuilderCheckTagsRequest {
+    tags: Vec<String>,
+}
+
+async fn h_persona_builder_check_tags(Json(req): Json<PersonaBuilderCheckTagsRequest>) -> Response {
+    ok_or_400(api::persona_builder_check_tags(req.tags).await)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersonaBuilderSuggestRequest {
+    character_tag: String,
+}
+
+async fn h_persona_builder_suggest(Json(req): Json<PersonaBuilderSuggestRequest>) -> Response {
+    ok_or_400(api::persona_builder_suggest(req.character_tag).await)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersonaBuilderGenerateSectionRequest {
+    build_id: String,
+    brief: persona_builder::Brief,
+    section: persona_builder::Section,
+    draft: persona_builder::Draft,
+    #[serde(default)]
+    snippets: Vec<persona_builder::Snippet>,
+}
+
+async fn h_persona_builder_generate_section(
+    Json(req): Json<PersonaBuilderGenerateSectionRequest>,
+) -> Response {
+    ok_or_400(
+        api::persona_builder_generate_section(
+            req.build_id,
+            req.brief,
+            req.section,
+            req.draft,
+            req.snippets,
+        )
+        .await,
+    )
+}
+
+#[derive(Deserialize)]
+struct PersonaBuilderRenderRequest {
+    brief: persona_builder::Brief,
+    draft: persona_builder::Draft,
+}
+
+async fn h_persona_builder_render(Json(req): Json<PersonaBuilderRenderRequest>) -> Response {
+    ok_or_400(api::persona_builder_render(req.brief, req.draft))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersonaBuilderTestPhotoRequest {
+    build_id: String,
+    brief: persona_builder::Brief,
+    draft: persona_builder::Draft,
+}
+
+async fn h_persona_builder_test_photo(Json(req): Json<PersonaBuilderTestPhotoRequest>) -> Response {
+    ok_or_400(api::persona_builder_test_photo(req.build_id, req.brief, req.draft).await)
+}
+
+#[derive(Deserialize)]
+struct PersonaBuilderSaveRequest {
+    mode: persona_builder::SaveMode,
+    persona: String,
+    brief: persona_builder::Brief,
+    draft: persona_builder::Draft,
+    content: String,
+}
+
+async fn h_persona_builder_save(Json(req): Json<PersonaBuilderSaveRequest>) -> Response {
+    ok_or_400(api::persona_builder_save(
+        req.mode,
+        req.persona,
+        req.brief,
+        req.draft,
+        req.content,
+    ))
+}
+
+async fn h_persona_builder_load(Json(req): Json<NamedRequest>) -> Response {
+    ok_or_400(api::persona_builder_load(req.name))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StopPersonaBuilderRequest {
+    build_id: String,
+}
+
+async fn h_stop_persona_builder(Json(req): Json<StopPersonaBuilderRequest>) -> Response {
+    ok_or_400(api::stop_persona_builder(req.build_id))
+}
+
 async fn h_list_rulesets() -> Response {
     ok_or_400(api::list_rulesets())
 }
@@ -853,6 +1008,17 @@ struct RenameChatSessionRequest {
 
 async fn h_rename_chat_session(Json(req): Json<RenameChatSessionRequest>) -> Response {
     ok_or_400(api::rename_chat_session(req.session_id, req.title).await)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetChatSessionPersonaRequest {
+    session_id: String,
+    persona: Option<String>,
+}
+
+async fn h_set_chat_session_persona(Json(req): Json<SetChatSessionPersonaRequest>) -> Response {
+    ok_or_400(api::set_chat_session_persona(req.session_id, req.persona).await)
 }
 
 async fn h_delete_chat_session(Json(req): Json<SessionIdRequest>) -> Response {
@@ -991,6 +1157,32 @@ fn api_router() -> Router {
         .route("/delete_persona", post(h_delete_persona))
         .route("/get_persona_content", post(h_get_persona_content))
         .route("/update_persona", post(h_update_persona))
+        .route("/persona_builder_status", post(h_persona_builder_status))
+        .route(
+            "/persona_builder_research",
+            post(h_persona_builder_research),
+        )
+        .route(
+            "/persona_builder_find_character",
+            post(h_persona_builder_find_character),
+        )
+        .route(
+            "/persona_builder_check_tags",
+            post(h_persona_builder_check_tags),
+        )
+        .route("/persona_builder_suggest", post(h_persona_builder_suggest))
+        .route(
+            "/persona_builder_generate_section",
+            post(h_persona_builder_generate_section),
+        )
+        .route("/persona_builder_render", post(h_persona_builder_render))
+        .route(
+            "/persona_builder_test_photo",
+            post(h_persona_builder_test_photo),
+        )
+        .route("/persona_builder_save", post(h_persona_builder_save))
+        .route("/persona_builder_load", post(h_persona_builder_load))
+        .route("/stop_persona_builder", post(h_stop_persona_builder))
         .route("/list_rulesets", post(h_list_rulesets))
         .route("/get_ruleset_content", post(h_get_ruleset_content))
         .route("/update_ruleset", post(h_update_ruleset))
@@ -999,6 +1191,10 @@ fn api_router() -> Router {
         .route("/create_chat_session", post(h_create_chat_session))
         .route("/load_chat_session", post(h_load_chat_session))
         .route("/rename_chat_session", post(h_rename_chat_session))
+        .route(
+            "/set_chat_session_persona",
+            post(h_set_chat_session_persona),
+        )
         .route("/delete_chat_session", post(h_delete_chat_session))
         .route("/get_chat_state", post(h_get_chat_state))
         .route("/get_chat_raw_state", post(h_get_chat_raw_state))
@@ -1231,6 +1427,7 @@ mod tests {
     #[test]
     fn http_save_config_never_touches_file_ops_policy_or_wipes_the_key() {
         let mut cfg = config::AppConfig {
+            endpoint: "http://x/v1".into(),
             api_key: "secret".into(),
             auto_approve: vec!["ls".into()],
             max_auto_steps: 7,
@@ -1239,16 +1436,17 @@ mod tests {
             ..Default::default()
         };
         let incoming: ServerSaveConfig = serde_json::from_str(
-            r#"{"endpoint":"http://x/v1","api_key":"","chat_temperature":0.3,"chat_auto_images":false,
+            r#"{"endpoint":"http://x/v1","api_key":"","chat_temperature":0.3,"chat_auto_images":false,"chat_photo_every_reply":true,
                 "chat_recall":false,"chat_recall_embedding_model":"nomic-embed-text","chat_recall_max":2,
                 "auto_approve":["sh","rm"],"granted_paths":[{"path":"/","note":"","read_write":true}],
                 "disable_builtin_rules":true,"sandbox_trash_dir":"/etc","max_auto_steps":0,
-                "confirm_fade_after":0,"memory_enabled":false,"memory_max_tokens":1}"#,
+                "confirm_fade_after":0,"memory_enabled":false,"memory_max_tokens":1,
+                "danbooru_tags_dir":"/etc","danbooru_online_lookup":true}"#,
         )
         .unwrap();
         incoming.merge_into(&mut cfg);
         assert_eq!(cfg.endpoint, "http://x/v1");
-        assert!(!cfg.chat_auto_images);
+        assert!(!cfg.chat_auto_images && cfg.chat_photo_every_reply);
         assert!(!cfg.chat_recall && cfg.chat_recall_max == 2);
         assert_eq!(cfg.chat_recall_embedding_model, "nomic-embed-text");
         assert!((cfg.chat_temperature - 0.3).abs() < 1e-6);
@@ -1262,9 +1460,46 @@ mod tests {
         assert_eq!(cfg.max_auto_steps, 7);
         assert!(cfg.memory_enabled);
         assert!(cfg.sandbox_trash_dir.is_empty());
+        assert!(cfg.danbooru_tags_dir.is_empty());
+        assert!(cfg.danbooru_online_lookup);
 
         let replace: ServerSaveConfig = serde_json::from_str(r#"{"api_key":"new"}"#).unwrap();
         replace.merge_into(&mut cfg);
         assert_eq!(cfg.api_key, "new");
+    }
+
+    #[test]
+    fn http_save_config_clears_the_key_when_the_endpoint_changes() {
+        let mut cfg = config::AppConfig {
+            endpoint: "http://old/v1".into(),
+            api_key: "secret".into(),
+            ..Default::default()
+        };
+        let moved: ServerSaveConfig =
+            serde_json::from_str(r#"{"endpoint":"http://evil/v1","api_key":""}"#).unwrap();
+        moved.merge_into(&mut cfg);
+        assert_eq!(cfg.endpoint, "http://evil/v1");
+        assert!(
+            cfg.api_key.is_empty(),
+            "the old key must not follow a new endpoint"
+        );
+
+        let typed: ServerSaveConfig =
+            serde_json::from_str(r#"{"endpoint":"http://new/v1","api_key":"k2"}"#).unwrap();
+        typed.merge_into(&mut cfg);
+        assert_eq!(cfg.api_key, "k2");
+    }
+
+    #[test]
+    fn http_save_config_keeps_the_key_for_a_cosmetic_endpoint_edit() {
+        let mut cfg = config::AppConfig {
+            endpoint: "http://old/v1".into(),
+            api_key: "secret".into(),
+            ..Default::default()
+        };
+        let cosmetic: ServerSaveConfig =
+            serde_json::from_str(r#"{"endpoint":" http://old/v1/ ","api_key":""}"#).unwrap();
+        cosmetic.merge_into(&mut cfg);
+        assert_eq!(cfg.api_key, "secret");
     }
 }

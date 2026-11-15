@@ -10,6 +10,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     console.error("initial load_config failed:", e);
   }
   updateNarrationToggleBtn();
+  updateThoughtsToggleBtn();
   // Chat is the default view now (HTML already shows it unhidden at parse
   // time, before this even runs) -- this just triggers the same lazy
   // persona/session-list load `switchMode("chat")` does on a rail click,

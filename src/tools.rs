@@ -287,10 +287,37 @@ impl Workspace {
         abs == self.root || self.grants.iter().any(|g| g.path == abs)
     }
 
+    /// Writability of the most specific base (root or grant) covering `canon`,
+    /// `None` if none does. Like later mounts in the sandbox, the most specific
+    /// wins, and a non-recursive grant covers itself and its direct files only
+    /// (`sandbox::push_grant` binds exactly those).
+    fn covering_base(&self, canon: &Path, is_dir: bool) -> Option<bool> {
+        let mut best: Option<(usize, bool)> = canon
+            .starts_with(&self.root)
+            .then_some((self.root.components().count(), true));
+        for g in &self.grants {
+            let inside = canon.starts_with(&g.path)
+                && (g.recursive
+                    || canon == g.path
+                    || (!is_dir && canon.parent() == Some(g.path.as_path())));
+            let depth = g.path.components().count();
+            if inside && best.map_or(true, |(d, _)| depth > d) {
+                best = Some((depth, g.writable));
+            }
+        }
+        best.map(|(_, writable)| writable)
+    }
+
     /// Resolves a model-supplied path to a canonical absolute one that is
     /// guaranteed inside the root or a grant (symlinks included).
     pub fn resolve(&self, user_path: &str, access: Access) -> Result<PathBuf, String> {
-        self.resolve_inner(user_path, access, true)
+        self.resolve_inner(user_path, access, true, false)
+    }
+
+    /// Like `resolve` for a path that will be (or is) a folder: a non-recursive
+    /// grant covers only itself, so a new subfolder in it would be unreachable.
+    fn resolve_dir(&self, user_path: &str, access: Access) -> Result<PathBuf, String> {
+        self.resolve_inner(user_path, access, true, true)
     }
 
     /// `follow_last = false` keeps a final symlink as the link itself, for
@@ -300,6 +327,7 @@ impl Workspace {
         user_path: &str,
         access: Access,
         follow_last: bool,
+        as_dir: bool,
     ) -> Result<PathBuf, String> {
         let raw = user_path.trim();
         let outside = || format!("path '{raw}' is outside the folder; use a path inside it");
@@ -322,19 +350,8 @@ impl Workspace {
         }
         .map_err(|e| format!("cannot use path '{raw}': {e}"))?;
 
-        // Most specific base wins, like later mounts in the sandbox.
-        let mut best: Option<(usize, bool)> = canon
-            .starts_with(&self.root)
-            .then_some((self.root.components().count(), true));
-        for g in &self.grants {
-            let inside = canon.starts_with(&g.path)
-                && (g.recursive || canon == g.path || canon.parent() == Some(g.path.as_path()));
-            let depth = g.path.components().count();
-            if inside && best.map_or(true, |(d, _)| depth > d) {
-                best = Some((depth, g.writable));
-            }
-        }
-        let Some((_, writable)) = best else {
+        let is_dir = as_dir || fs::symlink_metadata(&canon).is_ok_and(|m| m.is_dir());
+        let Some(writable) = self.covering_base(&canon, is_dir) else {
             return Err(outside());
         };
         if self.is_protected(&canon) {
@@ -610,8 +627,9 @@ impl Workspace {
                     return None; // FIFO/socket/device: opening one can block forever
                 };
                 let path = e.path();
-                (!self.is_protected(&path))
-                    .then(|| (e.file_name().to_string_lossy().into_owned(), path, kind))
+                (!self.is_protected(&path)
+                    && self.covering_base(&path, kind == Kind::Dir).is_some())
+                .then(|| (e.file_name().to_string_lossy().into_owned(), path, kind))
             })
             .collect();
         v.sort_by(|a, b| {
@@ -1259,7 +1277,7 @@ impl Workspace {
             Tool::EditFile { path, edits } => self.plan_edit(path, edits, st),
             Tool::Move { from, to } => self.plan_move(from, to),
             Tool::Delete { path } => {
-                let abs = self.resolve_inner(path, Access::Write, false)?;
+                let abs = self.resolve_inner(path, Access::Write, false, false)?;
                 let disp = self.display(&abs);
                 if self.is_base(&abs) {
                     return Err(format!(
@@ -1273,7 +1291,7 @@ impl Workspace {
                 Ok(Plan::Delete { abs })
             }
             Tool::MakeDir { path } => {
-                let abs = self.resolve(path, Access::Write)?;
+                let abs = self.resolve_dir(path, Access::Write)?;
                 if abs.exists() && !abs.is_dir() {
                     return Err(format!(
                         "'{}' already exists and is a file",
@@ -1336,7 +1354,7 @@ impl Workspace {
     }
 
     fn plan_move(&self, from: &str, to: &str) -> Result<Plan, String> {
-        let from_abs = self.resolve_inner(from, Access::Write, false)?;
+        let from_abs = self.resolve_inner(from, Access::Write, false, false)?;
         let fd = self.display(&from_abs);
         if self.is_base(&from_abs) {
             return Err(format!(
@@ -1347,7 +1365,8 @@ impl Workspace {
             return Err(format!("'{fd}' does not exist"));
         }
         self.refuse_if_contains_protected(&from_abs, "moved")?;
-        let to_abs = self.resolve(to, Access::Write)?;
+        let from_is_dir = fs::symlink_metadata(&from_abs).is_ok_and(|m| m.is_dir());
+        let to_abs = self.resolve_inner(to, Access::Write, true, from_is_dir)?;
         let into_dir = to.trim_end().ends_with('/') || to_abs.is_dir();
         let target = if into_dir {
             let name = from_abs
@@ -1358,6 +1377,12 @@ impl Workspace {
             to_abs
         };
         let td = self.display(&target);
+        // The final place must still be reachable (non-recursive grants).
+        if self.covering_base(&target, from_is_dir) != Some(true) {
+            return Err(format!(
+                "'{td}' is outside the writable folders (or inside a non-recursive granted path); pick another destination"
+            ));
+        }
         self.refuse_if_contains_protected(&target, "moved")?;
         if target == from_abs {
             return Err(format!("'{fd}' is already there"));
@@ -2278,6 +2303,65 @@ mod tests {
             .ws
             .resolve(g.join("sub/b.txt").to_str().unwrap(), Access::Read)
             .is_err());
+    }
+
+    #[test]
+    fn non_recursive_grant_refuses_new_subfolders() {
+        let mut g = PathBuf::new();
+        let e = env_with(|base| {
+            g = base.join("flat");
+            fs::create_dir_all(&g).unwrap();
+            vec![Grant {
+                path: g.clone(),
+                writable: true,
+                recursive: false,
+            }]
+        });
+        for p in ["a", "a/b"] {
+            let path = g.join(p);
+            assert!(
+                e.ws.resolve_dir(path.to_str().unwrap(), Access::Write)
+                    .is_err(),
+                "{p}"
+            );
+        }
+        // A new direct file is fine.
+        assert!(e
+            .ws
+            .resolve(g.join("f.txt").to_str().unwrap(), Access::Write)
+            .is_ok());
+        // Moving a folder in would create an unreachable subfolder; a file is fine.
+        fs::create_dir_all(e.root.join("d")).unwrap();
+        fs::write(e.root.join("f.txt"), "x").unwrap();
+        let to = g.to_str().unwrap();
+        assert!(e.ws.plan_move("d", to).is_err());
+        assert!(e.ws.plan_move("f.txt", to).is_ok());
+    }
+
+    #[test]
+    fn non_recursive_grant_hides_subfolders_from_resolve_and_listing() {
+        let mut g = PathBuf::new();
+        let e = env_with(|base| {
+            g = base.join("flat");
+            fs::create_dir_all(g.join("sub")).unwrap();
+            fs::write(g.join("a.txt"), "a").unwrap();
+            fs::write(g.join("sub/b.txt"), "b").unwrap();
+            vec![Grant {
+                path: g.clone(),
+                writable: false,
+                recursive: false,
+            }]
+        });
+        assert!(e
+            .ws
+            .resolve(g.join("sub").to_str().unwrap(), Access::Read)
+            .is_err());
+        let listing = e.ws.list_dir(g.to_str().unwrap(), Some(3)).unwrap();
+        assert!(listing.contains("a.txt"), "{listing}");
+        assert!(
+            !listing.contains("sub") && !listing.contains("b.txt"),
+            "{listing}"
+        );
     }
 
     #[test]

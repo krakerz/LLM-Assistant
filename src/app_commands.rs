@@ -11,7 +11,17 @@ pub fn load_config() -> Result<AppConfig, String> {
 #[tauri::command]
 pub fn save_config(cfg: AppConfig) -> Result<(), String> {
     log::info!("save_config: endpoint={} model={}", cfg.endpoint, cfg.model);
-    config::save(&cfg).map_err(|e| e.to_string())
+    let on_disk = config::load_or_init().map_err(|e| e.to_string())?;
+    config::save(&keep_command_owned(cfg, on_disk)).map_err(|e| e.to_string())
+}
+
+/// `auto_approve` and `granted_paths` are written only by their own commands
+/// (Always allow, add/remove), which save at once. Settings and the chat
+/// toggles send a whole config that may predate those, so the file wins.
+fn keep_command_owned(mut cfg: AppConfig, on_disk: AppConfig) -> AppConfig {
+    cfg.auto_approve = on_disk.auto_approve;
+    cfg.granted_paths = on_disk.granted_paths;
+    cfg
 }
 
 /// Tests what's typed in the dialog, not what's saved. A real completion
@@ -70,4 +80,33 @@ pub fn app_version() -> &'static str {
 #[tauri::command]
 pub fn app_build_hash() -> &'static str {
     env!("BUILD_HASH")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stale_dialog_save_keeps_command_owned_fields() {
+        let grant: config::GrantedPath =
+            serde_json::from_str(r#"{"path":"/data","note":"","read_write":false}"#).unwrap();
+        let on_disk = AppConfig {
+            auto_approve: vec!["ls".into(), "cat".into()],
+            granted_paths: vec![grant],
+            ..Default::default()
+        };
+        let stale = AppConfig {
+            endpoint: "http://new/v1".into(),
+            auto_approve: vec!["ls".into()],
+            ..Default::default()
+        };
+        let saved = keep_command_owned(stale, on_disk);
+        assert_eq!(saved.endpoint, "http://new/v1");
+        assert_eq!(
+            saved.auto_approve,
+            vec!["ls".to_string(), "cat".to_string()]
+        );
+        assert_eq!(saved.granted_paths.len(), 1);
+        assert_eq!(saved.granted_paths[0].path, "/data");
+    }
 }

@@ -536,12 +536,39 @@ pub async fn send_chat(
     temperature: f32,
     messages: &[ChatMessage],
 ) -> anyhow::Result<String> {
-    let opts = ChatOptions {
-        temperature,
-        ..Default::default()
-    };
-    let reply = send_chat_full(endpoint, model, api_key, messages, &opts).await?;
-    Ok(fold_reply(reply.reasoning, reply.content))
+    send_chat_with_effort(endpoint, model, api_key, temperature, messages, None).await
+}
+
+/// `send_chat` with an optional `reasoning_effort`; a server that rejects it
+/// is remembered and asked again without it, as in `send_chat_streaming`.
+pub async fn send_chat_with_effort(
+    endpoint: &str,
+    model: &str,
+    api_key: &str,
+    temperature: f32,
+    messages: &[ChatMessage],
+    reasoning_effort: Option<&str>,
+) -> anyhow::Result<String> {
+    let key = format!("{endpoint}\n{model}");
+    let mut effort = reasoning_effort.filter(|_| !effort_rejected(&key));
+    loop {
+        let opts = ChatOptions {
+            temperature,
+            reasoning_effort: effort,
+            ..Default::default()
+        };
+        match send_chat_full(endpoint, model, api_key, messages, &opts).await {
+            Ok(reply) => return Ok(fold_reply(reply.reasoning, reply.content)),
+            Err(e) if effort.is_some() && is_effort_rejected(&e) => {
+                log::info!("send_chat: reasoning_effort rejected ({e}), sending without it");
+                if let Ok(mut c) = effort_rejected_cache().lock() {
+                    c.insert(key.clone());
+                }
+                effort = None;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 // --- Embeddings ---
@@ -694,12 +721,7 @@ pub async fn send_chat_json(
                 }
                 return Err(anyhow::anyhow!("model reply was not a JSON object"));
             }
-            Err(e)
-                if effort.is_some()
-                    && http_error(&e).is_some_and(|h| {
-                        matches!(h.status, 400 | 422) && h.body.to_lowercase().contains("reasoning")
-                    }) =>
-            {
+            Err(e) if effort.is_some() && is_effort_rejected(&e) => {
                 log::info!("send_chat_json: reasoning_effort rejected ({e}), sending without it");
                 if let Ok(mut c) = effort_rejected_cache().lock() {
                     c.insert(key.clone());
@@ -717,6 +739,13 @@ pub async fn send_chat_json(
             Err(e) => return Err(e),
         }
     }
+}
+
+/// The server refused `reasoning_effort` (400/422 naming "reasoning").
+fn is_effort_rejected(err: &anyhow::Error) -> bool {
+    http_error(err).is_some_and(|h| {
+        matches!(h.status, 400 | 422) && h.body.to_lowercase().contains("reasoning")
+    })
 }
 
 fn effort_rejected_cache() -> &'static Mutex<std::collections::HashSet<String>> {
@@ -902,15 +931,33 @@ pub async fn send_chat_streaming(
     api_key: &str,
     temperature: f32,
     messages: &[ChatMessage],
+    reasoning_effort: Option<&str>,
     mut on_delta: impl FnMut(ChatDelta<'_>) + Send,
 ) -> anyhow::Result<String> {
-    let opts = ChatOptions {
-        temperature,
-        ..Default::default()
-    };
     let _permit = crate::gpu::llm_permit().await;
-    let req = ChatRequest::new(model, messages, &opts, true);
-    let resp = post(endpoint, api_key, &req).await?;
+    let key = format!("{endpoint}\n{model}");
+    let mut effort = reasoning_effort.filter(|_| !effort_rejected(&key));
+    let resp = loop {
+        let opts = ChatOptions {
+            temperature,
+            reasoning_effort: effort,
+            ..Default::default()
+        };
+        let req = ChatRequest::new(model, messages, &opts, true);
+        match post(endpoint, api_key, &req).await {
+            Ok(resp) => break resp,
+            Err(e) if effort.is_some() && is_effort_rejected(&e) => {
+                log::info!(
+                    "send_chat_streaming: reasoning_effort rejected ({e}), sending without it"
+                );
+                if let Ok(mut c) = effort_rejected_cache().lock() {
+                    c.insert(key.clone());
+                }
+                effort = None;
+            }
+            Err(e) => return Err(e),
+        }
+    };
 
     let mut acc = StreamAcc::default();
     // Raw bytes, decoded per complete line, so a multi-byte UTF-8 char split
@@ -1441,6 +1488,107 @@ mod tests {
         .unwrap();
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 3);
+        assert!(!seen[2].2.contains("reasoning_effort"));
+    }
+
+    const SSE_HI: &str =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+
+    #[tokio::test]
+    async fn streaming_can_turn_reasoning_off() {
+        let (host, seen) = crate::gpu::tests::fake_server(|_, _, _| (200, SSE_HI.to_string()));
+        let msgs = [ChatMessage::text("user", "q")];
+        let out = send_chat_streaming(
+            &format!("{host}/v1/chat/completions"),
+            "m-stream-effort",
+            "",
+            0.5,
+            &msgs,
+            Some("none"),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "hi");
+        let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].2).unwrap();
+        assert_eq!(body["reasoning_effort"], "none");
+        // Unset: nothing is sent.
+        send_chat_streaming(
+            &format!("{host}/v1/chat/completions"),
+            "m-stream-effort",
+            "",
+            0.5,
+            &msgs,
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(!seen.lock().unwrap()[1].2.contains("reasoning_effort"));
+    }
+
+    #[tokio::test]
+    async fn a_server_rejecting_reasoning_effort_is_retried_without_it_when_streaming() {
+        let (host, seen) = crate::gpu::tests::fake_server(|_, _, body| {
+            if body.contains("reasoning_effort") {
+                (
+                    400,
+                    r#"{"error": "unknown parameter reasoning_effort"}"#.to_string(),
+                )
+            } else {
+                (200, SSE_HI.to_string())
+            }
+        });
+        let msgs = [ChatMessage::text("user", "q")];
+        let endpoint = format!("{host}/v1/chat/completions");
+        for _ in 0..2 {
+            let out = send_chat_streaming(
+                &endpoint,
+                "m-stream-reject",
+                "",
+                0.5,
+                &msgs,
+                Some("none"),
+                |_| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(out, "hi");
+        }
+        // Rejected once, retried, then remembered.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(seen[0].2.contains("reasoning_effort"));
+        assert!(!seen[1].2.contains("reasoning_effort"));
+        assert!(!seen[2].2.contains("reasoning_effort"));
+    }
+
+    #[tokio::test]
+    async fn plain_chat_turns_reasoning_off_and_retries_when_rejected() {
+        let ok = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}"#;
+        let (host, seen) = crate::gpu::tests::fake_server(move |_, _, body| {
+            if body.contains("reasoning_effort") {
+                (
+                    400,
+                    r#"{"error": "unknown parameter reasoning_effort"}"#.to_string(),
+                )
+            } else {
+                (200, ok.to_string())
+            }
+        });
+        let msgs = [ChatMessage::text("user", "q")];
+        let endpoint = format!("{host}/v1/chat/completions");
+        for _ in 0..2 {
+            let out =
+                send_chat_with_effort(&endpoint, "m-plain-reject", "", 0.5, &msgs, Some("none"))
+                    .await
+                    .unwrap();
+            assert_eq!(out, "hi");
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(seen[0].2.contains("\"reasoning_effort\":\"none\""));
+        assert!(!seen[1].2.contains("reasoning_effort"));
         assert!(!seen[2].2.contains("reasoning_effort"));
     }
 

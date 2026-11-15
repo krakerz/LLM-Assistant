@@ -14,7 +14,7 @@ use crate::llm::{self, ChatMessage, ChatOptions, ChatReply, ToolCall};
 use crate::sandbox::{self, CancelToken, Classification};
 use crate::tool_protocol::{self as proto, TextParse, Transport};
 use crate::tools::{self, TaskState, Tool, Workspace};
-use crate::{context, memory, rules};
+use crate::{context, memory, recall, rules};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -154,6 +154,8 @@ pub struct AgentSession {
     /// Approvals per fade key (`cmd:<program>` / `tool:<name>`) since the last deny.
     approvals: HashMap<String, u32>,
     faded: HashSet<String>,
+    /// Recall ids of tasks this session ran; their text is already in `history`.
+    task_ids: HashSet<String>,
 }
 
 fn resolve_transport(cfg: &AppConfig, fell_back: bool) -> Transport {
@@ -181,6 +183,7 @@ impl AgentSession {
             fell_back: false,
             approvals: HashMap::new(),
             faded: HashSet::new(),
+            task_ids: HashSet::new(),
         })
     }
 
@@ -241,6 +244,25 @@ fn load_rules_text(cfg: &AppConfig) -> String {
     format!("{general}\n\n{command}").trim().to_string()
 }
 
+/// At task start, before this task backs anything up, so its own run dir
+/// can't be pruned.
+async fn prune_trash(cfg: &AppConfig) {
+    let max_age = (cfg.trash_max_age_days > 0)
+        .then(|| Duration::from_secs(u64::from(cfg.trash_max_age_days) * 86_400));
+    let max_bytes = (cfg.trash_max_mb > 0).then(|| cfg.trash_max_mb.saturating_mul(1024 * 1024));
+    if max_age.is_none() && max_bytes.is_none() {
+        return;
+    }
+    let root = sandbox::resolve_trash_dir(cfg);
+    let pruned = tokio::task::spawn_blocking(move || {
+        sandbox::prune_trash(&root, max_age, max_bytes, Path::new(""));
+    })
+    .await;
+    if let Err(e) = pruned {
+        log::warn!("trash prune task failed: {e}");
+    }
+}
+
 pub(crate) async fn run_task_with(
     cfg: &AppConfig,
     session: &mut AgentSession,
@@ -271,8 +293,13 @@ pub(crate) async fn run_task_with(
         }
     }
     session.transport = resolve_transport(cfg, session.fell_back);
+    prune_trash(cfg).await;
 
     memory::start_task(cfg, Some(&session.root), &user_message);
+    let recall_block =
+        recall::recall_tasks(cfg, &session.root, &user_message, &session.task_ids).await;
+    // Kept for this task's recall entry; the message itself moves into history.
+    let request = user_message.clone();
     session.task_start = session.history.len();
     session
         .history
@@ -280,6 +307,7 @@ pub(crate) async fn run_task_with(
 
     let mut t = TaskLocal {
         state: TaskState::new(),
+        recall_block,
         ..Default::default()
     };
     let reason = session.drive(&cx, &mut t).await;
@@ -297,6 +325,36 @@ pub(crate) async fn run_task_with(
             },
         })
         .collect();
+    if cfg.fileops_recall {
+        let summary = t.outcome.take().unwrap_or_default();
+        let finished = matches!(reason, DoneReason::Finished);
+        let outcome = match (finished, summary.trim().is_empty()) {
+            (true, false) => summary,
+            (true, true) => "finished without a summary".to_string(),
+            (false, true) => "not finished".to_string(),
+            (false, false) => format!("not finished: {summary}"),
+        };
+        let record = recall::TaskRecord {
+            root: &session.root,
+            request: &request,
+            outcome: &outcome,
+            files: files
+                .iter()
+                .map(|f| recall::TaskFile {
+                    path: f.path.clone(),
+                    change: f.change.clone(),
+                })
+                .collect(),
+        };
+        let (task_id, fresh) = recall::index_task(record).await;
+        if let Some(id) = task_id {
+            session.task_ids.insert(id);
+        }
+        if !fresh.is_empty() && !cfg.chat_recall_embedding_model.trim().is_empty() {
+            let cfg = cfg.clone();
+            tokio::spawn(async move { recall::embed_fresh(&cfg, fresh).await });
+        }
+    }
     if !files.is_empty() {
         host.emit(AgentEvent::ChangedFiles { files });
     }
@@ -326,6 +384,10 @@ struct TaskLocal {
     warned_writes: Vec<Tool>,
     noticed_condensed: usize,
     noticed_dropped: usize,
+    /// Past tasks in this folder (`recall::recall_tasks`), sent with every step.
+    recall_block: Option<String>,
+    /// The model's closing words, for this task's recall entry.
+    outcome: Option<String>,
 }
 
 enum TurnError {
@@ -591,6 +653,7 @@ impl AgentSession {
                         self.push_note(AFTER_ERROR_NUDGE);
                         continue;
                     }
+                    t.outcome = Some(text.clone());
                     cx.host.emit(AgentEvent::AssistantText {
                         text,
                         is_final: true,
@@ -691,6 +754,7 @@ impl AgentSession {
                 summary.clone()
             };
             self.push_result(&tool, &id, true, "task marked finished");
+            t.outcome = Some(text.clone());
             if !text.trim().is_empty() {
                 host.emit(AgentEvent::AssistantText {
                     text,
@@ -1073,7 +1137,13 @@ The user will run it themselves.]";
             );
             // No scratch-dir note: small models then reach for that path with
             // the file tools, which (rightly) refuse the app's own folders.
-            let record = memory::build_block(cfg).filter(|r| !r.is_empty());
+            let record = match (
+                memory::build_block(cfg).filter(|r| !r.is_empty()),
+                t.recall_block.as_deref(),
+            ) {
+                (Some(r), Some(b)) => Some(format!("{r}\n\n{b}")),
+                (r, b) => r.or_else(|| b.map(str::to_string)),
+            };
             let specs = if native {
                 proto::tool_specs()
             } else {
@@ -1094,6 +1164,7 @@ The user will run it themselves.]";
                 endpoint: &cfg.endpoint,
                 model: &cfg.model,
                 api_key: &cfg.api_key,
+                cancel: Some(cx.cancel),
             });
             let fit = context::fit_task_to_budget(
                 system_tokens,
@@ -1104,6 +1175,9 @@ The user will run it themselves.]";
                 cfg.memory_enabled,
             )
             .await;
+            if cx.cancel.is_cancelled() {
+                return Err(TurnError::Cancelled);
+            }
             if let Some(rewritten) = fit.rewritten_history {
                 self.history = rewritten;
                 self.task_start = fit.rewritten_task_start;
@@ -1353,6 +1427,7 @@ mod tests {
             model: "test".into(),
             tool_calling: tool_calling.into(),
             memory_enabled: false,
+            fileops_recall: false,
             sandbox_trash_dir: dir.join("trash").display().to_string(),
             max_context_tokens: 0,
             ..Default::default()
