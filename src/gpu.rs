@@ -11,11 +11,12 @@
 //! mid-generation. Nothing may call the LLM while holding `exclusive()`.
 
 use crate::comfyui::{self, ComfyUiConfig};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ModelTarget};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -26,13 +27,32 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 
 static GATE: RwLock<()> = RwLock::const_new(());
 
+/// Hosts (`base_host`) whose helper/embedding model is unloaded for the
+/// running image generation; requests to them must queue on the gate.
+static PARKED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+tokio::task_local! {
+    /// Set by `ungated`: requests to a model on another machine than the
+    /// chat model skip the gate (an image swap never touches their GPU).
+    static UNGATED: ();
+}
+
 /// Held by every LLM request for its whole duration, stream included.
-pub async fn llm_permit() -> RwLockReadGuard<'static, ()> {
+/// `None` inside `ungated`.
+pub async fn llm_permit() -> Option<RwLockReadGuard<'static, ()>> {
+    if UNGATED.try_with(|_| ()).is_ok() {
+        return None;
+    }
     if let Ok(guard) = GATE.try_read() {
-        return guard;
+        return Some(guard);
     }
     log::debug!("gpu: LLM request waiting for an image generation to finish");
-    GATE.read().await
+    Some(GATE.read().await)
+}
+
+/// Runs `fut` with every LLM request in it skipping the gate.
+pub async fn ungated<F: Future>(fut: F) -> F::Output {
+    UNGATED.scope((), fut).await
 }
 
 /// Held by an image generation that unloads the chat model. Waits for
@@ -55,7 +75,7 @@ struct Instance {
     config: serde_json::Map<String, Value>,
 }
 
-/// What `unload_chat_model` took off the GPU, so `reload_chat_model` can put
+/// What `unload_model` took off the GPU, so `reload_model` can put
 /// it back. Empty for Ollama (reloads itself) and unknown servers.
 #[derive(Debug, Default)]
 pub struct Unloaded {
@@ -71,6 +91,65 @@ pub(crate) fn base_host(endpoint: &str) -> Option<String> {
     url.set_query(None);
     url.set_fragment(None);
     Some(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// Whether requests to `endpoint` must take the GPU gate: it runs on the chat
+/// model's machine. Host compare only (ports ignored, no DNS); loopback names
+/// count as one host; an unparsable URL counts as shared.
+pub(crate) fn shares_gpu_gate(endpoint: &str, chat_endpoint: &str) -> bool {
+    let host = |s: &str| {
+        reqwest::Url::parse(s.trim())
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_lowercase))
+    };
+    let (Some(a), Some(b)) = (host(endpoint), host(chat_endpoint)) else {
+        return true;
+    };
+    let loopback = |h: &str| {
+        h == "localhost"
+            || h.trim_matches(['[', ']'])
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    };
+    a == b || (loopback(&a) && loopback(&b))
+}
+
+/// Whether `endpoint`'s host is parked for the running image generation.
+pub(crate) fn is_parked(endpoint: &str) -> bool {
+    let Some(host) = base_host(endpoint) else {
+        return false;
+    };
+    PARKED.lock().expect("lock poisoned").contains(&host)
+}
+
+/// Whether a helper/embedding request to `endpoint` must take the gate.
+pub(crate) fn needs_gate(endpoint: &str, chat_endpoint: &str) -> bool {
+    shares_gpu_gate(endpoint, chat_endpoint) || is_parked(endpoint)
+}
+
+/// Removes its hosts from `PARKED` on drop, so an early return or panic can't
+/// leave a host parked forever.
+struct Parked(Vec<String>);
+
+impl Parked {
+    fn new(hosts: Vec<String>) -> Self {
+        PARKED
+            .lock()
+            .expect("lock poisoned")
+            .extend(hosts.iter().cloned());
+        Parked(hosts)
+    }
+}
+
+impl Drop for Parked {
+    fn drop(&mut self) {
+        let mut parked = PARKED.lock().expect("lock poisoned");
+        for host in &self.0 {
+            if let Some(pos) = parked.iter().position(|h| h == host) {
+                parked.remove(pos);
+            }
+        }
+    }
 }
 
 /// LM Studio can suffix a key with `@variant` (quantization); compare without it.
@@ -116,33 +195,34 @@ fn find_instances(body: &Value, model: &str) -> Option<Vec<Instance>> {
 }
 
 fn request(
-    cfg: &AppConfig,
+    api_key: &str,
     method: reqwest::Method,
     url: String,
     timeout: Duration,
 ) -> reqwest::RequestBuilder {
     let mut builder = crate::llm::client().request(method, url).timeout(timeout);
-    if !cfg.api_key.trim().is_empty() {
-        builder = builder.bearer_auth(&cfg.api_key);
+    if !api_key.trim().is_empty() {
+        builder = builder.bearer_auth(api_key);
     }
     builder
 }
 
-/// Asks the server to drop the configured chat model from memory. Never
-/// fatal: on any failure the generation just runs with the model still loaded.
-pub async fn unload_chat_model(cfg: &AppConfig) -> Unloaded {
+/// Asks the server to drop `target`'s model from memory. Never fatal: on any
+/// failure the generation just runs with the model still loaded.
+pub async fn unload_model(target: ModelTarget<'_>) -> Unloaded {
     let started = Instant::now();
-    let Some(host) = base_host(&cfg.endpoint) else {
+    let Some(host) = base_host(target.endpoint) else {
         log::warn!(
-            "gpu: can't unload the chat model, endpoint isn't a URL: {}",
-            cfg.endpoint
+            "gpu: can't unload {}, endpoint isn't a URL: {}",
+            target.model,
+            target.endpoint
         );
         return Unloaded::default();
     };
 
     // LM Studio: its native API lists loaded instances with their config.
     let listing = request(
-        cfg,
+        target.api_key,
         reqwest::Method::GET,
         format!("{host}/api/v1/models"),
         PROBE_TIMEOUT,
@@ -152,8 +232,8 @@ pub async fn unload_chat_model(cfg: &AppConfig) -> Unloaded {
     if let Ok(resp) = listing {
         if resp.status().is_success() {
             if let Ok(body) = resp.json::<Value>().await {
-                if let Some(found) = find_instances(&body, &cfg.model) {
-                    return unload_lm_studio(cfg, &host, found, started).await;
+                if let Some(found) = find_instances(&body, target.model) {
+                    return unload_lm_studio(target, &host, found, started).await;
                 }
             }
         }
@@ -161,7 +241,7 @@ pub async fn unload_chat_model(cfg: &AppConfig) -> Unloaded {
 
     // Ollama: `keep_alive: 0` with no prompt unloads right away.
     let is_ollama = match request(
-        cfg,
+        target.api_key,
         reqwest::Method::GET,
         format!("{host}/api/version"),
         PROBE_TIMEOUT,
@@ -174,34 +254,32 @@ pub async fn unload_chat_model(cfg: &AppConfig) -> Unloaded {
     };
     if is_ollama {
         let res = request(
-            cfg,
+            target.api_key,
             reqwest::Method::POST,
             format!("{host}/api/generate"),
             SWAP_TIMEOUT,
         )
-        .json(&json!({ "model": cfg.model, "keep_alive": 0 }))
+        .json(&json!({ "model": target.model, "keep_alive": 0 }))
         .send()
         .await
         .and_then(|r| r.error_for_status());
         match res {
             Ok(_) => log::info!(
                 "gpu: unloaded {} from Ollama in {:.1}s",
-                cfg.model,
+                target.model,
                 started.elapsed().as_secs_f32()
             ),
-            Err(e) => log::warn!("gpu: Ollama unload of {} failed: {e}", cfg.model),
+            Err(e) => log::warn!("gpu: Ollama unload of {} failed: {e}", target.model),
         }
         return Unloaded::default();
     }
 
-    log::warn!(
-        "gpu: this LLM server ({host}) can't be asked to unload; the chat model stays in memory"
-    );
+    log::warn!("gpu: this LLM server ({host}) can't be asked to unload; the model stays in memory");
     Unloaded::default()
 }
 
 async fn unload_lm_studio(
-    cfg: &AppConfig,
+    target: ModelTarget<'_>,
     host: &str,
     found: Vec<Instance>,
     started: Instant,
@@ -209,14 +287,14 @@ async fn unload_lm_studio(
     if found.is_empty() {
         log::info!(
             "gpu: {} isn't loaded in LM Studio, nothing to unload",
-            cfg.model
+            target.model
         );
         return Unloaded::default();
     }
     let mut done = Vec::new();
     for inst in found {
         let res = request(
-            cfg,
+            target.api_key,
             reqwest::Method::POST,
             format!("{host}/api/v1/models/unload"),
             SWAP_TIMEOUT,
@@ -233,21 +311,21 @@ async fn unload_lm_studio(
     if !done.is_empty() {
         log::info!(
             "gpu: unloaded {} from LM Studio in {:.1}s",
-            cfg.model,
+            target.model,
             started.elapsed().as_secs_f32()
         );
     }
     Unloaded { instances: done }
 }
 
-/// Puts back what `unload_chat_model` took, with the same load settings.
+/// Puts back what `unload_model` took, with the same load settings.
 /// Never fatal: LM Studio's just-in-time loading would still load the model
 /// on the next request.
-pub async fn reload_chat_model(cfg: &AppConfig, unloaded: &Unloaded) {
+pub async fn reload_model(target: ModelTarget<'_>, unloaded: &Unloaded) {
     if unloaded.instances.is_empty() {
         return;
     }
-    let Some(host) = base_host(&cfg.endpoint) else {
+    let Some(host) = base_host(target.endpoint) else {
         return;
     };
     let started = Instant::now();
@@ -255,7 +333,7 @@ pub async fn reload_chat_model(cfg: &AppConfig, unloaded: &Unloaded) {
         let mut body = inst.config.clone();
         body.insert("model".into(), json!(inst.key));
         let res = request(
-            cfg,
+            target.api_key,
             reqwest::Method::POST,
             format!("{host}/api/v1/models/load"),
             SWAP_TIMEOUT,
@@ -278,10 +356,6 @@ pub async fn reload_chat_model(cfg: &AppConfig, unloaded: &Unloaded) {
     }
 }
 
-/// Runs one image generation with the configured GPU handling. The reload
-/// and the ComfyUI free happen on the error path too, and the gate is
-/// released only after the model is back, so callers must run any LLM
-/// follow-up (the reaction turn) after this returns.
 /// This computer's own interface addresses, so `192.168.1.2` and
 /// `localhost` count as the same machine.
 fn local_addrs() -> HashSet<IpAddr> {
@@ -348,6 +422,12 @@ pub async fn same_machine(llm_endpoint: &str, comfy_url: &str) -> Option<bool> {
     Some((a.iter().any(is_local) && b.iter().any(is_local)) || a.iter().any(|ip| b.contains(ip)))
 }
 
+/// Runs one image generation with the configured GPU handling. The reload
+/// and the ComfyUI free happen on the error path too, and the gate is
+/// released only after the model is back, so callers must run any LLM
+/// follow-up (the reaction turn) after this returns.
+/// With only helper/embedding models unloaded the gate is still exclusive, so
+/// chat requests wait for the image too (the trade-off of that opt-in switch).
 pub async fn with_image_slot<T, F, Fut>(cfg: &AppConfig, comfy: &ComfyUiConfig, generate: F) -> T
 where
     F: FnOnce() -> Fut,
@@ -356,37 +436,79 @@ where
     // Unloading a model on another machine frees nothing here and costs a
     // reload (plus its prompt cache) on the next reply, so it only happens
     // when both really share this GPU.
-    let share = if comfy.unload_llm_during_generation {
-        match same_machine(&cfg.endpoint, &comfy.base_url).await {
-            Some(true) => true,
-            Some(false) => {
-                log::info!("gpu: chat model and ComfyUI are on different machines; not unloading");
-                false
-            }
-            None => {
-                log::warn!(
-                    "gpu: couldn't tell whether the chat model and ComfyUI share a machine; \
-                     not unloading"
-                );
-                false
+    let on_comfy_machine = |endpoint: &str, what: &'static str| {
+        let endpoint = endpoint.to_string();
+        async move {
+            match same_machine(&endpoint, &comfy.base_url).await {
+                Some(true) => true,
+                Some(false) => {
+                    log::info!("gpu: {what} and ComfyUI are on different machines; not unloading");
+                    false
+                }
+                None => {
+                    log::warn!(
+                        "gpu: couldn't tell whether {what} and ComfyUI share a machine; \
+                         not unloading"
+                    );
+                    false
+                }
             }
         }
-    } else {
-        false
     };
-    let gate = if share { Some(exclusive().await) } else { None };
-    let unloaded = if gate.is_some() {
-        Some(unload_chat_model(cfg).await)
+    let share = comfy.unload_llm_during_generation
+        && on_comfy_machine(&cfg.endpoint, "the chat model").await;
+
+    let mut helpers: Vec<ModelTarget<'_>> = Vec::new();
+    if comfy.unload_helper_during_generation {
+        let mut wanted: Vec<ModelTarget<'_>> = cfg.helper().into_iter().collect();
+        if !cfg.chat_recall_embedding_model.trim().is_empty() {
+            wanted.push(cfg.embedding_target());
+        }
+        for t in wanted {
+            let key = (base_host(t.endpoint), t.model);
+            let is_chat = share && key == (base_host(&cfg.endpoint), cfg.model.as_str());
+            let dup = helpers
+                .iter()
+                .any(|h| (base_host(h.endpoint), h.model) == key);
+            if is_chat || dup || !on_comfy_machine(t.endpoint, "the helper model").await {
+                continue;
+            }
+            helpers.push(t);
+        }
+    }
+
+    // Park first so new helper/embedding requests queue on the gate.
+    let parked = Parked::new(
+        helpers
+            .iter()
+            .filter_map(|t| base_host(t.endpoint))
+            .collect(),
+    );
+    let gate = if share || !helpers.is_empty() {
+        Some(exclusive().await)
     } else {
         None
     };
+    let unloaded_chat = if share {
+        Some(unload_model(cfg.main_target()).await)
+    } else {
+        None
+    };
+    let mut unloaded_helpers = Vec::new();
+    for t in &helpers {
+        unloaded_helpers.push(unload_model(*t).await);
+    }
     let out = generate().await;
     if comfy.free_after_generation {
         comfyui::free_memory(comfy).await;
     }
-    if let Some(unloaded) = unloaded {
-        reload_chat_model(cfg, &unloaded).await;
+    if let Some(unloaded) = unloaded_chat {
+        reload_model(cfg.main_target(), &unloaded).await;
     }
+    for (t, unloaded) in helpers.iter().zip(&unloaded_helpers) {
+        reload_model(*t, unloaded).await;
+    }
+    drop(parked);
     drop(gate);
     out
 }
@@ -583,7 +705,7 @@ pub(crate) mod tests {
         let (host, seen) = fake_server(lm_studio_handler);
         let cfg = cfg_for(&host, "google/gemma-3-4b");
 
-        let unloaded = unload_chat_model(&cfg).await;
+        let unloaded = unload_model(cfg.main_target()).await;
         assert_eq!(unloaded.instances.len(), 1);
         {
             let seen = seen.lock().unwrap();
@@ -596,7 +718,7 @@ pub(crate) mod tests {
             assert_eq!(body, json!({"instance_id": "google/gemma-3-4b"}));
         }
 
-        reload_chat_model(&cfg, &unloaded).await;
+        reload_model(cfg.main_target(), &unloaded).await;
         let seen = seen.lock().unwrap();
         let load = seen
             .iter()
@@ -616,7 +738,7 @@ pub(crate) mod tests {
         let (host, seen) = fake_server(lm_studio_handler);
         let mut cfg = cfg_for(&host, "google/gemma-3-4b@q4_k_m");
         cfg.api_key = "secret".into();
-        let unloaded = unload_chat_model(&cfg).await;
+        let unloaded = unload_model(cfg.main_target()).await;
         assert_eq!(unloaded.instances.len(), 1);
         assert_eq!(unloaded.instances[0].key, "google/gemma-3-4b");
         assert!(!requests(&seen).is_empty());
@@ -630,7 +752,7 @@ pub(crate) mod tests {
             _ => (404, "{}".into()),
         });
         let cfg = cfg_for(&host, "gemma3:1b");
-        let unloaded = unload_chat_model(&cfg).await;
+        let unloaded = unload_model(cfg.main_target()).await;
         assert!(unloaded.instances.is_empty());
         {
             let seen = seen.lock().unwrap();
@@ -642,7 +764,7 @@ pub(crate) mod tests {
             assert_eq!(body, json!({"model": "gemma3:1b", "keep_alive": 0}));
         }
         let before = seen.lock().unwrap().len();
-        reload_chat_model(&cfg, &unloaded).await;
+        reload_model(cfg.main_target(), &unloaded).await;
         assert_eq!(seen.lock().unwrap().len(), before);
     }
 
@@ -650,8 +772,8 @@ pub(crate) mod tests {
     async fn unknown_server_is_left_alone() {
         let (host, seen) = fake_server(|_, _, _| (404, "{}".into()));
         let cfg = cfg_for(&host, "m");
-        let unloaded = unload_chat_model(&cfg).await;
-        reload_chat_model(&cfg, &unloaded).await;
+        let unloaded = unload_model(cfg.main_target()).await;
+        reload_model(cfg.main_target(), &unloaded).await;
         assert!(unloaded.instances.is_empty());
         assert!(requests(&seen).iter().all(|(m, _)| m == "GET"));
     }
@@ -722,5 +844,124 @@ pub(crate) mod tests {
         let out = with_image_slot(&cfg, &comfy, || async { 7 }).await;
         assert_eq!(out, 7);
         assert!(requests(&seen).is_empty());
+    }
+
+    #[test]
+    fn shares_gpu_gate_compares_hosts_only() {
+        let chat = "http://192.168.1.3:1234/v1/chat/completions";
+        assert!(shares_gpu_gate("http://192.168.1.3:11434", chat));
+        assert!(!shares_gpu_gate("http://192.168.1.7:1234", chat));
+        assert!(shares_gpu_gate(
+            "http://localhost:1/v1",
+            "http://127.0.0.1:1234/v1"
+        ));
+        assert!(shares_gpu_gate("not a url", chat));
+    }
+
+    #[tokio::test]
+    async fn ungated_requests_skip_an_exclusive_gate() {
+        let write = exclusive().await;
+        let permit = tokio::time::timeout(Duration::from_secs(1), ungated(llm_permit()))
+            .await
+            .expect("no wait");
+        assert!(permit.is_none());
+        drop(write);
+    }
+
+    fn helper_cfg(chat: &str, helper: &str) -> AppConfig {
+        AppConfig {
+            endpoint: format!("{chat}/v1/chat/completions"),
+            model: "chat-model".into(),
+            helper_endpoint: format!("{helper}/v1/chat/completions"),
+            helper_model: "small".into(),
+            ..AppConfig::default()
+        }
+    }
+
+    fn posts(seen: &Seen) -> Vec<(String, String)> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p.starts_with("/api/v1/models/"))
+            .map(|(_, p, b)| (p.clone(), b.clone()))
+            .collect()
+    }
+
+    fn small_model_handler(method: &str, path: &str, body: &str) -> (u16, String) {
+        match (method, path) {
+            ("GET", "/api/v1/models") => (
+                200,
+                json!({"models": [{"type": "llm", "key": "small", "loaded_instances": [
+                    {"id": "small", "config": {"context_length": 2048}}]}]})
+                .to_string(),
+            ),
+            _ => lm_studio_handler(method, path, body),
+        }
+    }
+
+    #[tokio::test]
+    async fn helper_on_comfys_machine_is_unloaded_when_the_option_is_on() {
+        let (host, seen) = fake_server(small_model_handler);
+        // Chat elsewhere and not unloaded: only the helper moves.
+        let cfg = helper_cfg("http://192.0.2.10:1234", &host);
+        let comfy = ComfyUiConfig {
+            base_url: host.clone(),
+            unload_helper_during_generation: true,
+            ..ComfyUiConfig::default()
+        };
+        let parked_during = with_image_slot(&cfg, &comfy, || async { is_parked(&host) }).await;
+        assert!(parked_during, "helper host is parked while generating");
+        assert!(!is_parked(&host), "parked entry removed afterwards");
+        let posts = posts(&seen);
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[0].0, "/api/v1/models/unload");
+        assert_eq!(posts[1].0, "/api/v1/models/load");
+        assert!(posts[1].1.contains("\"small\""));
+    }
+
+    #[tokio::test]
+    async fn helper_stays_loaded_when_the_option_is_off() {
+        let (host, seen) = fake_server(small_model_handler);
+        let cfg = helper_cfg("http://192.0.2.10:1234", &host);
+        let comfy = ComfyUiConfig {
+            base_url: host.clone(),
+            ..ComfyUiConfig::default()
+        };
+        with_image_slot(&cfg, &comfy, || async {}).await;
+        assert!(requests(&seen).is_empty());
+    }
+
+    #[tokio::test]
+    async fn parked_host_is_released_after_a_panicking_generation() {
+        let (host, _seen) = fake_server(small_model_handler);
+        let cfg = helper_cfg("http://192.0.2.10:1234", &host);
+        let comfy = ComfyUiConfig {
+            base_url: host.clone(),
+            unload_helper_during_generation: true,
+            ..ComfyUiConfig::default()
+        };
+        let task = tokio::spawn({
+            let host = host.clone();
+            async move {
+                with_image_slot(&cfg, &comfy, || async { panic!("boom") }).await;
+                host
+            }
+        });
+        assert!(task.await.is_err());
+        assert!(!is_parked(&host), "guard must unpark on unwind");
+        let _guard = tokio::time::timeout(Duration::from_secs(5), llm_permit())
+            .await
+            .expect("gate released");
+    }
+
+    #[test]
+    fn needs_gate_is_true_while_parked() {
+        let chat = "http://192.168.1.3:1234/v1/chat/completions";
+        let other = "http://192.0.2.77:1234/v1/chat/completions";
+        assert!(!needs_gate(other, chat));
+        let guard = Parked::new(vec![base_host(other).unwrap()]);
+        assert!(needs_gate(other, chat));
+        drop(guard);
+        assert!(!needs_gate(other, chat));
     }
 }

@@ -490,7 +490,14 @@ async fn embed_texts(
     let mut out = Vec::with_capacity(texts.len());
     for batch in texts.chunks(EMBED_BATCH) {
         let inputs: Vec<String> = batch.iter().map(|t| with_prefix(model, kind, t)).collect();
-        out.extend(llm::embed(&cfg.endpoint, &cfg.api_key, model, &inputs).await?);
+        let target = cfg.embedding_target();
+        let call = llm::embed(target.endpoint, target.api_key, model, &inputs);
+        let batch = if crate::gpu::needs_gate(target.endpoint, &cfg.endpoint) {
+            call.await?
+        } else {
+            crate::gpu::ungated(call).await?
+        };
+        out.extend(batch);
     }
     Ok(out)
 }
@@ -1267,10 +1274,6 @@ async fn expand_query(cfg: &AppConfig, query: &str, cancel: Option<&CancelToken>
     if query.trim().is_empty() || cancel.is_some_and(CancelToken::is_cancelled) {
         return Vec::new();
     }
-    let model = match cfg.chat_recall_expansion_model.trim() {
-        "" => cfg.model.as_str(),
-        m => m,
-    };
     let messages = [
         ChatMessage::text("system", EXPANSION_PROMPT),
         ChatMessage::text("user", query.chars().take(500).collect::<String>()),
@@ -1283,16 +1286,35 @@ async fn expand_query(cfg: &AppConfig, query: &str, cancel: Option<&CancelToken>
         "required": ["queries"],
         "additionalProperties": false
     });
-    let call = llm::send_chat_json(
-        &cfg.endpoint,
-        model,
-        &cfg.api_key,
-        &messages,
-        0.0,
-        Some(150),
-        "search_queries",
-        &schema,
-    );
+    // An explicit expansion model runs on the chat endpoint, as before.
+    let call = async {
+        match cfg.chat_recall_expansion_model.trim() {
+            "" => {
+                crate::helper_model::send_json(
+                    cfg,
+                    &messages,
+                    0.0,
+                    Some(150),
+                    "search_queries",
+                    &schema,
+                )
+                .await
+            }
+            model => {
+                llm::send_chat_json(
+                    &cfg.endpoint,
+                    model,
+                    &cfg.api_key,
+                    &messages,
+                    0.0,
+                    Some(150),
+                    "search_queries",
+                    &schema,
+                )
+                .await
+            }
+        }
+    };
     let stopped = async {
         match cancel {
             Some(c) => c.cancelled().await,

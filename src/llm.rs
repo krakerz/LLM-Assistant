@@ -613,8 +613,8 @@ fn parse_embeddings(body: &str, expected: usize) -> anyhow::Result<Vec<Vec<f32>>
     Ok(rows.into_iter().map(|(_, v)| v).collect())
 }
 
-/// `POST {host}/v1/embeddings` on the chat endpoint's own server. Holds the
-/// GPU permit like any other model request, so it waits out an image swap.
+/// `POST {host}/v1/embeddings` on `endpoint`'s server. Holds the GPU permit
+/// like any other model request (unless run inside `gpu::ungated`).
 pub async fn embed(
     endpoint: &str,
     api_key: &str,

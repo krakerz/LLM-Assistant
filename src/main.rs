@@ -17,6 +17,7 @@ mod danbooru;
 mod fileops_commands;
 mod gpu;
 mod headless;
+mod helper_model;
 mod llm;
 mod memory;
 mod paths;

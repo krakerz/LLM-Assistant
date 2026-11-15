@@ -569,7 +569,7 @@ async fn h_default_system_prompt() -> Json<&'static str> {
 
 /// The browser never sees the stored key (see `h_load_config`), so its
 /// Settings "test" buttons send an empty one. Fills it in from disk, but only
-/// when the request targets the already-saved endpoint -- otherwise a client
+/// when the request targets the already-saved chat or helper endpoint -- otherwise a client
 /// could point `endpoint` at its own server and collect the key.
 fn effective_api_key(endpoint: &str, sent: &str) -> String {
     if !sent.is_empty() {
@@ -577,6 +577,10 @@ fn effective_api_key(endpoint: &str, sent: &str) -> String {
     }
     match config::load_or_init() {
         Ok(cfg) if cfg.endpoint.trim() == endpoint.trim() => cfg.api_key,
+        Ok(cfg) => match cfg.helper() {
+            Some(h) if h.endpoint.trim() == endpoint.trim() => h.api_key.to_string(),
+            _ => String::new(),
+        },
         _ => String::new(),
     }
 }
@@ -618,14 +622,23 @@ async fn h_test_connection(Json(req): Json<TestConnectionRequest>) -> Response {
     ok_or_400(result)
 }
 
-/// The API key never leaves the server: `api_key` is blanked and
-/// `apiKeySet` says whether one is stored.
+/// API keys never leave the server: every `*api_key` is blanked and the
+/// matching `*ApiKeySet` flag says whether one is stored.
 async fn h_load_config() -> Response {
     let result = load_cfg().and_then(|cfg| {
-        let key_set = !cfg.api_key.is_empty();
         let mut value = serde_json::to_value(&cfg).map_err(|e| e.to_string())?;
-        value["api_key"] = serde_json::Value::String(String::new());
-        value["apiKeySet"] = serde_json::Value::Bool(key_set);
+        for (field, flag, stored) in [
+            ("api_key", "apiKeySet", &cfg.api_key),
+            ("helper_api_key", "helperApiKeySet", &cfg.helper_api_key),
+            (
+                "embedding_api_key",
+                "embeddingApiKeySet",
+                &cfg.embedding_api_key,
+            ),
+        ] {
+            value[field] = serde_json::Value::String(String::new());
+            value[flag] = serde_json::Value::Bool(!stored.is_empty());
+        }
         Ok(value)
     });
     ok_or_400(result)
@@ -664,6 +677,11 @@ struct ServerSaveConfig {
     chat_recall_min_similarity: Option<f32>,
     chat_recall_query_expansion: Option<bool>,
     chat_recall_expansion_model: Option<String>,
+    helper_endpoint: Option<String>,
+    helper_model: Option<String>,
+    helper_api_key: Option<String>,
+    embedding_endpoint: Option<String>,
+    embedding_api_key: Option<String>,
     server_session_expiry_days: Option<u32>,
     danbooru_online_lookup: Option<bool>,
 }
@@ -673,9 +691,39 @@ fn normalized_endpoint(endpoint: &str) -> &str {
     endpoint.trim().trim_end_matches('/')
 }
 
+/// Same rule as `api_key`: a blank echo keeps the stored key only while its
+/// target is unchanged.
+fn merge_key(sent: Option<String>, stored: &mut String, old_target: &str, new_target: &str) {
+    match sent.filter(|k| !k.is_empty()) {
+        Some(key) => *stored = key,
+        None if normalized_endpoint(new_target) != normalized_endpoint(old_target) => {
+            stored.clear()
+        }
+        None => {}
+    }
+}
+
+/// Where the helper's calls go: its own endpoint, else the chat endpoint.
+fn helper_server(cfg: &config::AppConfig) -> &str {
+    match cfg.helper_endpoint.trim() {
+        "" => &cfg.endpoint,
+        e => e,
+    }
+}
+
+/// Where embeddings go: their own endpoint, else the chat endpoint.
+fn embedding_server(cfg: &config::AppConfig) -> &str {
+    match cfg.embedding_endpoint.trim() {
+        "" => &cfg.endpoint,
+        e => e,
+    }
+}
+
 impl ServerSaveConfig {
     fn merge_into(self, cfg: &mut config::AppConfig) {
         let old_endpoint = normalized_endpoint(&cfg.endpoint).to_string();
+        let old_helper = helper_server(cfg).to_string();
+        let old_embedding = embedding_server(cfg).to_string();
         macro_rules! set {
             ($($field:ident),*) => {
                 $(if let Some(v) = self.$field { cfg.$field = v; })*
@@ -706,6 +754,9 @@ impl ServerSaveConfig {
             chat_recall_min_similarity,
             chat_recall_query_expansion,
             chat_recall_expansion_model,
+            helper_endpoint,
+            helper_model,
+            embedding_endpoint,
             server_session_expiry_days,
             danbooru_online_lookup
         );
@@ -713,11 +764,22 @@ impl ServerSaveConfig {
         // every save -- that keeps the stored key, but only for the endpoint it
         // was saved with: otherwise a client could re-point the endpoint and
         // collect the key (same rule as `effective_api_key`).
-        match self.api_key.filter(|k| !k.is_empty()) {
-            Some(key) => cfg.api_key = key,
-            None if normalized_endpoint(&cfg.endpoint) != old_endpoint => cfg.api_key.clear(),
-            None => {}
-        }
+        let new_endpoint = cfg.endpoint.clone();
+        merge_key(self.api_key, &mut cfg.api_key, &old_endpoint, &new_endpoint);
+        let new_helper = helper_server(cfg).to_string();
+        merge_key(
+            self.helper_api_key,
+            &mut cfg.helper_api_key,
+            &old_helper,
+            &new_helper,
+        );
+        let new_embedding = embedding_server(cfg).to_string();
+        merge_key(
+            self.embedding_api_key,
+            &mut cfg.embedding_api_key,
+            &old_embedding,
+            &new_embedding,
+        );
     }
 }
 
@@ -1501,5 +1563,65 @@ mod tests {
             serde_json::from_str(r#"{"endpoint":" http://old/v1/ ","api_key":""}"#).unwrap();
         cosmetic.merge_into(&mut cfg);
         assert_eq!(cfg.api_key, "secret");
+    }
+
+    fn merged(cfg: &mut config::AppConfig, json: &str) {
+        serde_json::from_str::<ServerSaveConfig>(json)
+            .unwrap()
+            .merge_into(cfg);
+    }
+
+    #[test]
+    fn http_save_config_helper_key_follows_its_target() {
+        let mut cfg = config::AppConfig {
+            endpoint: "http://old/v1".into(),
+            helper_endpoint: "http://h/v1".into(),
+            helper_api_key: "hk".into(),
+            ..Default::default()
+        };
+        merged(&mut cfg, r#"{"helper_api_key":""}"#);
+        assert_eq!(cfg.helper_api_key, "hk", "blank echo keeps it");
+        merged(&mut cfg, r#"{"endpoint":"http://other/v1"}"#);
+        assert_eq!(
+            cfg.helper_api_key, "hk",
+            "chat endpoint moves, helper has its own"
+        );
+        merged(&mut cfg, r#"{"helper_endpoint":"http://evil/v1"}"#);
+        assert!(cfg.helper_api_key.is_empty());
+    }
+
+    #[test]
+    fn http_save_config_helper_key_follows_the_chat_endpoint_when_blank() {
+        let mut cfg = config::AppConfig {
+            endpoint: "http://old/v1".into(),
+            helper_api_key: "hk".into(),
+            ..Default::default()
+        };
+        merged(&mut cfg, r#"{"endpoint":"http://other/v1"}"#);
+        assert!(cfg.helper_api_key.is_empty());
+    }
+
+    #[test]
+    fn http_save_config_embedding_key_follows_its_target() {
+        let mut cfg = config::AppConfig {
+            endpoint: "http://old/v1".into(),
+            embedding_endpoint: "http://e:11434".into(),
+            embedding_api_key: "ek".into(),
+            ..Default::default()
+        };
+        merged(&mut cfg, r#"{"embedding_api_key":""}"#);
+        assert_eq!(cfg.embedding_api_key, "ek");
+        merged(&mut cfg, r#"{"endpoint":"http://other/v1"}"#);
+        assert_eq!(cfg.embedding_api_key, "ek");
+        merged(&mut cfg, r#"{"embedding_endpoint":"http://evil:1"}"#);
+        assert!(cfg.embedding_api_key.is_empty());
+
+        let mut blank = config::AppConfig {
+            endpoint: "http://old/v1".into(),
+            embedding_api_key: "ek".into(),
+            ..Default::default()
+        };
+        merged(&mut blank, r#"{"endpoint":"http://other/v1"}"#);
+        assert!(blank.embedding_api_key.is_empty());
     }
 }

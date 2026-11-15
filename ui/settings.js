@@ -214,6 +214,7 @@ function collectComfyConfigFromForm() {
     filename_pattern: document.getElementById("cfgComfyFilenamePattern").value.trim() || "{session}-{timestamp}",
     reaction_mode: document.getElementById("cfgComfyReactionMode").value,
     unload_llm_during_generation: document.getElementById("cfgComfyUnloadLlm").checked,
+    unload_helper_during_generation: document.getElementById("cfgComfyUnloadHelper").checked,
     free_after_generation: document.getElementById("cfgComfyFreeAfter").checked,
     size_presets: Object.fromEntries(
       Object.entries(COMFY_SIZE_DEFAULTS).map(([name, def]) => [
@@ -243,10 +244,16 @@ function renderSettings() {
   const testResult = document.getElementById("testConnectionResult");
   testResult.textContent = "";
   testResult.classList.remove("warn");
+  const helperResult = document.getElementById("testHelperResult");
+  helperResult.textContent = "";
+  helperResult.classList.remove("warn");
 
   document.getElementById("cfgEndpoint").value = currentConfig.endpoint;
   document.getElementById("cfgModel").value = currentConfig.model;
   document.getElementById("cfgApiKey").value = currentConfig.api_key || "";
+  document.getElementById("cfgHelperEndpoint").value = currentConfig.helper_endpoint || "";
+  document.getElementById("cfgHelperModel").value = currentConfig.helper_model || "";
+  document.getElementById("cfgHelperApiKey").value = currentConfig.helper_api_key || "";
   document.getElementById("cfgTemperature").value = currentConfig.temperature;
   document.getElementById("cfgChatTemperature").value = currentConfig.chat_temperature;
   document.getElementById("cfgMaxAutoSteps").value = currentConfig.max_auto_steps;
@@ -276,6 +283,8 @@ function renderSettings() {
     currentConfig.chat_recall_scope === "persona";
   document.getElementById("cfgChatRecallEmbeddingModel").value =
     currentConfig.chat_recall_embedding_model || "";
+  document.getElementById("cfgEmbeddingEndpoint").value = currentConfig.embedding_endpoint || "";
+  document.getElementById("cfgEmbeddingApiKey").value = currentConfig.embedding_api_key || "";
   document.getElementById("cfgChatRecallMax").value = currentConfig.chat_recall_max ?? 4;
   document.getElementById("cfgChatRecallQueryExpansion").checked =
     !!currentConfig.chat_recall_query_expansion;
@@ -306,6 +315,7 @@ function renderSettings() {
   document.getElementById("cfgComfyFilenamePattern").value = currentComfyConfig.filename_pattern;
   document.getElementById("cfgComfyReactionMode").value = currentComfyConfig.reaction_mode || "always";
   document.getElementById("cfgComfyUnloadLlm").checked = !!currentComfyConfig.unload_llm_during_generation;
+  document.getElementById("cfgComfyUnloadHelper").checked = !!currentComfyConfig.unload_helper_during_generation;
   document.getElementById("cfgComfyFreeAfter").checked = !!currentComfyConfig.free_after_generation;
   for (const [name, def] of Object.entries(COMFY_SIZE_DEFAULTS)) {
     for (const dim of ["width", "height"]) {
@@ -484,6 +494,36 @@ document.getElementById("testConnectionBtn").addEventListener("click", async () 
   }
 });
 
+// Tests the helper as typed; an empty endpoint means the chat endpoint.
+document.getElementById("testHelperBtn").addEventListener("click", async () => {
+  const btn = document.getElementById("testHelperBtn");
+  const result = document.getElementById("testHelperResult");
+  const model = document.getElementById("cfgHelperModel").value.trim();
+  result.classList.remove("warn");
+  if (!model) {
+    result.textContent = "Set a helper model first.";
+    result.classList.add("warn");
+    return;
+  }
+  const helperEndpoint = document.getElementById("cfgHelperEndpoint").value.trim();
+  btn.disabled = true;
+  result.textContent = "Testing…";
+  try {
+    result.textContent = await invoke("test_connection", {
+      endpoint: helperEndpoint || document.getElementById("cfgEndpoint").value.trim(),
+      model,
+      apiKey:
+        document.getElementById("cfgHelperApiKey").value ||
+        (helperEndpoint ? "" : document.getElementById("cfgApiKey").value),
+    });
+  } catch (err) {
+    result.textContent = `Failed: ${err}`;
+    result.classList.add("warn");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 document.getElementById("resetPromptBtn").addEventListener("click", async () => {
   try {
     const defaultPrompt = await invoke("default_system_prompt");
@@ -517,6 +557,9 @@ document.getElementById("settingsSaveBtn").addEventListener("click", async () =>
   currentConfig.endpoint = document.getElementById("cfgEndpoint").value;
   currentConfig.model = document.getElementById("cfgModel").value;
   currentConfig.api_key = document.getElementById("cfgApiKey").value;
+  currentConfig.helper_endpoint = document.getElementById("cfgHelperEndpoint").value.trim();
+  currentConfig.helper_model = document.getElementById("cfgHelperModel").value.trim();
+  currentConfig.helper_api_key = document.getElementById("cfgHelperApiKey").value;
   currentConfig.temperature = parseFloat(document.getElementById("cfgTemperature").value) || 0;
   currentConfig.chat_temperature =
     parseFloat(document.getElementById("cfgChatTemperature").value) || 0;
@@ -563,6 +606,8 @@ document.getElementById("settingsSaveBtn").addEventListener("click", async () =>
   currentConfig.chat_recall_embedding_model = document
     .getElementById("cfgChatRecallEmbeddingModel")
     .value.trim();
+  currentConfig.embedding_endpoint = document.getElementById("cfgEmbeddingEndpoint").value.trim();
+  currentConfig.embedding_api_key = document.getElementById("cfgEmbeddingApiKey").value;
   currentConfig.chat_recall_max = Math.min(
     10,
     Math.max(1, parseInt(document.getElementById("cfgChatRecallMax").value, 10) || 4),

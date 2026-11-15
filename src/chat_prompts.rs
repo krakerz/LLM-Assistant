@@ -632,7 +632,9 @@ pub fn drop_template_fields(fields: Vec<StateField>, previous_raw: &str) -> Vec<
 /// The small model sometimes puts a removed garment back in the outfit. A
 /// garment that is new compared to the previous outfit stays only when its
 /// last word ("shrug" of "white shrug") is in her reply or the user's message.
-/// No previous or new outfit field: unchanged.
+/// If nothing would remain, the previous outfit is kept (a model-written
+/// "none" is its own answer and stays). No previous or new outfit field:
+/// unchanged.
 pub fn drop_unmentioned_garments(
     mut fields: Vec<StateField>,
     previous_raw: &str,
@@ -644,12 +646,7 @@ pub fn drop_unmentioned_garments(
     let Some(old) = previous.iter().find(|f| is_outfit(&f.name)) else {
         return fields;
     };
-    let garments = |text: &str| -> Vec<String> {
-        text.split(',')
-            .map(|g| g.trim().to_string())
-            .filter(|g| !g.is_empty())
-            .collect()
-    };
+    let garments = garment_list;
     let old_garments: Vec<String> = garments(&old.value.to_lowercase());
     // "thigh-highs" in prose is "thighhighs" in a tag.
     let said = format!("{reply} {user_text}")
@@ -660,6 +657,9 @@ pub fn drop_unmentioned_garments(
         .filter(|w| !w.is_empty())
         .collect();
     for field in fields.iter_mut().filter(|f| is_outfit(&f.name)) {
+        if is_unclothed(&field.value) {
+            continue;
+        }
         let kept: Vec<String> = garments(&field.value)
             .into_iter()
             .filter(|g| {
@@ -667,12 +667,8 @@ pub fn drop_unmentioned_garments(
                 if old_garments.contains(&lower) {
                     return true;
                 }
-                // "white shrug (clothing)": the head is "shrug", not the note.
-                let bare = lower.split('(').next().unwrap_or("").replace('-', "");
-                let head = bare
-                    .split(|c: char| !c.is_alphanumeric())
-                    .rfind(|w| !w.is_empty())
-                    .unwrap_or("");
+                let head = garment_head(&lower);
+                let head = head.as_str();
                 let mentioned = head.is_empty() || said_words.contains(&head);
                 if !mentioned {
                     log::info!("state update: '{g}' came back unmentioned, dropping");
@@ -682,11 +678,207 @@ pub fn drop_unmentioned_garments(
             .collect();
         // A parenthesised comma ("jeans (rolled, blue)") splits badly: only
         // rewrite when something was actually removed.
-        if kept.len() < garments(&field.value).len() {
+        if kept.is_empty() && !field.value.trim().is_empty() {
+            // A whole outfit nobody mentioned: keep the one she had.
+            log::info!(
+                "state update: invented outfit '{}', keeping the previous one",
+                field.value
+            );
+            field.value = old.value.clone();
+        } else if kept.len() < garments(&field.value).len() {
             field.value = kept.join(", ");
         }
     }
     fields
+}
+
+/// Comma-separated garments, trimmed, empties dropped.
+fn garment_list(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty())
+        .collect()
+}
+
+/// An outfit value that says she wears nothing.
+fn is_unclothed(value: &str) -> bool {
+    matches!(
+        value.trim().to_lowercase().as_str(),
+        "none" | "nothing" | "naked" | "nude"
+    )
+}
+
+/// Last word of a garment ("shrug" of "white shrug (clothing)"), lowercased,
+/// hyphens removed ("thigh-highs" is "thighhighs" in a tag); `""` if none.
+fn garment_head(garment: &str) -> String {
+    let lower = garment.to_lowercase();
+    let bare = lower.split('(').next().unwrap_or("").replace('-', "");
+    bare.split(|c: char| !c.is_alphanumeric())
+        .rfind(|w| !w.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+const PLAIN_REMOVE_VERBS: &[&str] = &[
+    "drop", "drops", "dropped", "dropping", "remove", "removes", "removed", "removing", "toss",
+    "tosses", "tossed", "tossing",
+];
+/// Verbs that only mean undressing with "off" ("takes her jacket off").
+const PARTICLE_REMOVE_VERBS: &[&str] = &[
+    "take",
+    "takes",
+    "took",
+    "taking",
+    "slip",
+    "slips",
+    "slipped",
+    "slipping",
+    "pull",
+    "pulls",
+    "pulled",
+    "pulling",
+    "kick",
+    "kicks",
+    "kicked",
+    "kicking",
+    "strip",
+    "strips",
+    "stripped",
+    "stripping",
+];
+const DETERMINERS: &[&str] = &["the", "her", "my"];
+const OBJECT_STOP_WORDS: &[&str] = &[
+    "to", "at", "on", "in", "into", "onto", "of", "with", "and", "from", "her", "the", "his", "my",
+    "your", "a", "an",
+];
+const NEGATIONS: &[&str] = &[
+    "not", "no", "never", "doesnt", "dont", "didnt", "wont", "cant", "cannot", "isnt", "wasnt",
+    "hasnt", "without", "refuses", "refused",
+];
+
+/// The model sometimes keeps a garment her reply just took off. A garment of
+/// the previous outfit goes when her reply (only hers) says she removes it;
+/// negated phrases don't count. If she takes off the last piece, the outfit
+/// becomes `none`.
+pub fn drop_removed_garments(
+    mut fields: Vec<StateField>,
+    previous_raw: &str,
+    reply: &str,
+) -> Vec<StateField> {
+    let previous = parse_state_fields(previous_raw);
+    let is_outfit = |name: &str| name.eq_ignore_ascii_case("outfit");
+    let Some(old) = previous.iter().find(|f| is_outfit(&f.name)) else {
+        return fields;
+    };
+    let old_garments = garment_list(&old.value.to_lowercase());
+    let removed = removed_garments(reply, &old_garments);
+    if removed.is_empty() {
+        return fields;
+    }
+    for field in fields.iter_mut().filter(|f| is_outfit(&f.name)) {
+        let all = garment_list(&field.value);
+        let kept: Vec<&String> = all
+            .iter()
+            .filter(|g| {
+                let gone = removed.contains(&g.to_lowercase());
+                if gone {
+                    log::info!("state update: '{g}' was taken off, dropping");
+                }
+                !gone
+            })
+            .collect();
+        // Same parenthesised-comma caution as above: rewrite only on a removal.
+        if kept.len() == all.len() {
+            continue;
+        }
+        field.value = if kept.is_empty() {
+            "none".to_string()
+        } else {
+            kept.iter()
+                .map(|g| g.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+    }
+    fields
+}
+
+/// The lowercase `old_garments` her reply says she takes off.
+fn removed_garments(reply: &str, old_garments: &[String]) -> Vec<String> {
+    // "thigh-highs" is "thighhighs" in a tag; "doesn't" is "doesnt".
+    let normalized: String = reply
+        .to_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, '-' | '\'' | '\u{2019}'))
+        .collect();
+    let clauses: Vec<Vec<&str>> = normalized
+        .split(|c: char| ".!?;:,\n*\"()".contains(c))
+        .map(|clause| {
+            clause
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| !w.is_empty())
+                .collect()
+        })
+        .collect();
+    old_garments
+        .iter()
+        .filter(|g| {
+            let head = garment_head(g);
+            !head.is_empty() && clauses.iter().any(|words| clause_removes(words, &head))
+        })
+        .cloned()
+        .collect()
+}
+
+fn head_matches(word: &str, head: &str) -> bool {
+    word == head || head.strip_suffix('s') == Some(word) || word.strip_suffix('s') == Some(head)
+}
+
+/// Index of the head word of an object starting at `start` (a determiner
+/// plus up to 3 more words), stopping at a stop word before the head.
+fn object_head_index(words: &[&str], start: usize, head: &str) -> Option<usize> {
+    if !DETERMINERS.contains(words.get(start)?) {
+        return None;
+    }
+    for k in start + 1..=start + 3 {
+        let word = words.get(k)?;
+        if head_matches(word, head) {
+            return Some(k);
+        }
+        if OBJECT_STOP_WORDS.contains(word) {
+            return None;
+        }
+    }
+    None
+}
+
+/// Whether one clause has an un-negated removal verb whose object ends in `head`.
+fn clause_removes(words: &[&str], head: &str) -> bool {
+    words.iter().enumerate().any(|(i, verb)| {
+        let plain = PLAIN_REMOVE_VERBS.contains(verb);
+        let particle = PARTICLE_REMOVE_VERBS.contains(verb);
+        if !(plain || particle) {
+            return false;
+        }
+        if words[i.saturating_sub(3)..i]
+            .iter()
+            .any(|w| NEGATIONS.contains(w))
+        {
+            return false;
+        }
+        let off_first = words.get(i + 1) == Some(&"off");
+        if plain && object_head_index(words, i + 1, head).is_some() {
+            return true;
+        }
+        if !particle {
+            return false;
+        }
+        if off_first && object_head_index(words, i + 2, head).is_some() {
+            return true;
+        }
+        // "takes her jacket off"
+        object_head_index(words, i + 1, head).is_some_and(|k| words.get(k + 1) == Some(&"off"))
+    })
 }
 
 /// Flat JSON object -> ordered field list. Non-string scalars are
@@ -1020,6 +1212,115 @@ Clothing State: neat. Location: beach. Mood: smug.*";
     fn first_state_is_kept() {
         let out = drop_unmentioned_garments(outfit_field("white shrug, jeans"), "{}", "hi", "");
         assert_eq!(out[0].value, "white shrug, jeans");
+    }
+
+    #[test]
+    fn invented_outfit_keeps_the_previous_one() {
+        let prev = r#"{"outfit": "blue dress"}"#;
+        let out =
+            drop_unmentioned_garments(outfit_field("red bikini, sun hat"), prev, "She laughs.", "");
+        assert_eq!(out[0].value, "blue dress");
+    }
+
+    #[test]
+    fn written_none_is_not_reverted() {
+        let prev = r#"{"outfit": "blue dress"}"#;
+        for v in ["none", "None", " nude ", "naked", "nothing"] {
+            let out = drop_unmentioned_garments(
+                outfit_field(v),
+                prev,
+                "She slips out of everything.",
+                "",
+            );
+            assert_eq!(out[0].value, v);
+        }
+    }
+
+    fn removed(prev: &str, new: &str, reply: &str) -> String {
+        let prev = format!(r#"{{"outfit": "{prev}"}}"#);
+        drop_removed_garments(outfit_field(new), &prev, reply)
+            .remove(0)
+            .value
+    }
+
+    #[test]
+    fn taken_off_garment_is_dropped() {
+        let both = "blue dress, white shrug";
+        assert_eq!(
+            removed(both, both, "She slips off the white shrug and smiles."),
+            "blue dress"
+        );
+        assert_eq!(
+            removed(both, both, "She takes her shrug off."),
+            "blue dress"
+        );
+        assert_eq!(
+            removed(
+                "black thighhighs, pleated skirt",
+                "black thighhighs, pleated skirt",
+                "She pulls off her thigh-highs."
+            ),
+            "pleated skirt"
+        );
+    }
+
+    #[test]
+    fn plain_verbs_and_plurals_match() {
+        assert_eq!(
+            removed("boots, jeans", "boots, jeans", "She kicks off her boots"),
+            "jeans"
+        );
+        assert_eq!(
+            removed(
+                "boots, jeans",
+                "boots, jeans",
+                "She drops the boot by the door"
+            ),
+            "jeans"
+        );
+    }
+
+    #[test]
+    fn negated_or_unrelated_phrases_do_not_remove() {
+        let both = "blue dress, white shrug";
+        for reply in [
+            "She doesn't take off her shrug.",
+            "She won't remove the shrug",
+            "No way.",
+        ] {
+            assert_eq!(removed(both, both, reply), both, "{reply}");
+        }
+        assert_eq!(
+            removed(
+                "skirt, top",
+                "skirt, top",
+                "She drops her gaze to her skirt."
+            ),
+            "skirt, top"
+        );
+    }
+
+    #[test]
+    fn new_garment_with_the_same_head_survives() {
+        assert_eq!(
+            removed(
+                "blue dress",
+                "red dress",
+                "She takes off the blue dress and puts on a red dress."
+            ),
+            "red dress"
+        );
+    }
+
+    #[test]
+    fn last_garment_removed_gives_none() {
+        assert_eq!(removed("towel", "towel", "She drops the towel."), "none");
+    }
+
+    #[test]
+    fn removal_without_previous_outfit_is_a_no_op() {
+        let out = drop_removed_garments(outfit_field("towel"), "{}", "She drops the towel.");
+        assert_eq!(out[0].value, "towel");
     }
 
     #[test]
