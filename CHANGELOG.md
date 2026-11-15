@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [2.2.0] — 2026-11-15
+
+### Added
+- Optional helper model (endpoint, model, API key) for the background work after a chat reply: state sheet, photo and search decisions, recall queries; the chat model takes over if it fails
+- Optional separate endpoint and API key for recall embeddings
+- Option to also unload the helper and embedding models during image generation
+
+### Fixed
+- An outfit piece she takes off in her reply no longer stays in the state sheet
+- The state sheet keeps the current outfit when the state update invents one nobody mentioned
+
 ## [2.1.0] — 2026-11-15
 
 ### Added

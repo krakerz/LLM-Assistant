@@ -201,9 +201,25 @@ pub struct AppConfig {
     /// message into extra search queries. Off: it costs a call per turn.
     #[serde(default)]
     pub chat_recall_query_expansion: bool,
-    /// Model for that rewrite; empty = `model`.
+    /// Model for that rewrite, on `endpoint`; empty = the helper model if
+    /// set, else `model`.
     #[serde(default)]
     pub chat_recall_expansion_model: String,
+    /// Optional small model for the mechanical chat calls (state, director,
+    /// recall queries). Empty `helper_model` = off; empty endpoint = `endpoint`.
+    #[serde(default)]
+    pub helper_endpoint: String,
+    #[serde(default)]
+    pub helper_model: String,
+    /// Empty = `api_key` when the helper is on the chat model's server.
+    #[serde(default)]
+    pub helper_api_key: String,
+    /// Server for `/v1/embeddings`; empty = `endpoint`'s server.
+    #[serde(default)]
+    pub embedding_endpoint: String,
+    /// Empty = `api_key` when embeddings go to the chat model's server.
+    #[serde(default)]
+    pub embedding_api_key: String,
     /// File ops: index each finished task per working folder and show the
     /// relevant and newest past ones to a new task (see `recall::recall_tasks`).
     #[serde(default = "default_fileops_recall")]
@@ -385,9 +401,80 @@ impl Default for AppConfig {
             chat_recall_min_similarity: default_chat_recall_min_similarity(),
             chat_recall_query_expansion: false,
             chat_recall_expansion_model: String::new(),
+            helper_endpoint: String::new(),
+            helper_model: String::new(),
+            helper_api_key: String::new(),
+            embedding_endpoint: String::new(),
+            embedding_api_key: String::new(),
             fileops_recall: default_fileops_recall(),
             danbooru_tags_dir: String::new(),
             danbooru_online_lookup: false,
+        }
+    }
+}
+
+/// Where one model call goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelTarget<'a> {
+    pub endpoint: &'a str,
+    pub model: &'a str,
+    pub api_key: &'a str,
+}
+
+impl AppConfig {
+    pub fn main_target(&self) -> ModelTarget<'_> {
+        ModelTarget {
+            endpoint: &self.endpoint,
+            model: &self.model,
+            api_key: &self.api_key,
+        }
+    }
+
+    /// `None` unless a helper model is set.
+    pub fn helper(&self) -> Option<ModelTarget<'_>> {
+        let model = self.helper_model.trim();
+        if model.is_empty() {
+            return None;
+        }
+        let endpoint = self.endpoint_or_chat(&self.helper_endpoint);
+        let api_key = match self.helper_api_key.as_str() {
+            "" => self.key_for(endpoint),
+            own => own,
+        };
+        Some(ModelTarget {
+            endpoint,
+            model,
+            api_key,
+        })
+    }
+
+    pub fn embedding_target(&self) -> ModelTarget<'_> {
+        let endpoint = self.endpoint_or_chat(&self.embedding_endpoint);
+        let api_key = match self.embedding_api_key.as_str() {
+            "" => self.key_for(endpoint),
+            own => own,
+        };
+        ModelTarget {
+            endpoint,
+            model: self.chat_recall_embedding_model.trim(),
+            api_key,
+        }
+    }
+
+    fn endpoint_or_chat<'a>(&'a self, own: &'a str) -> &'a str {
+        match own.trim() {
+            "" => &self.endpoint,
+            e => e,
+        }
+    }
+
+    /// The main key goes only to the chat endpoint's own server.
+    fn key_for(&self, endpoint: &str) -> &str {
+        let host = crate::gpu::base_host(endpoint);
+        if host.is_some() && host == crate::gpu::base_host(&self.endpoint) {
+            &self.api_key
+        } else {
+            ""
         }
     }
 }
@@ -424,6 +511,83 @@ pub fn save(cfg: &AppConfig) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    const CHAT: &str = "http://192.168.1.3:1234/v1/chat/completions";
+
+    fn cfg_with(f: impl FnOnce(&mut AppConfig)) -> AppConfig {
+        let mut cfg = AppConfig {
+            endpoint: CHAT.into(),
+            api_key: "chat-key".into(),
+            ..AppConfig::default()
+        };
+        f(&mut cfg);
+        cfg
+    }
+
+    #[test]
+    fn helper_is_off_without_a_model() {
+        let cfg = cfg_with(|c| c.helper_endpoint = "http://x:1/v1/chat/completions".into());
+        assert!(cfg.helper().is_none());
+    }
+
+    #[test]
+    fn helper_without_endpoint_uses_the_chat_endpoint_and_key() {
+        let cfg = cfg_with(|c| c.helper_model = " small ".into());
+        let h = cfg.helper().unwrap();
+        assert_eq!(
+            (h.endpoint, h.model, h.api_key),
+            (CHAT, "small", "chat-key")
+        );
+    }
+
+    #[test]
+    fn helper_on_the_chat_server_gets_the_chat_key() {
+        let cfg = cfg_with(|c| {
+            c.helper_model = "small".into();
+            c.helper_endpoint = CHAT.into();
+        });
+        assert_eq!(cfg.helper().unwrap().api_key, "chat-key");
+    }
+
+    #[test]
+    fn helper_on_another_host_never_gets_the_chat_key() {
+        let cfg = cfg_with(|c| {
+            c.helper_model = "small".into();
+            c.helper_endpoint = "http://192.168.1.9:1234/v1/chat/completions".into();
+        });
+        assert_eq!(cfg.helper().unwrap().api_key, "");
+    }
+
+    #[test]
+    fn own_helper_key_wins() {
+        let cfg = cfg_with(|c| {
+            c.helper_model = "small".into();
+            c.helper_api_key = "own".into();
+        });
+        assert_eq!(cfg.helper().unwrap().api_key, "own");
+    }
+
+    #[test]
+    fn embedding_on_another_server_gets_no_chat_key() {
+        let cfg = cfg_with(|c| {
+            c.chat_recall_embedding_model = "nomic".into();
+            c.embedding_endpoint = "http://192.168.1.7:11434".into();
+        });
+        let t = cfg.embedding_target();
+        assert_eq!(
+            (t.endpoint, t.model, t.api_key),
+            ("http://192.168.1.7:11434", "nomic", "")
+        );
+    }
+
+    #[test]
+    fn embedding_default_is_the_chat_server_with_its_key() {
+        let cfg = cfg_with(|_| {});
+        let t = cfg.embedding_target();
+        assert_eq!((t.endpoint, t.api_key), (CHAT, "chat-key"));
+    }
+
     #[test]
     fn partial_config_fills_missing_keys_with_defaults() {
         let cfg: super::AppConfig =
@@ -437,6 +601,11 @@ mod tests {
         assert!(cfg.fileops_recall && !cfg.chat_recall_query_expansion);
         assert!(cfg.danbooru_tags_dir.is_empty() && !cfg.danbooru_online_lookup);
         assert!(cfg.chat_recall_expansion_model.is_empty());
+        assert!(
+            cfg.helper().is_none()
+                && cfg.helper_endpoint.is_empty()
+                && cfg.embedding_endpoint.is_empty()
+        );
         assert_eq!(
             (cfg.chat_recall_scope.as_str(), cfg.chat_recall_max),
             ("session", 4)

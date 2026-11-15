@@ -752,10 +752,8 @@ async fn update_state_json(
         ChatMessage::text("system", system),
         ChatMessage::text("user", exchange),
     ];
-    let value = match llm::send_chat_json(
-        &cfg.endpoint,
-        &cfg.model,
-        &cfg.api_key,
+    let value = match crate::helper_model::send_json(
+        cfg,
         &messages,
         MECHANICAL_TEMPERATURE,
         None,
@@ -776,6 +774,7 @@ async fn update_state_json(
     let fields = prompts::drop_template_fields(prompts::flat_fields(map), &previous);
     let fields =
         prompts::drop_unmentioned_garments(fields, &previous, reply, user_text.unwrap_or(""));
+    let fields = prompts::drop_removed_garments(fields, &previous, reply);
     if fields.is_empty() {
         log::warn!("state update produced no usable fields");
         return None;
@@ -818,15 +817,9 @@ async fn update_state_summary(cfg: &AppConfig, session_id: &str, source_id: &str
             ChatMessage::text("system", prompts::CHAT_STATE_SUMMARY_PROMPT),
             ChatMessage::text("user", narrative_json),
         ];
-        let summary = llm::send_chat(
-            &cfg.endpoint,
-            &cfg.model,
-            &cfg.api_key,
-            MECHANICAL_TEMPERATURE,
-            &messages,
-        )
-        .await
-        .map(|raw| prompts::clean_reply(&raw).0);
+        let summary = crate::helper_model::send_text(cfg, MECHANICAL_TEMPERATURE, &messages)
+            .await
+            .map(|raw| prompts::clean_reply(&raw).0);
         match summary {
             Ok(s) if !s.is_empty() => s,
             other => {

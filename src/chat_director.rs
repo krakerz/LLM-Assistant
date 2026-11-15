@@ -333,18 +333,7 @@ async fn ask(
         ChatMessage::text("system", system),
         ChatMessage::text("user", user),
     ];
-    match llm::send_chat_json(
-        &cfg.endpoint,
-        &cfg.model,
-        &cfg.api_key,
-        &messages,
-        0.2,
-        Some(200),
-        name,
-        &schema,
-    )
-    .await
-    {
+    match crate::helper_model::send_json(cfg, &messages, 0.2, Some(200), name, &schema).await {
         Ok(v) => {
             log::info!("director {name}: {v}");
             Some(v)
@@ -421,24 +410,16 @@ async fn confirm(cfg: &AppConfig, question: &str, text: &str) -> bool {
         ChatMessage::text("system", CONFIRM_SYSTEM),
         ChatMessage::text("user", format!("{question}\n\nText: \"{text}\"")),
     ];
-    let yes = match llm::send_chat_json(
-        &cfg.endpoint,
-        &cfg.model,
-        &cfg.api_key,
-        &messages,
-        0.0,
-        Some(24),
-        "confirm",
-        &schema,
-    )
-    .await
-    {
-        Ok(v) => lenient_string(v.get("answer")).eq_ignore_ascii_case("yes"),
-        Err(e) => {
-            log::warn!("director confirm call failed: {e}");
-            false
-        }
-    };
+    let yes =
+        match crate::helper_model::send_json(cfg, &messages, 0.0, Some(24), "confirm", &schema)
+            .await
+        {
+            Ok(v) => lenient_string(v.get("answer")).eq_ignore_ascii_case("yes"),
+            Err(e) => {
+                log::warn!("director confirm call failed: {e}");
+                false
+            }
+        };
     log::info!(
         "director confirm {}: {text:?}",
         if yes { "yes" } else { "no" }

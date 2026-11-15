@@ -405,6 +405,25 @@
         <button id="testConnectionBtn" type="button">Test connection</button>
         <span id="testConnectionResult" class="explain"></span>
       </div>
+      <h4>Helper model (optional)</h4>
+      <p class="explain">
+        A small model for the background work after each chat reply: state sheet, photo and search
+        decisions, recall queries. Empty model = the chat model does it all. If the helper fails,
+        the chat model takes over for that call.
+      </p>
+      <label>Helper endpoint
+        <input id="cfgHelperEndpoint" type="text" placeholder="empty = same endpoint as above" autocomplete="off" spellcheck="false" />
+      </label>
+      <label>Helper model
+        <input id="cfgHelperModel" type="text" placeholder="e.g. qwen2.5-3b-instruct" autocomplete="off" spellcheck="false" />
+      </label>
+      <label>Helper API key
+        <input id="cfgHelperApiKey" type="password" placeholder="empty = the key above when it's the same server" autocomplete="off" spellcheck="false" />
+      </label>
+      <div class="path-row">
+        <button id="testHelperBtn" type="button">Test helper</button>
+        <span id="testHelperResult" class="explain"></span>
+      </div>
       <label>Context budget in tokens (once a turn would exceed this, finished command steps are condensed to just the command and its output, and beyond that the oldest turns are dropped; 0 = never trim). Rough estimate, not a real tokenizer — leave headroom under your model's actual limit. Shared by both modes below.
         <input id="cfgMaxContextTokens" type="number" step="500" min="0" />
       </label>
@@ -478,8 +497,14 @@
       </label>
       <p class="explain">
         e.g. text-embedding-nomic-embed-text-v1.5 in LM Studio or nomic-embed-text in Ollama, served
-        by the same server as the chat model. Empty = keyword search only.
+        by the embedding endpoint below (empty = the chat model's server). Empty = keyword search only.
       </p>
+      <label>Embedding endpoint (optional)
+        <input id="cfgEmbeddingEndpoint" type="text" placeholder="http://nas:11434" autocomplete="off" spellcheck="false" />
+      </label>
+      <label>Embedding API key (optional)
+        <input id="cfgEmbeddingApiKey" type="password" autocomplete="off" spellcheck="false" />
+      </label>
       <label>Max recalled snippets
         <input id="cfgChatRecallMax" type="number" step="1" min="1" max="10" />
       </label>
@@ -738,6 +763,11 @@
         <input id="cfgComfyUnloadLlm" type="checkbox" />
         Unload the chat model while generating images
       </label>
+      <label class="checkbox-row">
+        <input id="cfgComfyUnloadHelper" type="checkbox" />
+        Also unload the helper and embedding models
+      </label>
+      <p class="explain">Only when they run on the same machine as ComfyUI. Chat waits until the image is done.</p>
       <label class="checkbox-row">
         <input id="cfgComfyFreeAfter" type="checkbox" />
         Free ComfyUI's memory after each image

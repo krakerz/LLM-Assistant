@@ -80,6 +80,9 @@ pub struct ComfyUiConfig {
     /// (`gpu::with_image_slot`), for running both on one GPU.
     #[serde(default)]
     pub unload_llm_during_generation: bool,
+    /// Also unload the helper and embedding models when they run on ComfyUI's machine.
+    #[serde(default)]
+    pub unload_helper_during_generation: bool,
     /// Ask ComfyUI to drop its models and cached memory after each image.
     #[serde(default)]
     pub free_after_generation: bool,
@@ -242,6 +245,7 @@ impl Default for ComfyUiConfig {
             filename_pattern: default_filename_pattern(),
             reaction_mode: ReactionMode::default(),
             unload_llm_during_generation: false,
+            unload_helper_during_generation: false,
             free_after_generation: false,
             size_presets: SizePresets::default(),
             default_size: DefaultSize::default(),
