@@ -29,13 +29,14 @@ All notable changes to this project are documented here. The format follows [Kee
 - The Image Gen settings tab uses two columns on wide windows: workflow JSON on the left, field mapping and size presets on the right
 
 ### Fixed
-- Holding a riding crop no longer turns a photo into a sex scene
+- The character knows the current date and time, and a date question no longer triggers a web search
+- Holding a riding crop no longer changes what a photo shows
 - Stat fields copied from the card template no longer end up in her state
 - Replies no longer repeat the app's photo note
 - Stat lines the model echoes into a reply (Outfit:, Mood:, ...) are removed from the chat
 - Stat lines in old saved chats are cleaned up too
 - A garment she took off no longer reappears in her outfit unless it is mentioned
-- A photo "of us" now shows both of you, even without a sex scene
+- A photo "of us" now shows both of you
 - An original character's name is no longer used as a photo tag
 - Photos always carry the negative tags listed as "always" in the image rules, even when the model leaves some out
 - Vague prose in photo prompts ("playful glint in eyes", "afternoon sun", a lone "wearing") becomes a real tag or is dropped

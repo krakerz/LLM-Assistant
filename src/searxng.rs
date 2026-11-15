@@ -124,6 +124,13 @@ pub async fn search(cfg: &SearxngConfig, query: &str) -> anyhow::Result<Vec<Sear
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+    // SearXNG answers 200 with no results when its engines are blocked.
+    log::info!(
+        "web search {query:?}: {} results, unresponsive engines: {}",
+        results.len(),
+        body.get("unresponsive_engines")
+            .unwrap_or(&serde_json::Value::Null)
+    );
 
     Ok(results
         .into_iter()

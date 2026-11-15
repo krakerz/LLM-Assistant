@@ -587,6 +587,14 @@ pub struct StateField {
     pub value: String,
 }
 
+/// The local date and time for the chat model, which has no clock.
+pub fn now_note() -> String {
+    format!(
+        "[Current local date and time: {}. Use it if asked about the date or time.]",
+        chrono::Local::now().format("%A, %-d %B %Y, %H:%M (UTC%:z)")
+    )
+}
+
 /// A value copied from the card's stat template instead of filled in:
 /// "{current_affection}", "?:0-100%", "0-100%", "?".
 fn is_template_value(value: &str) -> bool {

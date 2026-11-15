@@ -404,6 +404,7 @@ Personal questions to the other person are not.\nExamples:\n\
 \"how much is an iphone now?\" -> yes\n\
 \"how was your day?\" -> no\n\
 \"show me where you are\" -> no\n\
+\"what date is it today?\" -> no\n\
 \"what are you reading?\" -> no";
 
 async fn confirm(cfg: &AppConfig, question: &str, text: &str) -> bool {

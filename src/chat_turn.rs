@@ -410,6 +410,12 @@ async fn run_turn_one(
     let mut messages = vec![ChatMessage::text("system", system_content)];
     messages.extend(fit.messages);
     add_recall(cfg, session_id, &snapshot, &mut messages, &running.cancel).await;
+    // The model has no clock; on the request copy only, so the system prompt
+    // (and the server's prefix cache) stays static.
+    if let Some(last) = messages.last_mut().filter(|m| m.role == "user") {
+        last.content
+            .push_str(&format!("\n\n{}", prompts::now_note()));
+    }
 
     // A Stop while summarizing ends the turn like a Stop before the first token.
     let (raw, stopped) = if running.cancel.is_cancelled() {
